@@ -13,15 +13,37 @@
  *        /     : Search / filter models in real time.
  *        Esc   : Clear search or exit picker.
  *
- * 2. Preconfigured Roles & Default Models:
- *    - Daily / Default  : Workhorse model for daily tasks & startup default (e.g., Claude 3.7 Sonnet / GPT-4o).
- *    - Small / Tiny     : Fast, lightweight model for tiny tasks (e.g., Claude 3.5 Haiku / GPT-4o-mini).
- *    - Frontier / Deep  : Advanced reasoning model for complex tasks (e.g., Claude 3.7 Sonnet / o3-mini with high effort).
+ * 2. Model Effort Picking & Reasoning Controller:
  *    - In Picker:
- *        Press 'd' : Assign highlighted model as Daily / Default (updates settings.json defaultModel!).
- *        Press 's' : Assign highlighted model as Small.
- *        Press 'f' : Assign highlighted model as Frontier.
- *        Press 'e' : Cycle reasoning effort for the highlighted model.
+ *        Press 'e' : Open interactive Reasoning Effort Picker for highlighted model
+ *                    (displays and allows picking ONLY levels supported by that model!).
+ *                    Inside effort picker:
+ *                      ↑ / ↓       : Navigate between supported effort levels.
+ *                      e           : Cycle to next supported effort level.
+ *                      Enter       : Apply chosen effort to model (persisted in settings.json).
+ *                      Space       : Apply chosen effort AND immediately switch to that model.
+ *                      Esc / ←     : Cancel back to model list.
+ *                      0-9         : Jump directly to effort tier by index.
+ *    - In Spec Card:
+ *        Displays model thinking capability, current configured effort, and exact supported levels.
+ *    - In Model List:
+ *        Displays reasoning badge with effective effort (e.g. 🧠 high, 🧠 med).
+ *    - Slash commands:
+ *        /effort                    : Interactive selector with only supported levels for active model.
+ *        /effort <level>            : Set reasoning effort directly (clamped to model capabilities).
+ *        /effort <model> <level>    : Set default reasoning effort for any model.
+ *        /effort <model>            : Interactive effort selector for a specific model.
+ *        /thinking                  : Alias of /effort.
+ *        Argument completions dynamically adapt to active model's supported levels.
+ *
+ * 3. Preconfigured Roles & Default Models:
+ *    - Daily / Default  : Workhorse model for daily tasks & startup default (e.g. Claude 3.7 Sonnet / GPT-4o).
+ *    - Small / Tiny     : Fast, lightweight model for tiny tasks (e.g. Claude 3.5 Haiku / GPT-4o-mini).
+ *    - Frontier / Deep  : Advanced reasoning model for complex tasks (e.g. Claude 3.7 Sonnet / o3-mini with high effort).
+ *    - In Picker:
+ *        Press 'd' : Assign highlighted model as Daily / Default (clamped to model's effort support).
+ *        Press 's' : Assign highlighted model as Small (clamped to model's effort support).
+ *        Press 'f' : Assign highlighted model as Frontier (clamped to model's effort support).
  *        Press '1' : Quick-switch to Daily model.
  *        Press '2' : Quick-switch to Small model.
  *        Press '3' : Quick-switch to Frontier model.
@@ -29,11 +51,6 @@
  *        /role [daily|small|frontier] : Switch role or open interactive role menu.
  *        /daily, /small, /frontier    : Direct role activation shortcuts.
  *        /default [model]             : Set startup default model.
- *
- * 3. Reasoning Effort Controller (/effort, /thinking):
- *    - /effort <off|minimal|low|medium|high|xhigh|max> : Set reasoning effort directly.
- *    - /effort (no args) : Interactive prompt with full descriptions of all 7 effort tiers.
- *    - Argument completions for quick tab completion.
  *
  * 4. Clean Shutdown (/exit, /quit):
  *    - /exit : Gracefully shuts down Pi via ctx.shutdown().
@@ -45,6 +62,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Model } from "@earendil-works/pi-ai";
+import {
+  clampThinkingLevel,
+  getSupportedThinkingLevels,
+  modelsAreEqual,
+} from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -72,11 +94,11 @@ export const THINKING_LEVELS: readonly ThinkingLevel[] = [
 
 export const EFFORT_DESCRIPTIONS: Record<ThinkingLevel, string> = {
   off: "No reasoning / thinking tokens (fastest response)",
-  minimal: "Minimal thinking tokens (light reasoning)",
-  low: "Low thinking effort (quick analysis)",
-  medium: "Medium thinking effort (balanced reasoning)",
-  high: "High thinking effort (deep reasoning & architecture)",
-  xhigh: "Extra high thinking effort (complex proofs & debugging)",
+  minimal: "Minimal thinking tokens (light reasoning, ~1k tokens)",
+  low: "Low thinking effort (quick analysis, ~2k tokens)",
+  medium: "Medium thinking effort (balanced reasoning, ~8k tokens)",
+  high: "High thinking effort (deep reasoning & architecture, ~16k tokens)",
+  xhigh: "Extra high thinking effort (complex proofs & debugging, ~32k tokens)",
   max: "Maximum reasoning budget (exhaustive reasoning)",
 };
 
@@ -133,6 +155,27 @@ interface ProviderGroup {
   models: Model<any>[];
 }
 
+// --- Model Capabilities Helpers ---
+
+/**
+ * Returns true if the model supports reasoning tokens and has at least
+ * one thinking level other than "off" available.
+ */
+export function isReasoningModel(model?: Model<any> | null): boolean {
+  if (!model || !model.reasoning) return false;
+  const levels = getSupportedThinkingLevels(model);
+  return levels.some((l) => l !== "off");
+}
+
+/**
+ * Returns the exact list of thinking levels supported by the model.
+ * For non-reasoning models, returns ["off"].
+ */
+export function getModelSupportedThinkingLevels(model?: Model<any> | null): ThinkingLevel[] {
+  if (!model) return ["off"];
+  return getSupportedThinkingLevels(model) as ThinkingLevel[];
+}
+
 // --- Persistence Helpers ---
 
 const ROLES_FILE_PATH = path.join(os.homedir(), ".pi", "agent", "model-roles.json");
@@ -157,6 +200,28 @@ function writeSettingsFile(settings: Record<string, any>): void {
   } catch (e) {
     console.error("Failed to write settings.json:", e);
   }
+}
+
+/**
+ * Read the configured thinking level for a specific model from ~/.pi/agent/settings.json
+ * (under `modelThinkingLevels`). Pi core uses this setting natively when switching models.
+ */
+export function getModelThinkingLevel(provider: string, modelId: string): ThinkingLevel | undefined {
+  const settings = readSettingsFile();
+  return settings.modelThinkingLevels?.[`${provider}/${modelId}`];
+}
+
+/**
+ * Persist the configured thinking level for a specific model into ~/.pi/agent/settings.json
+ * (under `modelThinkingLevels`).
+ */
+export function saveModelThinkingLevel(provider: string, modelId: string, level: ThinkingLevel): void {
+  const settings = readSettingsFile();
+  if (!settings.modelThinkingLevels) {
+    settings.modelThinkingLevels = {};
+  }
+  settings.modelThinkingLevels[`${provider}/${modelId}`] = level;
+  writeSettingsFile(settings);
 }
 
 export function loadRolesState(): ModelRolesState {
@@ -226,6 +291,57 @@ export function saveDefaultModelToSettings(provider: string, modelId: string): v
     rolesState.roles.daily.modelId = modelId;
   }
   saveRolesState(rolesState);
+}
+
+/**
+ * Determine the effective thinking effort for any model:
+ * 1. If currently active in session and currentSessionEffort provided -> clamp that level.
+ * 2. If configured in settings.json modelThinkingLevels -> use that if supported.
+ * 3. If configured in model-roles.json -> clamp that level.
+ * 4. If global settings.json defaultThinkingLevel set -> clamp that level.
+ * 5. Default fallback -> clamp "medium" (or lowest/highest supported).
+ */
+export function getEffectiveModelEffort(
+  model: Model<any>,
+  ctxModel?: Model<any>,
+  currentSessionEffort?: ThinkingLevel,
+  rolesState?: ModelRolesState
+): ThinkingLevel {
+  if (!isReasoningModel(model)) {
+    return "off";
+  }
+
+  const supported = getModelSupportedThinkingLevels(model);
+
+  // 1. If active in session, active level has precedence
+  if (ctxModel && modelsAreEqual(ctxModel, model) && currentSessionEffort) {
+    return clampThinkingLevel(model, currentSessionEffort as any) as ThinkingLevel;
+  }
+
+  // 2. Check settings.json modelThinkingLevels
+  const configured = getModelThinkingLevel(model.provider, model.id);
+  if (configured && supported.includes(configured)) {
+    return configured;
+  }
+
+  // 3. Check roles state
+  if (rolesState) {
+    for (const rKey of ["daily", "frontier", "small"] as const) {
+      const r = rolesState.roles[rKey];
+      if (r?.provider === model.provider && r?.modelId === model.id && r.effort) {
+        return clampThinkingLevel(model, r.effort as any) as ThinkingLevel;
+      }
+    }
+  }
+
+  // 4. Global defaultThinkingLevel in settings.json
+  const settings = readSettingsFile();
+  if (settings.defaultThinkingLevel) {
+    return clampThinkingLevel(model, settings.defaultThinkingLevel) as ThinkingLevel;
+  }
+
+  // 5. Fallback clamped to medium (or whatever model supports)
+  return clampThinkingLevel(model, "medium") as ThinkingLevel;
 }
 
 // --- Text & Formatting Helpers ---
@@ -342,6 +458,12 @@ export class SplitModelPickerComponent {
   private modelScrollOffset: number = 0;
   private readonly visibleRows: number = 14;
 
+  // Reasoning Effort Picker sub-state
+  private isEffortPickerOpen: boolean = false;
+  private effortPickerModel?: Model<any>;
+  private effortPickerLevels: ThinkingLevel[] = [];
+  private effortPickerIndex: number = 0;
+
   constructor(
     tui: any,
     theme: any,
@@ -391,6 +513,7 @@ export class SplitModelPickerComponent {
   }
 
   private updateFilter(): void {
+    this.isEffortPickerOpen = false;
     const q = this.searchQuery.trim().toLowerCase();
 
     let list = this.allProviders;
@@ -494,7 +617,125 @@ export class SplitModelPickerComponent {
     return badges;
   }
 
+  /**
+   * Helper to retrieve effective reasoning effort for a model.
+   */
+  private getModelEffort(model: Model<any>): ThinkingLevel {
+    return getEffectiveModelEffort(
+      model,
+      this.ctx.model,
+      this.pi.getThinkingLevel() as ThinkingLevel,
+      this.rolesState
+    );
+  }
+
+  /**
+   * Apply an effort level to a model: saves to settings.json,
+   * sets active session if model is currently active, and updates roles.
+   */
+  private applyModelEffort(model: Model<any>, level: ThinkingLevel): void {
+    saveModelThinkingLevel(model.provider, model.id, level);
+
+    if (this.ctx.model && modelsAreEqual(this.ctx.model, model)) {
+      this.pi.setThinkingLevel(level);
+    }
+
+    let roleUpdated = false;
+    for (const rKey of ["daily", "small", "frontier"] as const) {
+      const r = this.rolesState.roles[rKey];
+      if (r?.provider === model.provider && r?.modelId === model.id) {
+        r.effort = level;
+        roleUpdated = true;
+      }
+    }
+    if (roleUpdated) {
+      saveRolesState(this.rolesState);
+    }
+  }
+
   handleInput(data: string): void {
+    // --- Effort Picker Mode Input Handling ---
+    if (this.isEffortPickerOpen && this.effortPickerModel) {
+      // 1. Esc or Left: cancel and close effort picker
+      if (matchesKey(data, Key.escape) || matchesKey(data, Key.left)) {
+        this.isEffortPickerOpen = false;
+        this.tui.requestRender();
+        return;
+      }
+
+      // 2. Up: move cursor up
+      if (matchesKey(data, Key.up)) {
+        if (this.effortPickerLevels.length > 0) {
+          this.effortPickerIndex =
+            this.effortPickerIndex > 0
+              ? this.effortPickerIndex - 1
+              : this.effortPickerLevels.length - 1;
+          this.tui.requestRender();
+        }
+        return;
+      }
+
+      // 3. Down: move cursor down
+      if (matchesKey(data, Key.down)) {
+        if (this.effortPickerLevels.length > 0) {
+          this.effortPickerIndex =
+            this.effortPickerIndex < this.effortPickerLevels.length - 1
+              ? this.effortPickerIndex + 1
+              : 0;
+          this.tui.requestRender();
+        }
+        return;
+      }
+
+      // 4. 'e' / 'E': cycle to next supported level
+      if (data === "e" || data === "E") {
+        if (this.effortPickerLevels.length > 0) {
+          this.effortPickerIndex =
+            (this.effortPickerIndex + 1) % this.effortPickerLevels.length;
+          this.tui.requestRender();
+        }
+        return;
+      }
+
+      // 5. Numeric shortcuts: jump directly to index
+      if (data >= "0" && data <= "9") {
+        const num = parseInt(data, 10);
+        if (num >= 0 && num < this.effortPickerLevels.length) {
+          this.effortPickerIndex = num;
+          this.tui.requestRender();
+          return;
+        }
+      }
+
+      // 6. Enter: confirm chosen effort level
+      if (matchesKey(data, Key.enter)) {
+        const chosen = this.effortPickerLevels[this.effortPickerIndex];
+        if (chosen) {
+          this.applyModelEffort(this.effortPickerModel, chosen);
+          this.isEffortPickerOpen = false;
+          this.setFlash(`✓ Set reasoning effort for ${this.effortPickerModel.id} to ${chosen.toUpperCase()}`);
+          this.tui.requestRender();
+        }
+        return;
+      }
+
+      // 7. Space: confirm effort AND immediately select/switch to model
+      if (matchesKey(data, Key.space)) {
+        const chosen = this.effortPickerLevels[this.effortPickerIndex];
+        if (chosen) {
+          this.applyModelEffort(this.effortPickerModel, chosen);
+          this.isEffortPickerOpen = false;
+          this.done(this.effortPickerModel);
+        }
+        return;
+      }
+
+      // Ignore other keystrokes while effort picker is active
+      return;
+    }
+
+    // --- Normal Two-Panel Picker Input Handling ---
+
     // 1. ESC: Clear search or exit
     if (matchesKey(data, Key.escape)) {
       if (this.isSearchMode || this.searchQuery.length > 0) {
@@ -636,57 +877,73 @@ export class SplitModelPickerComponent {
       return;
     }
 
-    // 11. Role Assignments on highlighted model: 'd' (Daily/Default), 's' (Small), 'f' (Frontier)
+    // 11. Model Actions on highlighted model: 'd', 's', 'f', 'e'
     const selectedModel = this.getCurrentModels()[this.modelIndex];
     if (selectedModel) {
       if (data === "d" || data === "D") {
+        const effort = isReasoningModel(selectedModel)
+          ? (clampThinkingLevel(selectedModel, this.getModelEffort(selectedModel) || "medium") as ThinkingLevel)
+          : "off";
         this.rolesState.roles.daily = {
           provider: selectedModel.provider,
           modelId: selectedModel.id,
-          effort: "medium",
+          effort,
         };
         saveDefaultModelToSettings(selectedModel.provider, selectedModel.id);
-        this.setFlash(`✓ Assigned ${selectedModel.id} as Daily & Default Model!`);
+        this.setFlash(`✓ Assigned ${selectedModel.id} as Daily & Default Model (effort: ${effort})!`);
         this.tui.requestRender();
         return;
       }
       if (data === "s" || data === "S") {
+        const effort = isReasoningModel(selectedModel)
+          ? (clampThinkingLevel(selectedModel, "off") as ThinkingLevel)
+          : "off";
         this.rolesState.roles.small = {
           provider: selectedModel.provider,
           modelId: selectedModel.id,
-          effort: "off",
+          effort,
         };
         saveRolesState(this.rolesState);
-        this.setFlash(`✓ Assigned ${selectedModel.id} as Small (Tiny Tasks) Model!`);
+        this.setFlash(`✓ Assigned ${selectedModel.id} as Small (Tiny Tasks) Model (effort: ${effort})!`);
         this.tui.requestRender();
         return;
       }
       if (data === "f" || data === "F") {
+        const effort = isReasoningModel(selectedModel)
+          ? (clampThinkingLevel(selectedModel, "high") as ThinkingLevel)
+          : "off";
         this.rolesState.roles.frontier = {
           provider: selectedModel.provider,
           modelId: selectedModel.id,
-          effort: "high",
+          effort,
         };
         saveRolesState(this.rolesState);
-        this.setFlash(`✓ Assigned ${selectedModel.id} as Frontier (Advanced) Model!`);
+        this.setFlash(`✓ Assigned ${selectedModel.id} as Frontier (Advanced) Model (effort: ${effort})!`);
         this.tui.requestRender();
         return;
       }
+
+      // 'e' / 'E': Open interactive Reasoning Effort Picker for highlighted model
       if (data === "e" || data === "E") {
-        // Cycle reasoning effort
-        const currentEffort = (this.pi.getThinkingLevel() as ThinkingLevel) || "off";
-        const idx = THINKING_LEVELS.indexOf(currentEffort);
-        const nextEffort = THINKING_LEVELS[(idx + 1) % THINKING_LEVELS.length];
-        this.pi.setThinkingLevel(nextEffort);
-        // If assigned to a role, update role effort too
-        for (const rKey of ["daily", "small", "frontier"] as const) {
-          const r = this.rolesState.roles[rKey];
-          if (r?.provider === selectedModel.provider && r?.modelId === selectedModel.id) {
-            r.effort = nextEffort;
-            saveRolesState(this.rolesState);
-          }
+        if (this.focusedPanel === "providers") {
+          this.focusedPanel = "models";
         }
-        this.setFlash(`✓ Reasoning effort set to: ${nextEffort.toUpperCase()}`);
+
+        if (!isReasoningModel(selectedModel)) {
+          this.setFlash(`⚠ ${selectedModel.id} does not support reasoning/thinking effort.`);
+          this.tui.requestRender();
+          return;
+        }
+
+        const supported = getModelSupportedThinkingLevels(selectedModel);
+        this.isEffortPickerOpen = true;
+        this.effortPickerModel = selectedModel;
+        this.effortPickerLevels = supported;
+
+        const currentEff = this.getModelEffort(selectedModel);
+        const curIdx = supported.indexOf(currentEff);
+        this.effortPickerIndex = curIdx >= 0 ? curIdx : 0;
+
         this.tui.requestRender();
         return;
       }
@@ -708,13 +965,22 @@ export class SplitModelPickerComponent {
     }
     const ok = await this.pi.setModel(model);
     if (ok) {
-      if (role.effort) {
-        this.pi.setThinkingLevel(role.effort);
+      if (isReasoningModel(model)) {
+        const targetEffort = role.effort
+          ? (clampThinkingLevel(model, role.effort as any) as ThinkingLevel)
+          : this.getModelEffort(model);
+        this.pi.setThinkingLevel(targetEffort);
+        saveModelThinkingLevel(model.provider, model.id, targetEffort);
+        this.ctx.ui.notify(
+          `Switched to [${roleKey.toUpperCase()}]: ${role.provider}/${role.modelId} (effort: ${targetEffort.toUpperCase()})`,
+          "info"
+        );
+      } else {
+        this.ctx.ui.notify(
+          `Switched to [${roleKey.toUpperCase()}]: ${role.provider}/${role.modelId}`,
+          "info"
+        );
       }
-      this.ctx.ui.notify(
-        `Switched to [${roleKey.toUpperCase()}]: ${role.provider}/${role.modelId} (effort: ${role.effort || "default"})`,
-        "info"
-      );
       this.done(model);
     } else {
       this.setFlash(`Failed to switch to ${role.modelId}: No API key configured.`);
@@ -726,13 +992,10 @@ export class SplitModelPickerComponent {
 
   render(width: number): string[] {
     const lines: string[] = [];
-    // TUI contract: no returned line may exceed `width`. Every row below is
-    // exactly totalWidth wide INCLUDING its border characters.
     const totalWidth = width;
-    const innerWidth = totalWidth - 2; // content rows sit between the outer │ borders
+    const innerWidth = totalWidth - 2;
 
     const leftWidth = Math.max(4, Math.min(32, Math.floor(totalWidth * 0.30), totalWidth - 15));
-    // Row = │ + leftWidth + │ (divider) + rightWidth + │ → 3 border chars total.
     const rightWidth = totalWidth - leftWidth - 3;
 
     const currentProvider = this.getCurrentProvider();
@@ -744,8 +1007,8 @@ export class SplitModelPickerComponent {
     lines.push("┌" + "─".repeat(leftWidth) + "┬" + "─".repeat(rightWidth) + "┐");
 
     // Title headers
-    const pIsFocused = this.focusedPanel === "providers";
-    const mIsFocused = this.focusedPanel === "models";
+    const pIsFocused = this.focusedPanel === "providers" && !this.isEffortPickerOpen;
+    const mIsFocused = (this.focusedPanel === "models" || this.isEffortPickerOpen);
 
     const pDot = pIsFocused
       ? this.theme.fg("accent", "● ")
@@ -756,17 +1019,26 @@ export class SplitModelPickerComponent {
     const pCountBadge = this.theme.fg("muted", ` (${this.filteredProviders.length})`);
     const leftHeader = ` ${pDot}${pTitleText}${pCountBadge}`;
 
-    const mDot = mIsFocused
-      ? this.theme.fg("accent", "● ")
-      : this.theme.fg("dim", "○ ");
-    const mTitleText = mIsFocused
-      ? this.theme.fg("accent", bold("MODELS"))
-      : this.theme.fg("text", "MODELS");
-    const pNameTag = currentProvider
-      ? ` : ${this.theme.fg("accent", currentProvider.displayName)}`
-      : "";
-    const mCountBadge = this.theme.fg("muted", ` (${currentModels.length})`);
-    const rightHeader = ` ${mDot}${mTitleText}${pNameTag}${mCountBadge}`;
+    let rightHeader = "";
+    if (this.isEffortPickerOpen && this.effortPickerModel) {
+      const eDot = this.theme.fg("warning", "● ");
+      const eTitleText = this.theme.fg("warning", bold("REASONING EFFORT"));
+      const eModelTag = ` : ${this.theme.fg("accent", this.effortPickerModel.id)}`;
+      const eCountBadge = this.theme.fg("muted", ` (${this.effortPickerLevels.length} levels)`);
+      rightHeader = ` ${eDot}${eTitleText}${eModelTag}${eCountBadge}`;
+    } else {
+      const mDot = mIsFocused
+        ? this.theme.fg("accent", "● ")
+        : this.theme.fg("dim", "○ ");
+      const mTitleText = mIsFocused
+        ? this.theme.fg("accent", bold("MODELS"))
+        : this.theme.fg("text", "MODELS");
+      const pNameTag = currentProvider
+        ? ` : ${this.theme.fg("accent", currentProvider.displayName)}`
+        : "";
+      const mCountBadge = this.theme.fg("muted", ` (${currentModels.length})`);
+      rightHeader = ` ${mDot}${mTitleText}${pNameTag}${mCountBadge}`;
+    }
 
     lines.push(
       "│" + pad(leftHeader, leftWidth) + "│" + pad(rightHeader, rightWidth) + "│"
@@ -846,58 +1118,110 @@ export class SplitModelPickerComponent {
         }
       }
 
-      // --- Right Column: Model row ---
+      // --- Right Column: Model row OR Effort Picker rows ---
       let rightCell = "";
-      const mIdx = this.modelScrollOffset + i;
-      if (mIdx < currentModels.length) {
-        const mdl = currentModels[mIdx];
-        const isSelected = mIdx === this.modelIndex;
-        const isCurrentActive =
-          activeModel?.provider === mdl.provider && activeModel?.id === mdl.id;
 
-        let pointer = "  ";
-        if (isSelected && mIsFocused) {
-          pointer = this.theme.fg("accent", "› ");
-        } else if (isSelected) {
-          pointer = this.theme.fg("muted", "▸ ");
+      if (this.isEffortPickerOpen && this.effortPickerModel) {
+        // Effort Picker View
+        const currentEff = this.getModelEffort(this.effortPickerModel);
+
+        if (i === 0) {
+          rightCell = ` ${this.theme.fg("dim", "Choose reasoning effort for ")}${this.theme.fg("accent", bold(this.effortPickerModel.id))}:`;
+        } else if (i === 1) {
+          rightCell = "";
+        } else {
+          const lvlIdx = i - 2;
+          if (lvlIdx < this.effortPickerLevels.length) {
+            const lvl = this.effortPickerLevels[lvlIdx];
+            const isCursor = lvlIdx === this.effortPickerIndex;
+            const isCurrent = lvl === currentEff;
+            const isSessionActive =
+              activeModel &&
+              modelsAreEqual(activeModel, this.effortPickerModel) &&
+              lvl === (this.pi.getThinkingLevel() as ThinkingLevel);
+
+            const pointer = isCursor ? this.theme.fg("warning", "› ") : "  ";
+            const radio = isCurrent
+              ? this.theme.fg("success", "[●] ")
+              : this.theme.fg("dim", "[○] ");
+
+            let lvlText = lvl.padEnd(8);
+            if (isCursor) {
+              lvlText = this.theme.fg("warning", bold(lvlText));
+            } else if (isCurrent) {
+              lvlText = this.theme.fg("success", lvlText);
+            } else {
+              lvlText = this.theme.fg("text", lvlText);
+            }
+
+            const desc = this.theme.fg("dim", `- ${EFFORT_DESCRIPTIONS[lvl] || ""}`);
+            const badge = isSessionActive
+              ? this.theme.fg("success", " [ACTIVE]")
+              : isCurrent
+              ? this.theme.fg("muted", " [CONFIGURED]")
+              : "";
+
+            rightCell = ` ${pointer}${radio}${lvlText} ${desc}${badge}`;
+          }
         }
+      } else {
+        // Normal Model View
+        const mIdx = this.modelScrollOffset + i;
+        if (mIdx < currentModels.length) {
+          const mdl = currentModels[mIdx];
+          const isSelected = mIdx === this.modelIndex;
+          const isCurrentActive =
+            activeModel?.provider === mdl.provider && activeModel?.id === mdl.id;
 
-        const check = isCurrentActive
-          ? this.theme.fg("success", "✓ ")
-          : "  ";
+          let pointer = "  ";
+          if (isSelected && mIsFocused) {
+            pointer = this.theme.fg("accent", "› ");
+          } else if (isSelected) {
+            pointer = this.theme.fg("muted", "▸ ");
+          }
 
-        let idText = mdl.id;
-        if (isSelected && mIsFocused) {
-          idText = this.theme.fg("accent", bold(idText));
-        } else if (isCurrentActive) {
-          idText = this.theme.fg("success", idText);
+          const check = isCurrentActive
+            ? this.theme.fg("success", "✓ ")
+            : "  ";
+
+          let idText = mdl.id;
+          if (isSelected && mIsFocused) {
+            idText = this.theme.fg("accent", bold(idText));
+          } else if (isCurrentActive) {
+            idText = this.theme.fg("success", idText);
+          }
+
+          const roleBadges = this.getRoleBadges(mdl).join(" ");
+          const isReasoning = isReasoningModel(mdl);
+          let rBadge = "";
+          if (isReasoning) {
+            const eff = this.getModelEffort(mdl);
+            rBadge = this.theme.fg("accent", `🧠 ${eff}`);
+          }
+          const vBadge = mdl.input?.includes("image") ? "📷" : "";
+          const ctxBadge = this.theme.fg("warning", formatTokens(mdl.contextWindow));
+
+          const infoBadges = [rBadge, vBadge, ctxBadge].filter(Boolean).join(" ");
+
+          rightCell = ` ${pointer}${check}${idText} ${roleBadges}`.trimEnd();
+          const avail = rightWidth - visibleWidth(rightCell) - visibleWidth(infoBadges) - 1;
+          if (avail > 0) {
+            rightCell += " ".repeat(avail) + infoBadges;
+          }
+
+          if (i === 0 && this.modelScrollOffset > 0) {
+            rightCell = ` ${this.theme.fg("muted", `▲ (${this.modelScrollOffset} more above)`)}`;
+          } else if (
+            i === this.visibleRows - 1 &&
+            this.modelScrollOffset + this.visibleRows < currentModels.length
+          ) {
+            const remaining =
+              currentModels.length - (this.modelScrollOffset + this.visibleRows);
+            rightCell = ` ${this.theme.fg("muted", `▼ (${remaining} more below)`)}`;
+          }
+        } else if (currentModels.length === 0 && i === 0) {
+          rightCell = `  ${this.theme.fg("dim", "No models available for this provider")}`;
         }
-
-        const roleBadges = this.getRoleBadges(mdl).join(" ");
-        const rBadge = mdl.reasoning ? this.theme.fg("accent", "🧠 Think") : "";
-        const vBadge = mdl.input?.includes("image") ? "📷" : "";
-        const ctxBadge = this.theme.fg("warning", formatTokens(mdl.contextWindow));
-
-        const infoBadges = [rBadge, vBadge, ctxBadge].filter(Boolean).join(" ");
-
-        rightCell = ` ${pointer}${check}${idText} ${roleBadges}`.trimEnd();
-        const avail = rightWidth - visibleWidth(rightCell) - visibleWidth(infoBadges) - 1;
-        if (avail > 0) {
-          rightCell += " ".repeat(avail) + infoBadges;
-        }
-
-        if (i === 0 && this.modelScrollOffset > 0) {
-          rightCell = ` ${this.theme.fg("muted", `▲ (${this.modelScrollOffset} more above)`)}`;
-        } else if (
-          i === this.visibleRows - 1 &&
-          this.modelScrollOffset + this.visibleRows < currentModels.length
-        ) {
-          const remaining =
-            currentModels.length - (this.modelScrollOffset + this.visibleRows);
-          rightCell = ` ${this.theme.fg("muted", `▼ (${remaining} more below)`)}`;
-        }
-      } else if (currentModels.length === 0 && i === 0) {
-        rightCell = `  ${this.theme.fg("dim", "No models available for this provider")}`;
       }
 
       lines.push(
@@ -914,7 +1238,19 @@ export class SplitModelPickerComponent {
     }
 
     // Detail spec card
-    if (selectedModel) {
+    if (this.isEffortPickerOpen && this.effortPickerModel) {
+      // Effort picker detail card
+      const hoveredLevel = this.effortPickerLevels[this.effortPickerIndex] || "off";
+      const desc = EFFORT_DESCRIPTIONS[hoveredLevel] || "";
+      const curEff = this.getModelEffort(this.effortPickerModel);
+
+      const detail1 = ` Selected Tier: ${this.theme.fg("warning", bold(hoveredLevel.toUpperCase()))} · ${desc}`;
+      lines.push("│" + pad(detail1, innerWidth) + "│");
+
+      const detail2 = ` Target Model: ${this.theme.fg("accent", bold(this.effortPickerModel.id))} · Configured: ${this.theme.fg("success", curEff.toUpperCase())} · Supported: [${this.effortPickerLevels.join(", ")}]`;
+      lines.push("│" + pad(detail2, innerWidth) + "│");
+    } else if (selectedModel) {
+      // Normal model detail card
       const isCurrentActive =
         activeModel?.provider === selectedModel.provider &&
         activeModel?.id === selectedModel.id;
@@ -932,10 +1268,14 @@ export class SplitModelPickerComponent {
 
       const costText = formatCost(selectedModel.cost);
       const costBadge = costText ? ` · ${this.theme.fg("muted", costText)}` : "";
-      const curEffort = (this.pi.getThinkingLevel() as ThinkingLevel) || "off";
-      const thinkText = selectedModel.reasoning
-        ? `${this.theme.fg("accent", "Yes 🧠")} (Effort: ${this.theme.fg("warning", curEffort.toUpperCase())})`
-        : this.theme.fg("dim", "None");
+
+      const isReasoning = isReasoningModel(selectedModel);
+      let thinkText = this.theme.fg("dim", "None");
+      if (isReasoning) {
+        const eff = this.getModelEffort(selectedModel);
+        const supported = getModelSupportedThinkingLevels(selectedModel);
+        thinkText = `${this.theme.fg("accent", "Yes 🧠")} (Effort: ${this.theme.fg("warning", eff.toUpperCase())} · Supported: ${supported.join(", ")})`;
+      }
 
       const detail2 = ` Context: ${this.theme.fg("warning", formatTokens(selectedModel.contextWindow))} · Max Output: ${this.theme.fg("warning", formatTokens(selectedModel.maxTokens))} · Thinking: ${thinkText}${costBadge}`;
       lines.push("│" + pad(detail2, innerWidth) + "│");
@@ -946,12 +1286,17 @@ export class SplitModelPickerComponent {
 
     // Bottom help bar
     lines.push("├" + "─".repeat(innerWidth) + "┤");
-    const filterState = this.showOnlyConfigured
-      ? this.theme.fg("success", "Configured Only")
-      : this.theme.fg("dim", "All Providers");
+    if (this.isEffortPickerOpen) {
+      const helpBar = " [↑/↓] Navigate  [Enter] Apply Effort  [Space] Apply & Switch  [e] Next Level  [Esc/←] Back";
+      lines.push("│" + pad(this.theme.fg("warning", helpBar), innerWidth) + "│");
+    } else {
+      const filterState = this.showOnlyConfigured
+        ? this.theme.fg("success", "Configured Only")
+        : this.theme.fg("dim", "All Providers");
 
-    const helpBar = ` [←/→] Panel  [↑/↓] Move  [Enter] Select  [d/s/f] Set Role  [1-3] Switch Role  [e] Effort  [/] Search  [Tab] ${filterState}  [Esc] Close`;
-    lines.push("│" + pad(this.theme.fg("dim", helpBar), innerWidth) + "│");
+      const helpBar = ` [←/→] Panel  [↑/↓] Move  [Enter] Select  [e] Pick Effort  [d/s/f] Role  [1-3] Switch Role  [/] Search  [Tab] ${filterState}  [Esc] Close`;
+      lines.push("│" + pad(this.theme.fg("dim", helpBar), innerWidth) + "│");
+    }
     lines.push("└" + "─".repeat(innerWidth) + "┘");
 
     return lines;
@@ -975,10 +1320,19 @@ async function openModelPicker(ctx: ExtensionCommandContext, pi: ExtensionAPI): 
   if (selectedModel) {
     const ok = await pi.setModel(selectedModel);
     if (ok) {
-      ctx.ui.notify(
-        `Switched model to ${selectedModel.provider}/${selectedModel.id}`,
-        "info"
-      );
+      if (isReasoningModel(selectedModel)) {
+        const configuredEffort = getEffectiveModelEffort(selectedModel);
+        pi.setThinkingLevel(configuredEffort);
+        ctx.ui.notify(
+          `Switched model to ${selectedModel.provider}/${selectedModel.id} (effort: ${configuredEffort.toUpperCase()})`,
+          "info"
+        );
+      } else {
+        ctx.ui.notify(
+          `Switched model to ${selectedModel.provider}/${selectedModel.id}`,
+          "info"
+        );
+      }
     } else {
       ctx.ui.notify(
         `Failed to switch to ${selectedModel.provider}/${selectedModel.id}: No valid authentication found.`,
@@ -989,58 +1343,273 @@ async function openModelPicker(ctx: ExtensionCommandContext, pi: ExtensionAPI): 
 }
 
 async function handleEffortCommand(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
-  const trimmed = args.trim().toLowerCase();
+  const trimmed = args.trim();
 
+  // Case 1: Arguments provided
   if (trimmed) {
-    const target = EFFORT_ALIASES[trimmed];
-    if (!target) {
-      const valid = THINKING_LEVELS.join(", ");
-      ctx.ui.notify(
-        `Unknown effort level "${args.trim()}". Valid levels: ${valid} (or min, med, max, 0-6)`,
-        "error"
+    const parts = trimmed.split(/\s+/);
+
+    // Subcase 1A: Two arguments - e.g. /effort <model> <level>
+    if (parts.length >= 2) {
+      const modelQuery = parts[0];
+      const levelQuery = parts.slice(1).join(" ").toLowerCase();
+      const allModels = ctx.modelRegistry.getAll() || [];
+      const targetModel = allModels.find(
+        (m) =>
+          m.id === modelQuery ||
+          `${m.provider}/${m.id}` === modelQuery ||
+          m.id.toLowerCase() === modelQuery.toLowerCase() ||
+          `${m.provider}/${m.id}`.toLowerCase() === modelQuery.toLowerCase()
       );
+
+      if (targetModel) {
+        const targetLevel = EFFORT_ALIASES[levelQuery];
+        if (!targetLevel) {
+          ctx.ui.notify(
+            `Unknown effort level "${levelQuery}". Valid levels: ${THINKING_LEVELS.join(", ")}`,
+            "error"
+          );
+          return;
+        }
+
+        if (!isReasoningModel(targetModel)) {
+          ctx.ui.notify(
+            `Model "${targetModel.provider}/${targetModel.id}" does not support reasoning/thinking effort.`,
+            "warning"
+          );
+          return;
+        }
+
+        const supported = getModelSupportedThinkingLevels(targetModel);
+        const effective = clampThinkingLevel(targetModel, targetLevel as any) as ThinkingLevel;
+        saveModelThinkingLevel(targetModel.provider, targetModel.id, effective);
+
+        // Update role if model is assigned to one
+        const rolesState = loadRolesState();
+        let roleUpdated = false;
+        for (const rKey of ["daily", "small", "frontier"] as const) {
+          const r = rolesState.roles[rKey];
+          if (r?.provider === targetModel.provider && r?.modelId === targetModel.id) {
+            r.effort = effective;
+            roleUpdated = true;
+          }
+        }
+        if (roleUpdated) saveRolesState(rolesState);
+
+        const clampedMsg =
+          effective !== targetLevel
+            ? ` (clamped from ${targetLevel}; supported: ${supported.join(", ")})`
+            : "";
+
+        if (ctx.model && modelsAreEqual(ctx.model, targetModel)) {
+          const previous = pi.getThinkingLevel();
+          pi.setThinkingLevel(effective);
+          ctx.ui.notify(
+            `Reasoning effort for ${targetModel.id}: ${previous} → ${effective}${clampedMsg}`,
+            "info"
+          );
+        } else {
+          ctx.ui.notify(
+            `Saved default reasoning effort for ${targetModel.provider}/${targetModel.id}: ${effective}${clampedMsg}`,
+            "info"
+          );
+        }
+        return;
+      }
+    }
+
+    // Subcase 1B: Single argument
+    // First, check if it is a recognized effort alias (sets effort on active model)
+    const targetLevel = EFFORT_ALIASES[trimmed.toLowerCase()];
+    if (targetLevel) {
+      if (!ctx.model) {
+        ctx.ui.notify("No active model in session.", "error");
+        return;
+      }
+
+      if (!isReasoningModel(ctx.model)) {
+        if (targetLevel === "off") {
+          pi.setThinkingLevel("off");
+          ctx.ui.notify("Reasoning effort: off", "info");
+          return;
+        }
+        ctx.ui.notify(
+          `Current model "${ctx.model.id}" does not support reasoning/thinking effort.`,
+          "warning"
+        );
+        return;
+      }
+
+      const supported = getModelSupportedThinkingLevels(ctx.model);
+      const effective = clampThinkingLevel(ctx.model, targetLevel as any) as ThinkingLevel;
+      const previous = pi.getThinkingLevel();
+      pi.setThinkingLevel(effective);
+      saveModelThinkingLevel(ctx.model.provider, ctx.model.id, effective);
+
+      // Update role if active model is assigned to one
+      const rolesState = loadRolesState();
+      let roleUpdated = false;
+      for (const rKey of ["daily", "small", "frontier"] as const) {
+        const r = rolesState.roles[rKey];
+        if (r?.provider === ctx.model.provider && r?.modelId === ctx.model.id) {
+          r.effort = effective;
+          roleUpdated = true;
+        }
+      }
+      if (roleUpdated) saveRolesState(rolesState);
+
+      const clampedMsg =
+        effective !== targetLevel
+          ? ` (clamped from ${targetLevel}; supported: ${supported.join(", ")})`
+          : "";
+      ctx.ui.notify(`Reasoning effort: ${previous} → ${effective}${clampedMsg}`, "info");
       return;
     }
 
-    const previous = pi.getThinkingLevel();
-    pi.setThinkingLevel(target);
-    const effective = pi.getThinkingLevel();
-    const clamped =
-      effective !== target ? ` (clamped to ${effective} for model ${ctx.model?.id || "unknown"})` : "";
+    // Next, check if it matches a model in the registry (opens interactive picker for that model)
+    const allModels = ctx.modelRegistry.getAll() || [];
+    const targetModel = allModels.find(
+      (m) =>
+        m.id === trimmed ||
+        `${m.provider}/${m.id}` === trimmed ||
+        m.id.toLowerCase() === trimmed.toLowerCase() ||
+        `${m.provider}/${m.id}`.toLowerCase() === trimmed.toLowerCase()
+    );
 
-    ctx.ui.notify(`Reasoning effort: ${previous} → ${effective}${clamped}`, "info");
+    if (targetModel) {
+      if (!isReasoningModel(targetModel)) {
+        ctx.ui.notify(
+          `Model "${targetModel.provider}/${targetModel.id}" does not support reasoning/thinking effort.`,
+          "warning"
+        );
+        return;
+      }
+
+      if (ctx.hasUI) {
+        const supported = getModelSupportedThinkingLevels(targetModel);
+        const currentEff = getEffectiveModelEffort(targetModel);
+        const choices = supported.map((level) => {
+          const isCur = level === currentEff;
+          const marker = isCur ? "● " : "  ";
+          const desc = EFFORT_DESCRIPTIONS[level] || "";
+          return `${marker}${level.padEnd(8)} - ${desc}${isCur ? " (current)" : ""}`;
+        });
+
+        const choice = await ctx.ui.select(
+          `Select reasoning effort for ${targetModel.id} (${supported.join(", ")}):`,
+          choices
+        );
+
+        if (!choice) return;
+
+        const chosenLevel = choice.trim().split(/\s+/)[0].replace("●", "").trim() as ThinkingLevel;
+        if (chosenLevel && supported.includes(chosenLevel)) {
+          saveModelThinkingLevel(targetModel.provider, targetModel.id, chosenLevel);
+
+          // Update role if target model is assigned to one
+          const rolesState = loadRolesState();
+          let roleUpdated = false;
+          for (const rKey of ["daily", "small", "frontier"] as const) {
+            const r = rolesState.roles[rKey];
+            if (r?.provider === targetModel.provider && r?.modelId === targetModel.id) {
+              r.effort = chosenLevel;
+              roleUpdated = true;
+            }
+          }
+          if (roleUpdated) saveRolesState(rolesState);
+
+          if (ctx.model && modelsAreEqual(ctx.model, targetModel)) {
+            const previous = pi.getThinkingLevel();
+            pi.setThinkingLevel(chosenLevel);
+            ctx.ui.notify(
+              `Reasoning effort for ${targetModel.id}: ${previous} → ${chosenLevel}`,
+              "info"
+            );
+          } else {
+            ctx.ui.notify(
+              `Saved reasoning effort for ${targetModel.provider}/${targetModel.id}: ${chosenLevel}`,
+              "info"
+            );
+          }
+        }
+        return;
+      } else {
+        const supported = getModelSupportedThinkingLevels(targetModel);
+        ctx.ui.notify(
+          `Supported effort levels for ${targetModel.id}: ${supported.join(", ")}`,
+          "info"
+        );
+        return;
+      }
+    }
+
+    // Argument didn't match an effort level or model
+    const valid =
+      ctx.model && isReasoningModel(ctx.model)
+        ? getModelSupportedThinkingLevels(ctx.model).join(", ")
+        : THINKING_LEVELS.join(", ");
+    ctx.ui.notify(
+      `Unknown effort level or model "${trimmed}". Valid levels for current model: ${valid}`,
+      "error"
+    );
     return;
   }
 
-  // Interactive selection prompt
+  // Case 2: No arguments - interactive selection for current model
+  if (!ctx.model) {
+    ctx.ui.notify("No active model in session.", "error");
+    return;
+  }
+
+  if (!isReasoningModel(ctx.model)) {
+    ctx.ui.notify(
+      `Current model "${ctx.model.id}" does not support reasoning/thinking effort.`,
+      "warning"
+    );
+    return;
+  }
+
   if (ctx.hasUI) {
+    const supported = getModelSupportedThinkingLevels(ctx.model);
     const current = (pi.getThinkingLevel() as ThinkingLevel) || "off";
-    const choices = THINKING_LEVELS.map((level) => {
+    const choices = supported.map((level) => {
       const isCur = level === current;
       const marker = isCur ? "● " : "  ";
-      const desc = EFFORT_DESCRIPTIONS[level];
+      const desc = EFFORT_DESCRIPTIONS[level] || "";
       return `${marker}${level.padEnd(8)} - ${desc}${isCur ? " (current)" : ""}`;
     });
 
     const choice = await ctx.ui.select(
-      `Select reasoning effort for ${ctx.model?.id || "current model"} (current: ${current}):`,
+      `Select reasoning effort for ${ctx.model.id} (${supported.join(", ")}):`,
       choices
     );
 
     if (!choice) return;
 
     const chosenLevel = choice.trim().split(/\s+/)[0].replace("●", "").trim() as ThinkingLevel;
-    if (chosenLevel) {
+    if (chosenLevel && supported.includes(chosenLevel)) {
       const previous = pi.getThinkingLevel();
       pi.setThinkingLevel(chosenLevel);
-      const effective = pi.getThinkingLevel();
-      const clamped =
-        effective !== chosenLevel ? ` (clamped to ${effective} for ${ctx.model?.id})` : "";
-      ctx.ui.notify(`Reasoning effort: ${previous} → ${effective}${clamped}`, "info");
+      saveModelThinkingLevel(ctx.model.provider, ctx.model.id, chosenLevel);
+
+      // Update role if current model is assigned to one
+      const rolesState = loadRolesState();
+      let roleUpdated = false;
+      for (const rKey of ["daily", "small", "frontier"] as const) {
+        const r = rolesState.roles[rKey];
+        if (r?.provider === ctx.model.provider && r?.modelId === ctx.model.id) {
+          r.effort = chosenLevel;
+          roleUpdated = true;
+        }
+      }
+      if (roleUpdated) saveRolesState(rolesState);
+
+      ctx.ui.notify(`Reasoning effort: ${previous} → ${chosenLevel}`, "info");
     }
   } else {
+    const supported = getModelSupportedThinkingLevels(ctx.model);
     ctx.ui.notify(
-      `Current effort: ${pi.getThinkingLevel()}. Usage: /effort <${THINKING_LEVELS.join("|")}>`,
+      `Current effort: ${pi.getThinkingLevel()}. Usage: /effort <${supported.join("|")}>`,
       "info"
     );
   }
@@ -1079,13 +1648,22 @@ async function handleRoleCommand(args: string, ctx: ExtensionCommandContext, pi:
 
     const ok = await pi.setModel(model);
     if (ok) {
-      if (role.effort) {
-        pi.setThinkingLevel(role.effort);
+      if (isReasoningModel(model)) {
+        const targetEffort = role.effort
+          ? (clampThinkingLevel(model, role.effort as any) as ThinkingLevel)
+          : getEffectiveModelEffort(model, undefined, undefined, rolesState);
+        pi.setThinkingLevel(targetEffort);
+        saveModelThinkingLevel(model.provider, model.id, targetEffort);
+        ctx.ui.notify(
+          `Switched to [${roleKey.toUpperCase()}]: ${role.provider}/${role.modelId} (effort: ${targetEffort.toUpperCase()})`,
+          "info"
+        );
+      } else {
+        ctx.ui.notify(
+          `Switched to [${roleKey.toUpperCase()}]: ${role.provider}/${role.modelId}`,
+          "info"
+        );
       }
-      ctx.ui.notify(
-        `Switched to [${roleKey.toUpperCase()}]: ${role.provider}/${role.modelId} (effort: ${role.effort || "default"})`,
-        "info"
-      );
     } else {
       ctx.ui.notify(`Failed to switch to ${role.modelId}: No valid API key configured.`, "error");
     }
@@ -1130,6 +1708,13 @@ async function handleRoleCommand(args: string, ctx: ExtensionCommandContext, pi:
 // --- Main Extension Registration ---
 
 export default function (pi: ExtensionAPI) {
+  let activeModelTracked: Model<any> | undefined;
+
+  // Track model switches to provide accurate argument completions
+  pi.on("model_select", (event) => {
+    activeModelTracked = event.model;
+  });
+
   // 1. /exit and /quit commands to exit Pi cleanly
   pi.registerCommand("exit", {
     description: "Exit pi cleanly",
@@ -1147,16 +1732,24 @@ export default function (pi: ExtensionAPI) {
 
   // 2. /effort and /thinking reasoning effort commands
   pi.registerCommand("effort", {
-    description: "Set or pick reasoning effort level: off, minimal, low, medium, high, xhigh, max",
+    description: "Set or pick reasoning effort level for active model or specific model",
     getArgumentCompletions: (prefix: string) => {
       const p = prefix.trim().toLowerCase();
-      const list = THINKING_LEVELS.filter((l) => l.startsWith(p)).map((l) => ({
-        value: l,
-        label: `${l} - ${EFFORT_DESCRIPTIONS[l]}`,
-      }));
+      const validLevels =
+        activeModelTracked && isReasoningModel(activeModelTracked)
+          ? getModelSupportedThinkingLevels(activeModelTracked)
+          : THINKING_LEVELS;
+
+      const list = validLevels
+        .filter((l) => l.startsWith(p))
+        .map((l) => ({
+          value: l,
+          label: `${l} - ${EFFORT_DESCRIPTIONS[l] || ""}`,
+        }));
       return list.length > 0 ? list : null;
     },
     handler: async (args, ctx) => {
+      activeModelTracked = ctx.model;
       await handleEffortCommand(args, ctx, pi);
     },
   });
@@ -1165,13 +1758,21 @@ export default function (pi: ExtensionAPI) {
     description: "Set reasoning thinking level (alias for /effort)",
     getArgumentCompletions: (prefix: string) => {
       const p = prefix.trim().toLowerCase();
-      const list = THINKING_LEVELS.filter((l) => l.startsWith(p)).map((l) => ({
-        value: l,
-        label: `${l} - ${EFFORT_DESCRIPTIONS[l]}`,
-      }));
+      const validLevels =
+        activeModelTracked && isReasoningModel(activeModelTracked)
+          ? getModelSupportedThinkingLevels(activeModelTracked)
+          : THINKING_LEVELS;
+
+      const list = validLevels
+        .filter((l) => l.startsWith(p))
+        .map((l) => ({
+          value: l,
+          label: `${l} - ${EFFORT_DESCRIPTIONS[l] || ""}`,
+        }));
       return list.length > 0 ? list : null;
     },
     handler: async (args, ctx) => {
+      activeModelTracked = ctx.model;
       await handleEffortCommand(args, ctx, pi);
     },
   });
@@ -1189,6 +1790,7 @@ export default function (pi: ExtensionAPI) {
       return list.length > 0 ? list : null;
     },
     handler: async (args, ctx) => {
+      activeModelTracked = ctx.model;
       await handleRoleCommand(args, ctx, pi);
     },
   });
@@ -1196,6 +1798,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("roles", {
     description: "Switch or view preconfigured model roles (alias for /role)",
     handler: async (args, ctx) => {
+      activeModelTracked = ctx.model;
       await handleRoleCommand(args, ctx, pi);
     },
   });
@@ -1204,6 +1807,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("daily", {
     description: "Switch to daily default model",
     handler: async (_args, ctx) => {
+      activeModelTracked = ctx.model;
       await handleRoleCommand("daily", ctx, pi);
     },
   });
@@ -1211,6 +1815,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("small", {
     description: "Switch to small model for tiny daily tasks",
     handler: async (_args, ctx) => {
+      activeModelTracked = ctx.model;
       await handleRoleCommand("small", ctx, pi);
     },
   });
@@ -1218,6 +1823,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("tiny", {
     description: "Switch to small model for tiny daily tasks (alias for /small)",
     handler: async (_args, ctx) => {
+      activeModelTracked = ctx.model;
       await handleRoleCommand("small", ctx, pi);
     },
   });
@@ -1225,6 +1831,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("frontier", {
     description: "Switch to frontier model for complex tasks with high reasoning",
     handler: async (_args, ctx) => {
+      activeModelTracked = ctx.model;
       await handleRoleCommand("frontier", ctx, pi);
     },
   });
@@ -1232,9 +1839,9 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("default", {
     description: "Set current model (or argument) as startup default model in settings.json",
     handler: async (args, ctx) => {
+      activeModelTracked = ctx.model;
       const trimmed = args.trim();
       if (trimmed) {
-        // Try finding model
         const all = ctx.modelRegistry.getAll();
         const found = all.find((m) => m.id === trimmed || `${m.provider}/${m.id}` === trimmed);
         if (found) {
@@ -1259,6 +1866,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("models", {
     description: "Open two-panel split model picker (Provider | Model)",
     handler: async (_args, ctx) => {
+      activeModelTracked = ctx.model;
       await openModelPicker(ctx, pi);
     },
   });
@@ -1266,6 +1874,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("mp", {
     description: "Open two-panel split model picker (quick shortcut)",
     handler: async (_args, ctx) => {
+      activeModelTracked = ctx.model;
       await openModelPicker(ctx, pi);
     },
   });
@@ -1273,6 +1882,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("picker", {
     description: "Open two-panel split model picker",
     handler: async (_args, ctx) => {
+      activeModelTracked = ctx.model;
       await openModelPicker(ctx, pi);
     },
   });
@@ -1280,6 +1890,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("model-picker", {
     description: "Open two-panel split model picker",
     handler: async (_args, ctx) => {
+      activeModelTracked = ctx.model;
       await openModelPicker(ctx, pi);
     },
   });
