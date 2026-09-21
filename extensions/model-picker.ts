@@ -33,7 +33,7 @@
  *        /effort <level>            : Set reasoning effort directly (clamped to model capabilities).
  *        /effort <model> <level>    : Set default reasoning effort for any model.
  *        /effort <model>            : Interactive effort selector for a specific model.
- *        /thinking                  : Alias of /effort.
+ *        /think                     : Alias of /effort.
  *        Argument completions dynamically adapt to active model's supported levels.
  *
  * 3. Preconfigured Roles & Default Models:
@@ -61,8 +61,9 @@
  *        Press '5' : Quick-switch to Fusion Sidekick model.
  *    - Full two-panel picker with in-picker effort picking replaces separate selectors.
  *
- * 5. Clean Shutdown (/exit, /quit):
+ * 5. Clean Shutdown (/exit):
  *    - /exit : Gracefully shuts down Pi via ctx.shutdown().
+ *             (/quit is a pi built-in and is intentionally not re-registered here.)
  */
 
 import type {
@@ -2090,7 +2091,10 @@ export default function (pi: ExtensionAPI) {
     activeModelTracked = event.model;
   });
 
-  // 1. /exit and /quit commands to exit Pi cleanly
+  // 1. /exit command to exit Pi cleanly.
+  // /quit is deliberately NOT registered: pi already ships a built-in /quit, and
+  // re-registering it only produces a built-in command conflict warning while
+  // being skipped in autocomplete.
   pi.registerCommand("exit", {
     description: "Exit pi cleanly",
     handler: async (_args, ctx) => {
@@ -2098,14 +2102,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("quit", {
-    description: "Exit pi cleanly",
-    handler: async (_args, ctx) => {
-      ctx.shutdown();
-    },
-  });
-
-  // 2. /effort and /thinking reasoning effort commands
+  // 2. /effort and /think reasoning effort commands
   pi.registerCommand("effort", {
     description: "Set or pick reasoning effort level for active model or specific model",
     getArgumentCompletions: (prefix: string) => {
@@ -2129,7 +2126,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("thinking", {
+  // /thinking is a pi built-in, so this alias is registered as /think to avoid a
+  // built-in command conflict (which would drop it from autocomplete).
+  pi.registerCommand("think", {
     description: "Set reasoning thinking level (alias for /effort)",
     getArgumentCompletions: (prefix: string) => {
       const p = prefix.trim().toLowerCase();

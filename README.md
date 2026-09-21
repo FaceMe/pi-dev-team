@@ -95,14 +95,17 @@ Effort levels are validated and clamped against the model's actual capabilities 
 | `/effort <level>` | Set reasoning effort directly for the active model (clamped to capabilities) |
 | `/effort <model>` | Interactive prompt to configure effort for a specific model |
 | `/effort <model> <level>` | Set and persist default reasoning effort for any model |
-| `/thinking` | Alias of `/effort` |
+| `/think` | Alias of `/effort` |
 
 - **Tier aliases**: `min`, `med`, `mid`, `hi`, `max`, `0`–`6` are supported.
 - **Tab completions**: dynamically adapt to the active model's supported reasoning tiers.
+- The alias is `/think`, not `/thinking`: `/thinking` is already a pi built-in, and
+  re-registering it would only shadow that command and drop it from autocomplete.
 
 ### Exit
 
-`/exit` and `/quit` shut down pi gracefully.
+`/exit` shuts down pi gracefully. (`/quit` is pi's own built-in command, so it is not
+registered here — use either one.)
 
 ## Fusion
 
@@ -113,7 +116,7 @@ its own transcript and its own tools — so the expensive prefix is not re-sent 
 every call the way a stateless "ask another model" tool would.
 
 Enable with `/fusion on` (on by default once configured). Open the menu with
-`/fusion` or `Ctrl+Shift+F`.
+`/fusion` or `Ctrl+Shift+D`.
 
 ### How it works
 
@@ -136,7 +139,7 @@ Enable with `/fusion on` (on by default once configured). Open the menu with
 
 A typical first-run session:
 
-1. **`/fusion`** (or `Ctrl+Shift+F`) — open the interactive menu.
+1. **`/fusion`** (or `Ctrl+Shift+D`) — open the interactive menu.
 2. **`/fusion main`** — pick the frontier model for the main agent via the
    Model Picker (or `/fusion main provider/model`). This also switches the
    session to it immediately.
@@ -189,7 +192,12 @@ survives until you explicitly enable Fusion.
 | `/fusion stats` | Session + lifetime cost/savings report in the transcript |
 | `/fusion route` | Classify the current task now and apply the routing decision |
 | `/fusion reset` | Drop the sidekick's context and reset session stats |
-| `Ctrl+Shift+F` | Open the Fusion menu |
+| `Ctrl+Shift+D` | Open the Fusion menu |
+
+The menu shortcut is `Ctrl+Shift+D` (`ctrl+shift+f` is pi's built-in alt-screen
+search, so it is left alone). Rebind it with `"shortcut"` in
+`~/.pi/agent/fusion.json` — e.g. `"shortcut": "ctrl+shift+j"` — then run
+`/reload`.
 
 ### Sidekick tool
 

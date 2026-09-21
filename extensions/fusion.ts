@@ -107,6 +107,12 @@ export interface FusionConfig {
   limits: FusionLimits;
   /** Optional override for the sidekick system prompt. */
   sidekickPrompt?: string;
+  /**
+   * Keyboard shortcut that opens the Fusion menu, in pi keybinding syntax
+   * (e.g. "ctrl+shift+d"). Override it in ~/.pi/agent/fusion.json if it collides
+   * with one of your own keybindings. Takes effect on the next /reload.
+   */
+  shortcut?: string;
 }
 
 export interface RouteRecord {
@@ -163,6 +169,15 @@ interface DelegationOutcome {
   hitTurnCap: boolean;
 }
 
+/**
+ * Default keyboard shortcut for the Fusion menu.
+ *
+ * `ctrl+shift+f` is taken by pi's built-in `tui.altScreen.search`, so binding it
+ * here would shadow that built-in (and emit a shortcut-conflict warning).
+ * `ctrl+shift+d` ("delegate") is free and matches what Fusion is for.
+ */
+const DEFAULT_FUSION_SHORTCUT = Key.ctrlShift("d");
+
 const DEFAULT_CONFIG: FusionConfig = {
   enabled: true,
   main: { provider: "anthropic", modelId: "claude-sonnet-4-5", effort: "high" },
@@ -176,7 +191,16 @@ const DEFAULT_CONFIG: FusionConfig = {
     escalateOnFailure: true,
   },
   limits: { maxTurns: 12, maxMessages: 40 },
+  shortcut: DEFAULT_FUSION_SHORTCUT,
 };
+
+/**
+ * Effective Fusion menu shortcut. Falls back to the default when unset or blank.
+ */
+function resolveFusionShortcut(config: FusionConfig): string {
+  const raw = typeof config.shortcut === "string" ? config.shortcut.trim().toLowerCase() : "";
+  return raw.length > 0 ? raw : DEFAULT_FUSION_SHORTCUT;
+}
 
 const CONFIG_PATH = path.join(getAgentDir(), "fusion.json");
 const STATS_PATH = path.join(getAgentDir(), "fusion-stats.json");
@@ -450,6 +474,10 @@ function loadConfig(): FusionConfig {
     sidekickTools: Array.isArray(stored?.sidekickTools)
       ? stored.sidekickTools.filter((name: unknown) => typeof name === "string")
       : [...DEFAULT_SIDEKICK_TOOLS],
+    shortcut:
+      typeof stored?.shortcut === "string" && stored.shortcut.trim()
+        ? stored.shortcut.trim().toLowerCase()
+        : DEFAULT_FUSION_SHORTCUT,
   };
 
   // Seed unset slots from the model-picker roles so both extensions agree on
@@ -1441,7 +1469,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
       ctx.ui.notify(`fusion: main model ${modelKey()} is unavailable (no auth?) — session model unchanged.`, "error");
       return;
     }
-    const current = ctx.getModel();
+    const current = ctx.model;
     if (current && modelsAreEqual(target, current)) return;
 
     const effort = clampEffort(target, config.main.effort);
@@ -1473,7 +1501,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
     const target = preFusionModel;
     preFusionModel = undefined;
     if (!target || userPickedModel) return;
-    const current = ctx.getModel();
+    const current = ctx.model;
     if (current && modelsAreEqual(target, current)) return;
     internalModelChange = true;
     try {
@@ -1696,7 +1724,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerShortcut(Key.ctrlShift("f"), {
+  pi.registerShortcut(resolveFusionShortcut(config), {
     description: "Open the Fusion menu",
     handler: async (ctx) => {
       const activeEngine = engine;
@@ -1839,6 +1867,7 @@ async function openConfigWizard(
         `${engine.config.sidekick.effort ? ` (${engine.config.sidekick.effort})` : ""}`,
       `sidekick tools: ${engine.config.sidekickTools.join(", ") || "(none)"}`,
       `routing: ${routing.enabled ? (routing.autoApply ? "auto" : "suggest-only") : "off"} · ${routing.mode}`,
+      `menu shortcut: ${resolveFusionShortcut(engine.config)}`,
       `state: ${engine.config.enabled ? "enabled" : "disabled"}`,
       "session stats",
       "route now",
@@ -1919,6 +1948,15 @@ async function openConfigWizard(
       const enabledChoice = await ctx.ui.select("Dynamic routing", ["enabled", "disabled"]);
       engine.config.routing.enabled = enabledChoice !== "disabled";
       hooks.persist();
+      continue;
+    }
+
+    if (choice.startsWith("menu shortcut:")) {
+      ctx.ui.notify(
+        `Fusion menu shortcut: ${resolveFusionShortcut(engine.config)}. ` +
+          `Change it with "shortcut" in ${CONFIG_PATH}, then run /reload.`,
+        "info",
+      );
       continue;
     }
 
