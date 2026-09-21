@@ -1,6 +1,6 @@
 {
   "name": "pi-model-picker",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Two-panel model picker, role manager (daily/small/frontier), reasoning-effort controller and a hybrid main/sidekick model harness for the pi coding agent",
   "type": "module",
   "license": "MIT",

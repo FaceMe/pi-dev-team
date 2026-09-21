@@ -52,13 +52,23 @@
  *        /daily, /small, /frontier    : Direct role activation shortcuts.
  *        /default [model]             : Set startup default model.
  *
- * 4. Clean Shutdown (/exit, /quit):
+ * 4. Fusion Model Selection & Slot Assignment:
+ *    - Model picker natively supports selecting models and effort for Fusion slots (main/sidekick).
+ *    - In Picker:
+ *        Press 'm' : Assign highlighted model as Fusion Main (frontier) agent.
+ *        Press 'k' : Assign highlighted model as Fusion Sidekick (cheap) agent.
+ *        Press '4' : Quick-switch to Fusion Main model.
+ *        Press '5' : Quick-switch to Fusion Sidekick model.
+ *    - Full two-panel picker with in-picker effort picking replaces separate selectors.
+ *
+ * 5. Clean Shutdown (/exit, /quit):
  *    - /exit : Gracefully shuts down Pi via ctx.shutdown().
  */
 
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
+  ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Model } from "@earendil-works/pi-ai";
@@ -178,8 +188,91 @@ export function getModelSupportedThinkingLevels(model?: Model<any> | null): Thin
 
 // --- Persistence Helpers ---
 
-const ROLES_FILE_PATH = path.join(os.homedir(), ".pi", "agent", "model-roles.json");
-const SETTINGS_FILE_PATH = path.join(os.homedir(), ".pi", "agent", "settings.json");
+export function getAgentDir(): string {
+  const custom = process.env.PI_CODING_AGENT_DIR;
+  return custom && custom.trim() ? custom.trim() : path.join(os.homedir(), ".pi", "agent");
+}
+
+export const ROLES_FILE_PATH = path.join(getAgentDir(), "model-roles.json");
+export const SETTINGS_FILE_PATH = path.join(getAgentDir(), "settings.json");
+export const FUSION_CONFIG_PATH = path.join(getAgentDir(), "fusion.json");
+
+// --- Fusion Config Helpers ---
+
+export interface FusionSlotConfig {
+  provider: string;
+  modelId: string;
+  effort?: ThinkingLevel;
+}
+
+export interface FusionConfigFile {
+  enabled?: boolean;
+  main?: FusionSlotConfig;
+  sidekick?: FusionSlotConfig;
+  sidekickTools?: string[];
+  routing?: {
+    enabled?: boolean;
+    mode?: "llm" | "heuristic" | "off";
+    autoApply?: boolean;
+    onCompact?: boolean;
+    escalateOnFailure?: boolean;
+  };
+  limits?: { maxTurns?: number; maxMessages?: number };
+  sidekickPrompt?: string;
+  [key: string]: unknown;
+}
+
+export function loadFusionConfig(): FusionConfigFile {
+  if (fs.existsSync(FUSION_CONFIG_PATH)) {
+    try {
+      const content = fs.readFileSync(FUSION_CONFIG_PATH, "utf8");
+      const data = JSON.parse(content);
+      if (data && typeof data === "object") return data as FusionConfigFile;
+    } catch {}
+  }
+
+  const roles = loadRolesState().roles;
+  return {
+    enabled: true,
+    main: roles.frontier
+      ? { provider: roles.frontier.provider, modelId: roles.frontier.modelId, effort: roles.frontier.effort }
+      : { provider: "anthropic", modelId: "claude-sonnet-4-5", effort: "high" },
+    sidekick: roles.small
+      ? { provider: roles.small.provider, modelId: roles.small.modelId, effort: roles.small.effort }
+      : { provider: "anthropic", modelId: "claude-haiku-4-5", effort: "low" },
+  };
+}
+
+export function saveFusionConfig(config: FusionConfigFile): void {
+  try {
+    const dir = path.dirname(FUSION_CONFIG_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(FUSION_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
+  } catch (e) {
+    console.error("Failed to write fusion.json:", e);
+  }
+}
+
+// --- Model Picker Options & Results ---
+
+export interface ModelPickerOptions {
+  /** Target selection mode:
+   * - "session": normal model picker, switches active session model on Enter (default)
+   * - "fusion-main": selects model & effort for Fusion Main agent
+   * - "fusion-sidekick": selects model & effort for Fusion Sidekick agent
+   * - "select": general selection, returns chosen model and effort
+   */
+  target?: "session" | "fusion-main" | "fusion-sidekick" | "select";
+  title?: string;
+  initialModel?: Model<any> | { provider: string; modelId: string };
+  initialEffort?: ThinkingLevel;
+  applyToSession?: boolean;
+}
+
+export interface ModelPickerResult {
+  model: Model<any>;
+  effort: ThinkingLevel;
+}
 
 function readSettingsFile(): Record<string, any> {
   if (fs.existsSync(SETTINGS_FILE_PATH)) {
@@ -297,15 +390,17 @@ export function saveDefaultModelToSettings(provider: string, modelId: string): v
  * Determine the effective thinking effort for any model:
  * 1. If currently active in session and currentSessionEffort provided -> clamp that level.
  * 2. If configured in settings.json modelThinkingLevels -> use that if supported.
- * 3. If configured in model-roles.json -> clamp that level.
- * 4. If global settings.json defaultThinkingLevel set -> clamp that level.
- * 5. Default fallback -> clamp "medium" (or lowest/highest supported).
+ * 3. If configured in fusion.json (main or sidekick) -> clamp that level.
+ * 4. If configured in model-roles.json -> clamp that level.
+ * 5. If global settings.json defaultThinkingLevel set -> clamp that level.
+ * 6. Default fallback -> clamp "medium" (or lowest/highest supported).
  */
 export function getEffectiveModelEffort(
   model: Model<any>,
   ctxModel?: Model<any>,
   currentSessionEffort?: ThinkingLevel,
-  rolesState?: ModelRolesState
+  rolesState?: ModelRolesState,
+  fusionConfig?: FusionConfigFile
 ): ThinkingLevel {
   if (!isReasoningModel(model)) {
     return "off";
@@ -324,7 +419,25 @@ export function getEffectiveModelEffort(
     return configured;
   }
 
-  // 3. Check roles state
+  // 3. Check fusion config
+  if (fusionConfig) {
+    if (
+      fusionConfig.main?.provider === model.provider &&
+      fusionConfig.main?.modelId === model.id &&
+      fusionConfig.main.effort
+    ) {
+      return clampThinkingLevel(model, fusionConfig.main.effort as any) as ThinkingLevel;
+    }
+    if (
+      fusionConfig.sidekick?.provider === model.provider &&
+      fusionConfig.sidekick?.modelId === model.id &&
+      fusionConfig.sidekick.effort
+    ) {
+      return clampThinkingLevel(model, fusionConfig.sidekick.effort as any) as ThinkingLevel;
+    }
+  }
+
+  // 4. Check roles state
   if (rolesState) {
     for (const rKey of ["daily", "frontier", "small"] as const) {
       const r = rolesState.roles[rKey];
@@ -334,13 +447,13 @@ export function getEffectiveModelEffort(
     }
   }
 
-  // 4. Global defaultThinkingLevel in settings.json
+  // 5. Global defaultThinkingLevel in settings.json
   const settings = readSettingsFile();
   if (settings.defaultThinkingLevel) {
     return clampThinkingLevel(model, settings.defaultThinkingLevel) as ThinkingLevel;
   }
 
-  // 5. Fallback clamped to medium (or whatever model supports)
+  // 6. Fallback clamped to medium (or whatever model supports)
   return clampThinkingLevel(model, "medium") as ThinkingLevel;
 }
 
@@ -376,7 +489,7 @@ function formatCost(cost?: { input: number; output: number; cacheRead?: number }
   return `In: ${inStr}/M · Out: ${outStr}/M`;
 }
 
-function buildProviderGroups(ctx: ExtensionCommandContext, currentModel?: Model<any>): ProviderGroup[] {
+function buildProviderGroups(ctx: ExtensionCommandContext | ExtensionContext, currentModel?: Model<any>): ProviderGroup[] {
   const allModels: Model<any>[] = ctx.modelRegistry.getAll() || [];
   const availableModels: Model<any>[] = ctx.modelRegistry.getAvailable() || [];
   const availableSet = new Set(availableModels.map((m) => `${m.provider}:${m.id}`));
@@ -436,9 +549,11 @@ function buildProviderGroups(ctx: ExtensionCommandContext, currentModel?: Model<
 export class SplitModelPickerComponent {
   private tui: any;
   private theme: any;
-  private done: (model: Model<any> | null) => void;
-  private ctx: ExtensionCommandContext;
+  private done: (result: (ModelPickerResult & Model<any>) | null) => void;
+  private ctx: ExtensionCommandContext | ExtensionContext;
   private pi: ExtensionAPI;
+  private options: ModelPickerOptions;
+  private fusionConfig: FusionConfigFile;
 
   private allProviders: ProviderGroup[] = [];
   private filteredProviders: ProviderGroup[] = [];
@@ -456,7 +571,7 @@ export class SplitModelPickerComponent {
 
   private providerScrollOffset: number = 0;
   private modelScrollOffset: number = 0;
-  private readonly visibleRows: number = 14;
+  private readonly visibleRows: number = 13;
 
   // Reasoning Effort Picker sub-state
   private isEffortPickerOpen: boolean = false;
@@ -467,17 +582,20 @@ export class SplitModelPickerComponent {
   constructor(
     tui: any,
     theme: any,
-    done: (model: Model<any> | null) => void,
-    ctx: ExtensionCommandContext,
-    pi: ExtensionAPI
+    done: (result: (ModelPickerResult & Model<any>) | null) => void,
+    ctx: ExtensionCommandContext | ExtensionContext,
+    pi: ExtensionAPI,
+    options?: ModelPickerOptions
   ) {
     this.tui = tui;
     this.theme = theme;
     this.done = done;
     this.ctx = ctx;
     this.pi = pi;
+    this.options = options ?? { target: "session" };
 
     this.rolesState = loadRolesState();
+    this.fusionConfig = loadFusionConfig();
 
     const currentModel = ctx.model;
     this.allProviders = buildProviderGroups(ctx, currentModel);
@@ -487,8 +605,34 @@ export class SplitModelPickerComponent {
 
     this.updateFilter();
 
-    // Focus on active provider & active model initially
-    if (currentModel) {
+    // Focus on initial target model if supplied, else active provider & active model
+    const initTarget = this.options.initialModel;
+    if (initTarget) {
+      const pId = "provider" in initTarget ? initTarget.provider : undefined;
+      const mId =
+        "modelId" in initTarget
+          ? (initTarget as any).modelId
+          : "id" in initTarget
+          ? (initTarget as any).id
+          : undefined;
+      if (pId) {
+        if (!this.filteredProviders.some((p) => p.id === pId) && this.allProviders.some((p) => p.id === pId)) {
+          this.showOnlyConfigured = false;
+          this.updateFilter();
+        }
+        const pIdx = this.filteredProviders.findIndex((p) => p.id === pId);
+        if (pIdx >= 0) {
+          this.providerIndex = pIdx;
+          const models = this.getCurrentModels();
+          if (mId) {
+            const mIdx = models.findIndex((m) => m.id === mId);
+            if (mIdx >= 0) {
+              this.modelIndex = mIdx;
+            }
+          }
+        }
+      }
+    } else if (currentModel) {
       const pIdx = this.filteredProviders.findIndex((p) => p.id === currentModel.provider);
       if (pIdx >= 0) {
         this.providerIndex = pIdx;
@@ -501,6 +645,15 @@ export class SplitModelPickerComponent {
     }
 
     this.ensureScrollVisibility();
+  }
+
+  private completeSelection(selectedModel: Model<any>, effort?: ThinkingLevel): void {
+    const finalEffort = effort ?? this.getModelEffort(selectedModel);
+    const result = Object.assign({}, selectedModel, {
+      model: selectedModel,
+      effort: finalEffort,
+    }) as ModelPickerResult & Model<any>;
+    this.done(result);
   }
 
   private setFlash(msg: string): void {
@@ -614,6 +767,14 @@ export class SplitModelPickerComponent {
       badges.push(this.theme.fg("success", "[Default]"));
     }
 
+    const fConfig = this.fusionConfig;
+    if (fConfig.main?.provider === model.provider && fConfig.main?.modelId === model.id) {
+      badges.push(`\x1b[36m[🔮 Fusion Main]\x1b[39m`);
+    }
+    if (fConfig.sidekick?.provider === model.provider && fConfig.sidekick?.modelId === model.id) {
+      badges.push(`\x1b[33m[⚡ Fusion Sidekick]\x1b[39m`);
+    }
+
     return badges;
   }
 
@@ -621,17 +782,31 @@ export class SplitModelPickerComponent {
    * Helper to retrieve effective reasoning effort for a model.
    */
   private getModelEffort(model: Model<any>): ThinkingLevel {
+    if (this.options.initialModel && this.options.initialEffort) {
+      const initTarget = this.options.initialModel;
+      const pId = "provider" in initTarget ? initTarget.provider : undefined;
+      const mId =
+        "modelId" in initTarget
+          ? (initTarget as any).modelId
+          : "id" in initTarget
+          ? (initTarget as any).id
+          : undefined;
+      if (model.provider === pId && model.id === mId) {
+        return clampThinkingLevel(model, this.options.initialEffort as any) as ThinkingLevel;
+      }
+    }
     return getEffectiveModelEffort(
       model,
       this.ctx.model,
       this.pi.getThinkingLevel() as ThinkingLevel,
-      this.rolesState
+      this.rolesState,
+      this.fusionConfig
     );
   }
 
   /**
    * Apply an effort level to a model: saves to settings.json,
-   * sets active session if model is currently active, and updates roles.
+   * sets active session if model is currently active, and updates roles and fusion.
    */
   private applyModelEffort(model: Model<any>, level: ThinkingLevel): void {
     saveModelThinkingLevel(model.provider, model.id, level);
@@ -650,6 +825,22 @@ export class SplitModelPickerComponent {
     }
     if (roleUpdated) {
       saveRolesState(this.rolesState);
+    }
+
+    let fusionUpdated = false;
+    if (this.fusionConfig.main?.provider === model.provider && this.fusionConfig.main?.modelId === model.id) {
+      this.fusionConfig.main.effort = level;
+      fusionUpdated = true;
+    }
+    if (this.fusionConfig.sidekick?.provider === model.provider && this.fusionConfig.sidekick?.modelId === model.id) {
+      this.fusionConfig.sidekick.effort = level;
+      fusionUpdated = true;
+    }
+    if (fusionUpdated) {
+      saveFusionConfig(this.fusionConfig);
+      if (this.pi.events) {
+        this.pi.events.emit("fusion_config_updated", this.fusionConfig);
+      }
     }
   }
 
@@ -725,7 +916,7 @@ export class SplitModelPickerComponent {
         if (chosen) {
           this.applyModelEffort(this.effortPickerModel, chosen);
           this.isEffortPickerOpen = false;
-          this.done(this.effortPickerModel);
+          this.completeSelection(this.effortPickerModel, chosen);
         }
         return;
       }
@@ -851,7 +1042,7 @@ export class SplitModelPickerComponent {
       const models = this.getCurrentModels();
       const selected = models[this.modelIndex];
       if (selected) {
-        this.done(selected);
+        this.completeSelection(selected);
       }
       return;
     }
@@ -863,7 +1054,7 @@ export class SplitModelPickerComponent {
       return;
     }
 
-    // 10. Role Quick Switches: '1', '2', '3'
+    // 10. Role & Fusion Quick Switches: '1', '2', '3', '4', '5'
     if (data === "1") {
       void this.quickSwitchRole("daily");
       return;
@@ -876,8 +1067,16 @@ export class SplitModelPickerComponent {
       void this.quickSwitchRole("frontier");
       return;
     }
+    if (data === "4") {
+      void this.quickSwitchFusion("main");
+      return;
+    }
+    if (data === "5") {
+      void this.quickSwitchFusion("sidekick");
+      return;
+    }
 
-    // 11. Model Actions on highlighted model: 'd', 's', 'f', 'e'
+    // 11. Model Actions on highlighted model: 'd', 's', 'f', 'm', 'k', 'e'
     const selectedModel = this.getCurrentModels()[this.modelIndex];
     if (selectedModel) {
       if (data === "d" || data === "D") {
@@ -922,6 +1121,44 @@ export class SplitModelPickerComponent {
         this.tui.requestRender();
         return;
       }
+      if (data === "m" || data === "M") {
+        const effort = isReasoningModel(selectedModel)
+          ? (clampThinkingLevel(selectedModel, this.getModelEffort(selectedModel) || "high") as ThinkingLevel)
+          : "off";
+        const fConfig = loadFusionConfig();
+        fConfig.main = {
+          provider: selectedModel.provider,
+          modelId: selectedModel.id,
+          effort,
+        };
+        saveFusionConfig(fConfig);
+        this.fusionConfig = fConfig;
+        if (this.pi.events) {
+          this.pi.events.emit("fusion_config_updated", fConfig);
+        }
+        this.setFlash(`✓ Assigned ${selectedModel.id} as Fusion Main Model (effort: ${effort})!`);
+        this.tui.requestRender();
+        return;
+      }
+      if (data === "k" || data === "K") {
+        const effort = isReasoningModel(selectedModel)
+          ? (clampThinkingLevel(selectedModel, this.getModelEffort(selectedModel) || "low") as ThinkingLevel)
+          : "off";
+        const fConfig = loadFusionConfig();
+        fConfig.sidekick = {
+          provider: selectedModel.provider,
+          modelId: selectedModel.id,
+          effort,
+        };
+        saveFusionConfig(fConfig);
+        this.fusionConfig = fConfig;
+        if (this.pi.events) {
+          this.pi.events.emit("fusion_config_updated", fConfig);
+        }
+        this.setFlash(`✓ Assigned ${selectedModel.id} as Fusion Sidekick Model (effort: ${effort})!`);
+        this.tui.requestRender();
+        return;
+      }
 
       // 'e' / 'E': Open interactive Reasoning Effort Picker for highlighted model
       if (data === "e" || data === "E") {
@@ -963,28 +1200,77 @@ export class SplitModelPickerComponent {
       this.tui.requestRender();
       return;
     }
-    const ok = await this.pi.setModel(model);
-    if (ok) {
-      if (isReasoningModel(model)) {
-        const targetEffort = role.effort
-          ? (clampThinkingLevel(model, role.effort as any) as ThinkingLevel)
-          : this.getModelEffort(model);
-        this.pi.setThinkingLevel(targetEffort);
-        saveModelThinkingLevel(model.provider, model.id, targetEffort);
-        this.ctx.ui.notify(
-          `Switched to [${roleKey.toUpperCase()}]: ${role.provider}/${role.modelId} (effort: ${targetEffort.toUpperCase()})`,
-          "info"
-        );
+
+    if (this.options.target === "session" || this.options.applyToSession) {
+      const ok = await this.pi.setModel(model);
+      if (ok) {
+        if (isReasoningModel(model)) {
+          const targetEffort = role.effort
+            ? (clampThinkingLevel(model, role.effort as any) as ThinkingLevel)
+            : this.getModelEffort(model);
+          this.pi.setThinkingLevel(targetEffort);
+          saveModelThinkingLevel(model.provider, model.id, targetEffort);
+          this.ctx.ui.notify(
+            `Switched to [${roleKey.toUpperCase()}]: ${role.provider}/${role.modelId} (effort: ${targetEffort.toUpperCase()})`,
+            "info"
+          );
+        } else {
+          this.ctx.ui.notify(
+            `Switched to [${roleKey.toUpperCase()}]: ${role.provider}/${role.modelId}`,
+            "info"
+          );
+        }
+        this.completeSelection(model, role.effort);
       } else {
-        this.ctx.ui.notify(
-          `Switched to [${roleKey.toUpperCase()}]: ${role.provider}/${role.modelId}`,
-          "info"
-        );
+        this.setFlash(`Failed to switch to ${role.modelId}: No API key configured.`);
+        this.tui.requestRender();
       }
-      this.done(model);
     } else {
-      this.setFlash(`Failed to switch to ${role.modelId}: No API key configured.`);
+      this.completeSelection(model, role.effort);
+    }
+  }
+
+  private async quickSwitchFusion(slot: "main" | "sidekick"): Promise<void> {
+    const fConfig = this.fusionConfig ?? loadFusionConfig();
+    const target = fConfig[slot];
+    if (!target) {
+      this.setFlash(`Fusion ${slot} is not configured yet. Press '${slot === "main" ? "m" : "k"}' on any model to set it.`);
       this.tui.requestRender();
+      return;
+    }
+    const model = this.ctx.modelRegistry.find(target.provider, target.modelId);
+    if (!model) {
+      this.setFlash(`Model ${target.provider}/${target.modelId} not found in registry.`);
+      this.tui.requestRender();
+      return;
+    }
+
+    if (this.options.target === "session" || this.options.applyToSession) {
+      const ok = await this.pi.setModel(model);
+      if (ok) {
+        if (isReasoningModel(model)) {
+          const targetEffort = target.effort
+            ? (clampThinkingLevel(model, target.effort as any) as ThinkingLevel)
+            : this.getModelEffort(model);
+          this.pi.setThinkingLevel(targetEffort);
+          saveModelThinkingLevel(model.provider, model.id, targetEffort);
+          this.ctx.ui.notify(
+            `Switched to [FUSION ${slot.toUpperCase()}]: ${target.provider}/${target.modelId} (effort: ${targetEffort.toUpperCase()})`,
+            "info"
+          );
+        } else {
+          this.ctx.ui.notify(
+            `Switched to [FUSION ${slot.toUpperCase()}]: ${target.provider}/${target.modelId}`,
+            "info"
+          );
+        }
+        this.completeSelection(model, target.effort);
+      } else {
+        this.setFlash(`Failed to switch to ${target.modelId}: No API key configured.`);
+        this.tui.requestRender();
+      }
+    } else {
+      this.completeSelection(model, target.effort);
     }
   }
 
@@ -1030,9 +1316,20 @@ export class SplitModelPickerComponent {
       const mDot = mIsFocused
         ? this.theme.fg("accent", "● ")
         : this.theme.fg("dim", "○ ");
+      let titleLabel = "MODELS";
+      if (this.options.title) {
+        titleLabel = this.options.title.toUpperCase();
+      } else if (this.options.target === "fusion-main") {
+        titleLabel = "FUSION MAIN AGENT";
+      } else if (this.options.target === "fusion-sidekick") {
+        titleLabel = "FUSION SIDEKICK AGENT";
+      } else if (this.options.target === "select") {
+        titleLabel = "SELECT MODEL";
+      }
+
       const mTitleText = mIsFocused
-        ? this.theme.fg("accent", bold("MODELS"))
-        : this.theme.fg("text", "MODELS");
+        ? this.theme.fg("accent", bold(titleLabel))
+        : this.theme.fg("text", titleLabel);
       const pNameTag = currentProvider
         ? ` : ${this.theme.fg("accent", currentProvider.displayName)}`
         : "";
@@ -1056,6 +1353,15 @@ export class SplitModelPickerComponent {
 
     const rolesRibbon = ` ${this.theme.fg("warning", "[1: ☀️ Daily]")} ${dStr}  ${this.theme.fg("accent", "[2: ⚡ Small]")} ${sStr}  ${this.theme.fg("muted", "[3: 🚀 Frontier]")} ${fStr}`;
     lines.push("│" + pad(rolesRibbon, innerWidth) + "│");
+
+    // Quick Fusion Ribbon row
+    const fConfig = this.fusionConfig;
+    const fMainStr = fConfig.main ? `${fConfig.main.modelId} (${fConfig.main.effort || "high"})` : "not set";
+    const fSideStr = fConfig.sidekick ? `${fConfig.sidekick.modelId} (${fConfig.sidekick.effort || "low"})` : "not set";
+    const fusionStateStr = fConfig.enabled !== false ? this.theme.fg("success", "● ON") : this.theme.fg("dim", "○ OFF");
+
+    const fusionRibbon = ` ${this.theme.fg("muted", "Fusion:")} ${fusionStateStr}  ${this.theme.fg("warning", "[m/4: 🔮 Main]")} ${fMainStr}  ${this.theme.fg("accent", "[k/5: ⚡ Sidekick]")} ${fSideStr}`;
+    lines.push("│" + pad(fusionRibbon, innerWidth) + "│");
 
     // Search bar if search mode or active query
     if (this.isSearchMode || this.searchQuery.length > 0) {
@@ -1263,7 +1569,19 @@ export class SplitModelPickerComponent {
         ? this.theme.fg("success", "API Key Configured ✓")
         : this.theme.fg("error", "No API Key Configured ✗");
 
-      const detail1 = ` ${bold(selectedModel.name || selectedModel.id)}${activeBadge} · Provider: ${this.theme.fg("accent", selectedModel.provider)} · Auth: ${authStatus}`;
+      const isFMain =
+        this.fusionConfig.main?.provider === selectedModel.provider &&
+        this.fusionConfig.main?.modelId === selectedModel.id;
+      const isFSide =
+        this.fusionConfig.sidekick?.provider === selectedModel.provider &&
+        this.fusionConfig.sidekick?.modelId === selectedModel.id;
+      const fusionTag = isFMain
+        ? ` ${this.theme.fg("accent", "[🔮 Fusion Main]")}`
+        : isFSide
+        ? ` ${this.theme.fg("warning", "[⚡ Fusion Sidekick]")}`
+        : "";
+
+      const detail1 = ` ${bold(selectedModel.name || selectedModel.id)}${activeBadge}${fusionTag} · Provider: ${this.theme.fg("accent", selectedModel.provider)} · Auth: ${authStatus}`;
       lines.push("│" + pad(detail1, innerWidth) + "│");
 
       const costText = formatCost(selectedModel.cost);
@@ -1287,14 +1605,21 @@ export class SplitModelPickerComponent {
     // Bottom help bar
     lines.push("├" + "─".repeat(innerWidth) + "┤");
     if (this.isEffortPickerOpen) {
-      const helpBar = " [↑/↓] Navigate  [Enter] Apply Effort  [Space] Apply & Switch  [e] Next Level  [Esc/←] Back";
+      const helpBar = " [↑/↓] Navigate  [Enter] Apply Effort  [Space] Apply & Select  [e] Next Level  [Esc/←] Back";
       lines.push("│" + pad(this.theme.fg("warning", helpBar), innerWidth) + "│");
     } else {
       const filterState = this.showOnlyConfigured
         ? this.theme.fg("success", "Configured Only")
         : this.theme.fg("dim", "All Providers");
 
-      const helpBar = ` [←/→] Panel  [↑/↓] Move  [Enter] Select  [e] Pick Effort  [d/s/f] Role  [1-3] Switch Role  [/] Search  [Tab] ${filterState}  [Esc] Close`;
+      let helpBar = "";
+      if (this.options.target === "fusion-main") {
+        helpBar = ` [←/→] Panel  [↑/↓] Move  [Enter] Select Main  [e] Effort  [Space] Select with Effort  [/] Search  [Tab] ${filterState}  [Esc] Cancel`;
+      } else if (this.options.target === "fusion-sidekick") {
+        helpBar = ` [←/→] Panel  [↑/↓] Move  [Enter] Select Sidekick  [e] Effort  [Space] Select with Effort  [/] Search  [Tab] ${filterState}  [Esc] Cancel`;
+      } else {
+        helpBar = ` [←/→] Panel  [↑/↓] Move  [Enter] Select  [e] Effort  [d/s/f] Role  [m/k] Fusion  [1-5] Switch  [/] Search  [Tab] ${filterState}  [Esc] Close`;
+      }
       lines.push("│" + pad(this.theme.fg("dim", helpBar), innerWidth) + "│");
     }
     lines.push("└" + "─".repeat(innerWidth) + "┘");
@@ -1305,39 +1630,89 @@ export class SplitModelPickerComponent {
 
 // --- Handler Functions ---
 
+export async function showModelPicker(
+  ctx: ExtensionContext | ExtensionCommandContext,
+  pi: ExtensionAPI,
+  options?: ModelPickerOptions
+): Promise<ModelPickerResult | null> {
+  if (ctx.mode !== "tui") {
+    return fallbackModelPicker(ctx, options);
+  }
+
+  const result = await ctx.ui.custom<(ModelPickerResult & Model<any>) | null>(
+    (tui, theme, _keybindings, done) => {
+      return new SplitModelPickerComponent(tui, theme, done, ctx, pi, options);
+    }
+  );
+
+  return result ? { model: result.model ?? result, effort: result.effort ?? "off" } : null;
+}
+
+async function fallbackModelPicker(
+  ctx: ExtensionContext | ExtensionCommandContext,
+  options?: ModelPickerOptions
+): Promise<ModelPickerResult | null> {
+  const available = [...(ctx.modelRegistry.getAvailable() || [])].sort((a, b) => {
+    if (a.provider !== b.provider) return a.provider.localeCompare(b.provider);
+    return a.id.localeCompare(b.id);
+  });
+  if (available.length === 0) {
+    ctx.ui.notify("No models with configured auth are available.", "error");
+    return null;
+  }
+  const title =
+    options?.title ||
+    (options?.target === "fusion-main"
+      ? "Pick Fusion Main Model"
+      : options?.target === "fusion-sidekick"
+      ? "Pick Fusion Sidekick Model"
+      : "Select Model");
+  const choices = available.map((m) => `${m.provider}/${m.id}`);
+  const picked = await ctx.ui.select(title, choices);
+  if (!picked) return null;
+  const model = available[choices.indexOf(picked)];
+  if (!model) return null;
+  const effort = getEffectiveModelEffort(model);
+  return { model, effort };
+}
+
 async function openModelPicker(ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
   if (ctx.mode !== "tui") {
     ctx.ui.notify("Model picker requires TUI mode", "error");
     return;
   }
 
-  const selectedModel = await ctx.ui.custom<Model<any> | null>(
-    (tui, theme, _keybindings, done) => {
-      return new SplitModelPickerComponent(tui, theme, done, ctx, pi);
-    }
-  );
+  const result = await showModelPicker(ctx, pi, { target: "session" });
 
-  if (selectedModel) {
-    const ok = await pi.setModel(selectedModel);
-    if (ok) {
-      if (isReasoningModel(selectedModel)) {
-        const configuredEffort = getEffectiveModelEffort(selectedModel);
-        pi.setThinkingLevel(configuredEffort);
-        ctx.ui.notify(
-          `Switched model to ${selectedModel.provider}/${selectedModel.id} (effort: ${configuredEffort.toUpperCase()})`,
-          "info"
-        );
+  if (result) {
+    const selectedModel = result.model;
+    const currentActive = ctx.model;
+    if (!currentActive || !modelsAreEqual(currentActive, selectedModel)) {
+      const ok = await pi.setModel(selectedModel);
+      if (ok) {
+        if (isReasoningModel(selectedModel)) {
+          const configuredEffort = result.effort || getEffectiveModelEffort(selectedModel);
+          pi.setThinkingLevel(configuredEffort);
+          ctx.ui.notify(
+            `Switched model to ${selectedModel.provider}/${selectedModel.id} (effort: ${configuredEffort.toUpperCase()})`,
+            "info"
+          );
+        } else {
+          ctx.ui.notify(
+            `Switched model to ${selectedModel.provider}/${selectedModel.id}`,
+            "info"
+          );
+        }
       } else {
         ctx.ui.notify(
-          `Switched model to ${selectedModel.provider}/${selectedModel.id}`,
-          "info"
+          `Failed to switch to ${selectedModel.provider}/${selectedModel.id}: No valid authentication found.`,
+          "error"
         );
       }
     } else {
-      ctx.ui.notify(
-        `Failed to switch to ${selectedModel.provider}/${selectedModel.id}: No valid authentication found.`,
-        "error"
-      );
+      if (isReasoningModel(selectedModel) && result.effort) {
+        pi.setThinkingLevel(result.effort);
+      }
     }
   }
 }

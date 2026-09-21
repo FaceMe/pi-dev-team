@@ -58,6 +58,7 @@ import { Box, Key, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { showModelPicker } from "./model-picker.js";
 
 // ---------------------------------------------------------------------------
 // Types & constants
@@ -1142,7 +1143,45 @@ export default function fusionExtension(pi: ExtensionAPI) {
 
   const persistConfig = (): void => {
     writeJsonFile(CONFIG_PATH, config);
+    if (pi.events) {
+      pi.events.emit("fusion_config_updated", config);
+    }
   };
+
+  if (pi.events) {
+    pi.events.on("fusion_config_updated", (updated: any) => {
+      if (updated && typeof updated === "object") {
+        let changed = false;
+        if (
+          updated.main &&
+          (updated.main.provider !== config.main.provider ||
+            updated.main.modelId !== config.main.modelId ||
+            updated.main.effort !== config.main.effort)
+        ) {
+          config.main = { ...config.main, ...updated.main };
+          if (engine) engine.config.main = config.main;
+          changed = true;
+        }
+        if (
+          updated.sidekick &&
+          (updated.sidekick.provider !== config.sidekick.provider ||
+            updated.sidekick.modelId !== config.sidekick.modelId ||
+            updated.sidekick.effort !== config.sidekick.effort)
+        ) {
+          config.sidekick = { ...config.sidekick, ...updated.sidekick };
+          if (engine) {
+            engine.config.sidekick = config.sidekick;
+            const sidekickMdl = engine.resolveSidekickModel();
+            if (sidekickMdl) {
+              engine.setSidekickModel(sidekickMdl, config.sidekick.effort);
+            }
+          }
+          changed = true;
+        }
+        if (changed) refreshUi();
+      }
+    });
+  }
 
   const refreshUi = (ctx?: ExtensionContext): void => {
     const target = ctx ?? engine?.latestCtx;
@@ -1390,7 +1429,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
   pi.registerCommand("fusion", {
     description: "Fusion hybrid harness: status, model configuration, routing and stats",
     getArgumentCompletions: (prefix: string) => {
-      const items = ["on", "off", "status", "stats", "models", "route", "reset", "help"].map((value) => ({
+      const items = ["on", "off", "main", "sidekick", "status", "stats", "models", "route", "reset", "help"].map((value) => ({
         value,
         label: value,
       }));
@@ -1407,6 +1446,107 @@ export default function fusionExtension(pi: ExtensionAPI) {
       const sub = args.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
 
       switch (sub) {
+        case "main": {
+          if (!ctx.hasUI) {
+            ctx.ui.notify(`main=${modelKey(activeEngine.resolveMainModel())}`, "info");
+            return;
+          }
+          const modelArg = args.trim().replace(/^main\s*/i, "").trim();
+          if (modelArg) {
+            const all = ctx.modelRegistry.getAll() || [];
+            const targetModel = all.find(
+              (m) =>
+                m.id === modelArg ||
+                `${m.provider}/${m.id}` === modelArg ||
+                m.id.toLowerCase() === modelArg.toLowerCase() ||
+                `${m.provider}/${m.id}`.toLowerCase() === modelArg.toLowerCase(),
+            );
+            if (targetModel) {
+              const effort = clampThinkingLevel(targetModel, activeEngine.config.main.effort || "high") as EffortLevel;
+              activeEngine.config.main = { provider: targetModel.provider, modelId: targetModel.id, effort };
+              persistConfig();
+              const ok = await pi.setModel(targetModel);
+              if (ok && effort) pi.setThinkingLevel(effort);
+              ctx.ui.notify(
+                ok
+                  ? `Main agent switched to ${modelKey(targetModel)}${effort ? ` (effort: ${effort})` : ""}.`
+                  : `No auth for ${modelKey(targetModel)}.`,
+                ok ? "info" : "error",
+              );
+              refreshUi(ctx);
+              return;
+            }
+          }
+          const result = await showModelPicker(ctx, pi, {
+            target: "fusion-main",
+            title: "Pick the main (frontier) agent model",
+            initialModel: activeEngine.resolveMainModel() ?? activeEngine.config.main,
+            initialEffort: activeEngine.config.main.effort as any,
+          });
+          if (result) {
+            const { model, effort } = result;
+            const effortLevel = effort as EffortLevel;
+            activeEngine.config.main = { provider: model.provider, modelId: model.id, effort: effortLevel };
+            persistConfig();
+            const ok = await pi.setModel(model);
+            if (ok && effortLevel) pi.setThinkingLevel(effortLevel);
+            ctx.ui.notify(
+              ok
+                ? `Main agent switched to ${modelKey(model)}${effortLevel ? ` (effort: ${effortLevel})` : ""}.`
+                : `No auth for ${modelKey(model)}.`,
+              ok ? "info" : "error",
+            );
+            refreshUi(ctx);
+          }
+          return;
+        }
+
+        case "sidekick": {
+          if (!ctx.hasUI) {
+            ctx.ui.notify(`sidekick=${modelKey(activeEngine.resolveSidekickModel())}`, "info");
+            return;
+          }
+          const modelArg = args.trim().replace(/^sidekick\s*/i, "").trim();
+          if (modelArg) {
+            const all = ctx.modelRegistry.getAll() || [];
+            const targetModel = all.find(
+              (m) =>
+                m.id === modelArg ||
+                `${m.provider}/${m.id}` === modelArg ||
+                m.id.toLowerCase() === modelArg.toLowerCase() ||
+                `${m.provider}/${m.id}`.toLowerCase() === modelArg.toLowerCase(),
+            );
+            if (targetModel) {
+              const effort = clampThinkingLevel(targetModel, activeEngine.config.sidekick.effort || "low") as EffortLevel;
+              activeEngine.setSidekickModel(targetModel, effort);
+              persistConfig();
+              ctx.ui.notify(
+                `Sidekick switched to ${modelKey(targetModel)}${effort ? ` (effort: ${effort})` : ""}.`,
+                "info",
+              );
+              refreshUi(ctx);
+              return;
+            }
+          }
+          const result = await showModelPicker(ctx, pi, {
+            target: "fusion-sidekick",
+            title: "Pick the sidekick (cheap) agent model",
+            initialModel: activeEngine.resolveSidekickModel() ?? activeEngine.config.sidekick,
+            initialEffort: activeEngine.config.sidekick.effort as any,
+          });
+          if (result) {
+            const { model, effort } = result;
+            const effortLevel = effort as EffortLevel;
+            activeEngine.setSidekickModel(model, effortLevel);
+            persistConfig();
+            ctx.ui.notify(
+              `Sidekick switched to ${modelKey(model)}${effortLevel ? ` (effort: ${effortLevel})` : ""}.`,
+              "info",
+            );
+            refreshUi(ctx);
+          }
+          return;
+        }
         case "on":
         case "off": {
           config.enabled = sub === "on";
@@ -1474,12 +1614,12 @@ export default function fusionExtension(pi: ExtensionAPI) {
             setThinkingLevel: (effort) => pi.setThinkingLevel(effort),
             appendStats: (activeEngine) => pi.appendEntry("fusion-stats", activeEngine.snapshot()),
             refreshUi,
-          });
+          }, pi);
           return;
         }
 
         default: {
-          ctx.ui.notify("Usage: /fusion [on|off|status|stats|models|route|reset]", "info");
+          ctx.ui.notify("Usage: /fusion [on|off|main|sidekick|status|stats|models|route|reset]", "info");
         }
       }
     },
@@ -1496,7 +1636,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
         setThinkingLevel: (effort) => pi.setThinkingLevel(effort),
         appendStats: (activeEngine) => pi.appendEntry("fusion-stats", activeEngine.snapshot()),
         refreshUi,
-      });
+      }, pi);
     },
   });
 
@@ -1607,44 +1747,12 @@ interface WizardHooks {
   refreshUi: (ctx?: ExtensionContext) => void;
 }
 
-async function pickModel(
-  ctx: ExtensionContext,
-  title: string,
-  registry: ModelRegistry,
-): Promise<Model<any> | undefined> {
-  const available = [...registry.getAvailable()].sort((a, b) => {
-    if (a.provider !== b.provider) return a.provider.localeCompare(b.provider);
-    return a.id.localeCompare(b.id);
-  });
-  if (available.length === 0) {
-    ctx.ui.notify("No models with configured auth are available.", "error");
-    return undefined;
-  }
-  const options = available.map((model) => modelKey(model));
-  const choice = await ctx.ui.select(title, options);
-  if (!choice) return undefined;
-  return available[options.indexOf(choice)];
-}
-
-async function pickEffort(
-  ctx: ExtensionContext,
-  model: Model<any>,
-  current?: EffortLevel,
-): Promise<EffortLevel | undefined> {
-  const levels = supportedEfforts(model);
-  const labels = levels.map((level) => `${level}${current === level ? "  (current)" : ""}`);
-  const choice = await ctx.ui.select(`Reasoning effort for ${modelKey(model)}`, labels);
-  if (!choice) return current;
-  return levels[labels.indexOf(choice)];
-}
-
 async function openConfigWizard(
   ctx: ExtensionContext,
   engine: FusionEngine,
   hooks: WizardHooks,
+  pi: ExtensionAPI,
 ): Promise<void> {
-  const registry = ctx.modelRegistry;
-
   while (true) {
     const routing = engine.config.routing;
     const choice = await ctx.ui.select("Fusion", [
@@ -1663,15 +1771,23 @@ async function openConfigWizard(
     if (!choice || choice === "done") return;
 
     if (choice.startsWith("main agent:")) {
-      const model = await pickModel(ctx, "Pick the main (frontier) agent model", registry);
-      if (!model) continue;
-      const effort = await pickEffort(ctx, model, engine.config.main.effort);
-      engine.config.main = { provider: model.provider, modelId: model.id, effort };
+      const result = await showModelPicker(ctx, pi, {
+        target: "fusion-main",
+        title: "Pick the main (frontier) agent model",
+        initialModel: engine.resolveMainModel() ?? engine.config.main,
+        initialEffort: engine.config.main.effort as any,
+      });
+      if (!result) continue;
+      const { model, effort } = result;
+      const effortLevel = effort as EffortLevel;
+      engine.config.main = { provider: model.provider, modelId: model.id, effort: effortLevel };
       hooks.persist();
       const ok = await hooks.setMainModel(model);
-      if (ok && effort) hooks.setThinkingLevel(effort);
+      if (ok && effortLevel) hooks.setThinkingLevel(effortLevel);
       ctx.ui.notify(
-        ok ? `Main agent switched to ${modelKey(model)}.` : `No auth for ${modelKey(model)}.`,
+        ok
+          ? `Main agent switched to ${modelKey(model)}${effortLevel ? ` (effort: ${effortLevel})` : ""}.`
+          : `No auth for ${modelKey(model)}.`,
         ok ? "info" : "error",
       );
       hooks.refreshUi(ctx);
@@ -1679,12 +1795,21 @@ async function openConfigWizard(
     }
 
     if (choice.startsWith("sidekick:")) {
-      const model = await pickModel(ctx, "Pick the sidekick (cheap) agent model", registry);
-      if (!model) continue;
-      const effort = await pickEffort(ctx, model, engine.config.sidekick.effort);
-      engine.setSidekickModel(model, effort);
+      const result = await showModelPicker(ctx, pi, {
+        target: "fusion-sidekick",
+        title: "Pick the sidekick (cheap) agent model",
+        initialModel: engine.resolveSidekickModel() ?? engine.config.sidekick,
+        initialEffort: engine.config.sidekick.effort as any,
+      });
+      if (!result) continue;
+      const { model, effort } = result;
+      const effortLevel = effort as EffortLevel;
+      engine.setSidekickModel(model, effortLevel);
       hooks.persist();
-      ctx.ui.notify(`Sidekick switched to ${modelKey(model)}.`, "info");
+      ctx.ui.notify(
+        `Sidekick switched to ${modelKey(model)}${effortLevel ? ` (effort: ${effortLevel})` : ""}.`,
+        "info",
+      );
       hooks.refreshUi(ctx);
       continue;
     }

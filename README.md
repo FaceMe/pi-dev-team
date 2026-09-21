@@ -8,7 +8,7 @@ Model tooling for the [pi coding agent](https://github.com/badlogic/pi-mono):
    plus a persistent cheap "sidekick" agent, with dynamic mid-session routing.
 
 ```bash
-pi install git:github.com/rsudharshan/pi-model-picker@v1.2.0
+pi install git:github.com/rsudharshan/pi-model-picker@v1.3.0
 ```
 
 Both extensions ship in the same package and load independently.
@@ -61,8 +61,11 @@ Inside the picker:
 | `d` | Assign highlighted model as **daily** (clamped to model's effort support) |
 | `s` | Assign highlighted model as **small** (clamped to model's effort support) |
 | `f` | Assign highlighted model as **frontier** (clamped to model's effort support) |
+| `m` | Assign highlighted model as **Fusion Main** (frontier) agent |
+| `k` | Assign highlighted model as **Fusion Sidekick** (cheap) agent |
 | `e` | Open Reasoning Effort Picker for highlighted model |
 | `1` / `2` / `3` | Quick-switch to daily / small / frontier |
+| `4` / `5` | Quick-switch to Fusion Main / Fusion Sidekick |
 
 Slash commands:
 
@@ -71,6 +74,14 @@ Slash commands:
 | `/role [daily\|small\|frontier]` | Switch role, or open the interactive role menu |
 | `/daily`, `/small`, `/tiny`, `/frontier` | Direct role activation |
 | `/default [model]` | Set the startup default model in `settings.json` |
+
+### Fusion Model Selection
+
+The Model Picker directly powers model selection for Fusion — no separate or flat selector needed:
+
+- In `/fusion` menu: choosing **main agent** or **sidekick** opens the full two-panel Model Picker with capability badges, token limits, search, and the interactive Reasoning Effort Picker (`e`).
+- `/fusion main` and `/fusion sidekick` directly launch the Model Picker to configure the respective Fusion slot.
+- Live `[🔮 Fusion Main]` and `[⚡ Fusion Sidekick]` badges and a dedicated Fusion Ribbon are displayed right inside the picker.
 
 ### Reasoning effort
 
@@ -124,6 +135,8 @@ Enable with `/fusion` (on by default once configured). Open the menu with
 | Command | Action |
 |---|---|
 | `/fusion` | Interactive menu: main/sidekick models, sidekick tools, routing, state, stats |
+| `/fusion main [model]` | Select or set the main (frontier) agent model via the Model Picker |
+| `/fusion sidekick [model]` | Select or set the sidekick (cheap) agent model via the Model Picker |
 | `/fusion on` / `/fusion off` | Enable or disable Fusion (removes the tool and the prompt section) |
 | `/fusion stats` | Session + lifetime cost/savings report in the transcript |
 | `/fusion route` | Classify the current task now and apply the routing decision |
