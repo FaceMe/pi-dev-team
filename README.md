@@ -110,7 +110,7 @@ session) delegates well-scoped work to a cheaper **sidekick** agent that keeps
 its own transcript and its own tools — so the expensive prefix is not re-sent on
 every call the way a stateless "ask another model" tool would.
 
-Enable with `/fusion` (on by default once configured). Open the menu with
+Enable with `/fusion on` (on by default once configured). Open the menu with
 `/fusion` or `Ctrl+Shift+F`.
 
 ### How it works
@@ -130,6 +130,51 @@ Enable with `/fusion` (on by default once configured). Open the menu with
 3. **Escalation.** Two consecutive failed delegations escalate the sidekick one
    tier automatically.
 
+### Usage flow
+
+A typical first-run session:
+
+1. **`/fusion`** (or `Ctrl+Shift+F`) — open the interactive menu.
+2. **`/fusion main`** — pick the frontier model for the main agent via the
+   Model Picker (or `/fusion main provider/model`). This also switches the
+   session to it immediately.
+3. **`/fusion sidekick`** — pick the cheap model (default: your `small` role)
+   and, in the menu, the sidekick's tools (`read, grep, find, ls, bash` by
+   default; add `edit`/`write` if it should make changes).
+4. **`/fusion on`** — enable the harness. The session model (footer,
+   bottom-right) syncs to the fusion main slot, the `sidekick` tool activates,
+   and the main agent's system prompt gains the delegation discipline.
+5. **Use pi normally.** The main agent plans, resolves ambiguity and verifies;
+   it delegates mechanical work (reads, greps, tests, builds, mechanical edits)
+   to the sidekick via the `sidekick` tool. Each delegation streams live
+   progress and reports model · turns · tokens · cost.
+6. **Routing (optional).** In `/fusion` → routing, pick `llm` or `heuristic`
+   mode and auto-apply vs suggest-only. At each `/compact`, the classifier may
+   move the main and/or sidekick model up or down the `small → daily →
+   frontier` ladder (auto-applied, or suggested for `/fusion route` to apply).
+7. **`/fusion stats`** — delegation counts, sidekick cost vs estimated
+   main-only cost, savings %, and every routing decision.
+8. **`/fusion reset`** — clear the sidekick's context and session stats.
+9. **`/fusion off`** — disable the harness and restore the model that was
+   active before you enabled Fusion.
+
+What you'll see in the footer while Fusion is on:
+
+- **Bottom-right (model display):** always the *live* main model. It syncs to
+  the main slot on `/fusion on`, and again if routing auto-applies a main-slot
+  change at a compaction boundary. `/fusion off` restores your pre-Fusion model
+  — unless you explicitly picked a model meanwhile (`/model`, `Ctrl+P`), in
+  which case your pick wins.
+- **Extension status line:** `⚛ fusion <sidekick-model> · N% saved ($x)` — the
+  sidekick lives here (it is an in-process agent, not the session model).
+- **Widget above the footer:** `main ... · sidekick ...` plus delegation,
+  failure and cost counters.
+
+Notes on the sync: `/fusion on` is idempotent — run it again after startup or
+`pi -m <model>` to re-sync the session model with the main slot. Fusion never
+overrides your model at session start, so a CLI/model-picker choice always
+survives until you explicitly enable Fusion.
+
 ### Commands
 
 | Command | Action |
@@ -137,7 +182,8 @@ Enable with `/fusion` (on by default once configured). Open the menu with
 | `/fusion` | Interactive menu: main/sidekick models, sidekick tools, routing, state, stats |
 | `/fusion main [model]` | Select or set the main (frontier) agent model via the Model Picker |
 | `/fusion sidekick [model]` | Select or set the sidekick (cheap) agent model via the Model Picker |
-| `/fusion on` / `/fusion off` | Enable or disable Fusion (removes the tool and the prompt section) |
+| `/fusion on` | Enable Fusion: activate the sidekick tool + prompt section and switch the session model to the fusion main slot (idempotent — re-run to re-sync) |
+| `/fusion off` | Disable Fusion: remove the tool and prompt section and restore your pre-Fusion model (unless you picked a model yourself meanwhile) |
 | `/fusion stats` | Session + lifetime cost/savings report in the transcript |
 | `/fusion route` | Classify the current task now and apply the routing decision |
 | `/fusion reset` | Drop the sidekick's context and reset session stats |

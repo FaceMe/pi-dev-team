@@ -1135,6 +1135,8 @@ export default function fusionExtension(pi: ExtensionAPI) {
   let engine: FusionEngine | undefined;
   let userPickedModel = false;
   let internalModelChange = false;
+  /** Session model active before fusion took over the main slot, for restore on /fusion off. */
+  let preFusionModel: Model<any> | undefined;
 
   // Registration methods are the only API calls allowed while the extension is
   // still loading, so tool/action lookups are deferred to session_start.
@@ -1424,6 +1426,64 @@ export default function fusionExtension(pi: ExtensionAPI) {
     }
   });
 
+  // -- main-slot sync ------------------------------------------------------
+
+  /**
+   * Point the session model (the footer's bottom-right display) at fusion's
+   * configured main slot. `/fusion on` and the wizard state toggle call this so
+   * the harness is actually live on the main model. Fusion-driven switches are
+   * wrapped in `internalModelChange` so they don't count as user picks —
+   * dynamic routing keeps ownership of the main slot while fusion is enabled.
+   */
+  const applyFusionMainSlot = async (ctx: ExtensionContext): Promise<void> => {
+    const target = engine?.resolveMainModel();
+    if (!target) {
+      ctx.ui.notify(`fusion: main model ${modelKey()} is unavailable (no auth?) — session model unchanged.`, "error");
+      return;
+    }
+    const current = ctx.getModel();
+    if (current && modelsAreEqual(target, current)) return;
+
+    const effort = clampEffort(target, config.main.effort);
+    internalModelChange = true;
+    try {
+      const ok = await pi.setModel(target);
+      if (!ok) {
+        ctx.ui.notify(`fusion: no auth for main ${modelKey(target)} — session model unchanged.`, "error");
+        return;
+      }
+      if (effort) pi.setThinkingLevel(effort);
+      preFusionModel = current;
+      ctx.ui.notify(
+        `fusion main: ${current ? `${modelKey(current)} → ` : ""}${modelKey(target)}` +
+          `${effort ? ` (effort: ${effort})` : ""}`,
+        "info",
+      );
+    } finally {
+      internalModelChange = false;
+    }
+  };
+
+  /**
+   * On /fusion off, hand the main slot back to whatever was active before
+   * fusion enabled — unless the user explicitly picked a model since, in which
+   * case their pick wins and stays.
+   */
+  const restorePreFusionModel = async (ctx: ExtensionContext): Promise<void> => {
+    const target = preFusionModel;
+    preFusionModel = undefined;
+    if (!target || userPickedModel) return;
+    const current = ctx.getModel();
+    if (current && modelsAreEqual(target, current)) return;
+    internalModelChange = true;
+    try {
+      const ok = await pi.setModel(target);
+      if (ok) ctx.ui.notify(`fusion off — main restored to ${modelKey(target)}.`, "info");
+    } finally {
+      internalModelChange = false;
+    }
+  };
+
   // -- commands ------------------------------------------------------------
 
   pi.registerCommand("fusion", {
@@ -1553,6 +1613,13 @@ export default function fusionExtension(pi: ExtensionAPI) {
           persistConfig();
           activeEngine.config = config;
           setSidekickToolActive(config.enabled);
+          // Sync the session model (footer bottom-right) with the fusion main
+          // slot on enable; hand it back on disable.
+          if (config.enabled) {
+            await applyFusionMainSlot(ctx);
+          } else {
+            await restorePreFusionModel(ctx);
+          }
           refreshUi(ctx);
           ctx.ui.notify(`Fusion ${config.enabled ? "enabled" : "disabled"}.`, "info");
           return;
@@ -1614,6 +1681,10 @@ export default function fusionExtension(pi: ExtensionAPI) {
             setThinkingLevel: (effort) => pi.setThinkingLevel(effort),
             appendStats: (activeEngine) => pi.appendEntry("fusion-stats", activeEngine.snapshot()),
             refreshUi,
+            setEnableState: async (wizardCtx, enabled) => {
+              if (enabled) await applyFusionMainSlot(wizardCtx);
+              else await restorePreFusionModel(wizardCtx);
+            },
           }, pi);
           return;
         }
@@ -1636,6 +1707,10 @@ export default function fusionExtension(pi: ExtensionAPI) {
         setThinkingLevel: (effort) => pi.setThinkingLevel(effort),
         appendStats: (activeEngine) => pi.appendEntry("fusion-stats", activeEngine.snapshot()),
         refreshUi,
+        setEnableState: async (wizardCtx, enabled) => {
+          if (enabled) await applyFusionMainSlot(wizardCtx);
+          else await restorePreFusionModel(wizardCtx);
+        },
       }, pi);
     },
   });
@@ -1745,6 +1820,8 @@ interface WizardHooks {
   setThinkingLevel: (effort: EffortLevel) => void;
   appendStats: (engine: FusionEngine) => void;
   refreshUi: (ctx?: ExtensionContext) => void;
+  /** Sync the session model with the main slot when fusion is toggled. */
+  setEnableState: (ctx: ExtensionContext, enabled: boolean) => Promise<void>;
 }
 
 async function openConfigWizard(
@@ -1848,6 +1925,7 @@ async function openConfigWizard(
     if (choice.startsWith("state:")) {
       engine.config.enabled = !engine.config.enabled;
       hooks.persist();
+      await hooks.setEnableState(ctx, engine.config.enabled);
       ctx.ui.notify(`Fusion ${engine.config.enabled ? "enabled" : "disabled"}.`, "info");
       continue;
     }
