@@ -1,6 +1,6 @@
 {
   "name": "pi-model-picker",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Two-panel model picker, role manager (daily/small/frontier), reasoning-effort controller, a hybrid main/sidekick model harness, and Qwen (chat.qwen.ai) brainstorm/research via your Chrome session for the pi coding agent",
   "type": "module",
   "license": "MIT",

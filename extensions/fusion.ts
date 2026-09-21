@@ -21,6 +21,11 @@
  *
  * Everything is opt-in and configurable through `/fusion`.
  *
+ * Every delegation also records an on-demand trace — the sidekick's thinking
+ * blocks, tool calls with output excerpts, and errors. It stays collapsed in
+ * the tool row (expand with the pi expand key) and `/fusion trace` dumps the
+ * latest one into the transcript.
+ *
  * State:
  *   ~/.pi/agent/fusion.json        — configuration (main/sidekick slots, routing, limits)
  *   ~/.pi/agent/fusion-stats.json  — lifetime cost/savings ledger
@@ -45,6 +50,7 @@ import {
   createReadTool,
   createWriteTool,
   getAgentDir,
+  keyHint,
 } from "@earendil-works/pi-coding-agent";
 import {
   calculateCost,
@@ -65,6 +71,12 @@ import { showModelPicker } from "./model-picker.js";
 // ---------------------------------------------------------------------------
 
 const EXTENSION_TAG = "fusion";
+
+/** Bounds for the on-demand sidekick trace (kept in tool details + session entries). */
+const TRACE_STEP_LIMIT = 80;
+const TRACE_THINKING_CHARS = 2000;
+const TRACE_OUTPUT_CHARS = 1200;
+const TRACE_OUTPUT_LINES = 12;
 
 /** Reasoning effort, including the "no thinking" level pi supports on every model. */
 export type EffortLevel = ModelThinkingLevel;
@@ -167,6 +179,28 @@ interface DelegationOutcome {
   model?: string;
   activity: string[];
   hitTurnCap: boolean;
+  meta: string;
+  trace: TraceStep[];
+}
+
+/** One step of the sidekick's delegation trace: thinking, a tool call, or an error. */
+export interface TraceStep {
+  kind: "thinking" | "tool" | "error";
+  title: string;
+  detail?: string;
+  /** Tool result excerpt (tool steps only). */
+  output?: string;
+  isError?: boolean;
+}
+
+/** Captured trace of a delegation, kept on the engine for on-demand inspection. */
+export interface DelegationTrace {
+  at: number;
+  task: string;
+  model?: string;
+  meta: string;
+  isError: boolean;
+  steps: TraceStep[];
 }
 
 /**
@@ -368,6 +402,101 @@ function extractFinalText(messages: Array<{ role: string; content?: unknown }>):
   return "";
 }
 
+/** Bounded, line-preserving excerpt of a tool output for trace display. */
+function excerpt(text: string, maxChars: number, maxLines: number): string {
+  const clean = String(text ?? "").replace(/\s+$/, "");
+  if (!clean.trim()) return "";
+  const lines = clean.split("\n");
+  const kept = lines.slice(0, maxLines).join("\n");
+  const out = kept.length > maxChars ? `${kept.slice(0, Math.max(0, maxChars - 1))}…` : kept;
+  const extraLines = lines.length - Math.min(lines.length, maxLines);
+  const extraChars = clean.length - out.length;
+  if (extraChars > 0) {
+    return `${out}\n… (+${extraChars} chars${extraLines > 0 ? `, +${extraLines} more line${extraLines === 1 ? "" : "s"}` : ""} truncated)`;
+  }
+  if (extraLines > 0) return `${out}\n… (+${extraLines} more line${extraLines === 1 ? "" : "s"})`;
+  return out;
+}
+
+/** Compact `model · turns · tokens · cost` line shared by results and traces. */
+function delegationMeta(outcome: { model?: string; turns: number; usage: Usage }): string {
+  return (
+    `${outcome.model ?? "sidekick"} · ${outcome.turns} turn${outcome.turns === 1 ? "" : "s"} · ` +
+    `${formatTokens(outcome.usage.totalTokens)} tok · ${formatCost(outcome.usage.cost.total)}`
+  );
+}
+
+/**
+ * Structured trace of a delegation — thinking blocks, tool calls with output
+ * excerpts, and errors — built from the sidekick transcript slice so the UI
+ * can show the full log on demand.
+ */
+function buildTrace(messages: Array<Record<string, any>>): TraceStep[] {
+  const steps: TraceStep[] = [];
+  const byCallId = new Map<string, TraceStep>();
+  let turn = 0;
+  for (const message of messages) {
+    if (message?.role === "assistant") {
+      turn += 1;
+      for (const part of message.content ?? []) {
+        if (part?.type === "thinking") {
+          const text = part.redacted
+            ? "(redacted by the provider)"
+            : truncate(String(part.thinking ?? ""), TRACE_THINKING_CHARS);
+          if (text) steps.push({ kind: "thinking", title: `turn ${turn} thinking`, detail: text });
+        } else if (part?.type === "toolCall") {
+          const name = String(part.name ?? "tool");
+          const step: TraceStep = {
+            kind: "tool",
+            title: name,
+            detail: describeActivity(name, (part.arguments ?? {}) as Record<string, unknown>),
+          };
+          steps.push(step);
+          if (part.id) byCallId.set(String(part.id), step);
+        }
+      }
+      if (message.stopReason === "error" || message.stopReason === "aborted" || message.errorMessage) {
+        steps.push({
+          kind: "error",
+          title: `turn ${turn} ${message.stopReason ?? "error"}`,
+          detail: message.errorMessage ?? "stopped early",
+          isError: true,
+        });
+      }
+    } else if (message?.role === "toolResult") {
+      const step = message.toolCallId ? byCallId.get(String(message.toolCallId)) : undefined;
+      if (!step) continue;
+      const text = (Array.isArray(message.content) ? message.content : [])
+        .map((part: any) => (part?.type === "text" ? String(part.text ?? "") : `[${part?.type}]`))
+        .join("\n");
+      const output = excerpt(text, TRACE_OUTPUT_CHARS, TRACE_OUTPUT_LINES);
+      if (output) step.output = output;
+      step.isError = Boolean(message.isError);
+    }
+  }
+  return steps.length > TRACE_STEP_LIMIT ? steps.slice(-TRACE_STEP_LIMIT) : steps;
+}
+
+/** Trace lines for expanded tool rows and /fusion trace entries. */
+function renderTraceSteps(steps: TraceStep[], theme: any): string[] {
+  const lines: string[] = [];
+  for (const step of steps) {
+    if (step.kind === "thinking") {
+      lines.push(`${theme.fg("dim", "⋯")} ${theme.fg("dim", step.title)}`);
+      if (step.detail) lines.push(theme.fg("dim", `  ${step.detail}`));
+    } else if (step.kind === "error") {
+      lines.push(theme.fg("error", `✗ ${step.title}${step.detail ? ` — ${truncate(step.detail, 200)}` : ""}`));
+    } else {
+      const marker = step.isError ? theme.fg("error", "✗") : theme.fg("accent", "•");
+      lines.push(`${marker} ${theme.fg("toolTitle", step.title)} ${theme.fg("muted", step.detail ?? "")}`);
+      if (step.output) {
+        for (const line of step.output.split("\n")) lines.push(theme.fg("toolOutput", `  ${line}`));
+      }
+    }
+  }
+  return lines;
+}
+
 function parseClassifierJson(result: { content?: unknown }): RoutingDecision | null {
   let text = "";
   const content = result.content;
@@ -563,6 +692,8 @@ export class FusionEngine {
   stats: FusionStats;
   lifetime: LifetimeStats;
   activity: string[] = [];
+  /** Trace of the most recent delegation, shown on demand via /fusion trace. */
+  lastTrace?: DelegationTrace;
 
   private pi: ExtensionAPI;
   private modelRegistry: ModelRegistry;
@@ -770,6 +901,8 @@ export class FusionEngine {
           "Fusion sidekick is unavailable: no sidekick model could be resolved. " +
           "Configure one with /fusion models.",
         activity: [],
+        meta: "sidekick unavailable",
+        trace: [],
       };
     }
 
@@ -835,6 +968,18 @@ export class FusionEngine {
     }
     this.trimSidekickTranscript();
 
+    // On-demand trace: thinking, tool calls with output excerpts, and errors.
+    const trace = buildTrace(messages);
+    const meta = delegationMeta({ model: modelKey(model), turns, usage });
+    this.lastTrace = {
+      at: Date.now(),
+      task: truncate(input.task, 200),
+      model: modelKey(model),
+      meta,
+      isError,
+      steps: trace,
+    };
+
     // Accounting: what the delegated work would have cost on the main model.
     // Prefer the model the session is actually running, since routing may have
     // moved it away from the configured main slot.
@@ -857,7 +1002,7 @@ export class FusionEngine {
       this.consecutiveFailures = 0;
     }
 
-    return { text, usage, turns, isError, errorMessage, model: modelKey(model), activity: [...this.activity], hitTurnCap };
+    return { text, usage, turns, isError, errorMessage, model: modelKey(model), activity: [...this.activity], hitTurnCap, meta, trace };
   }
 
   /** Sliding window over the persistent sidekick transcript, cut on a user boundary. */
@@ -1289,9 +1434,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
         clearInterval(progress);
       }
 
-      const meta =
-        `${outcome.model ?? "sidekick"} · ${outcome.turns} turn${outcome.turns === 1 ? "" : "s"} · ` +
-        `${formatTokens(outcome.usage.totalTokens)} tok · ${formatCost(outcome.usage.cost.total)}`;
+      const meta = outcome.meta;
       refreshUi(ctx);
 
       if (outcome.isError) {
@@ -1300,9 +1443,20 @@ export default function fusionExtension(pi: ExtensionAPI) {
         const authProblem = /api key|auth|unauthorized|forbidden|credential/i.test(
           outcome.errorMessage ?? "",
         );
+        // The full trace is not attachable to thrown errors, so embed a compact
+        // tail and point at /fusion trace for the complete log.
+        const tail = outcome.trace
+          .filter((step) => step.kind !== "thinking")
+          .slice(-6)
+          .map((step) =>
+            `  ${step.isError ? "✗" : "·"} ${step.title}${step.detail ? ` — ${truncate(step.detail, 80)}` : ""}`,
+          )
+          .join("\n");
         throw new Error(
           `Sidekick delegation failed: ${outcome.errorMessage ?? "unknown error"}\n${meta}` +
-            (authProblem ? "\n(hint: the sidekick provider may have no credentials — /fusion models)" : ""),
+            (tail ? `\nlast steps:\n${tail}` : "") +
+            (authProblem ? "\n(hint: the sidekick provider may have no credentials — /fusion models)" : "") +
+            `\n(${EXTENSION_TAG} trace shows the full delegation log)`,
         );
       }
 
@@ -1313,6 +1467,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
           turns: outcome.turns,
           usage: outcome.usage,
           activity: outcome.activity,
+          trace: outcome.trace,
           meta,
         },
         usage: outcome.usage,
@@ -1327,18 +1482,31 @@ export default function fusionExtension(pi: ExtensionAPI) {
       return component;
     },
 
-    renderResult(result, { isPartial }, theme) {
+    renderResult(result, { isPartial, expanded }, theme) {
       if (isPartial) {
         return new Text(theme.fg("warning", "… sidekick working"), 0, 0);
       }
-      const details = (result.details ?? {}) as { meta?: string };
+      const details = (result.details ?? {}) as { meta?: string; trace?: TraceStep[] };
       const head = theme.fg("success", "✓ sidekick");
       const meta = theme.fg("dim", ` ${details.meta ?? ""}`);
       const preview = truncate(
         (result.content ?? []).map((part: any) => part.text ?? "").join(" "),
         100,
       );
-      return new Text(`${head}${meta}\n${theme.fg("toolOutput", preview)}`, 0, 0);
+      const lines = [`${head}${meta}`, theme.fg("toolOutput", preview)];
+      const trace = details.trace ?? [];
+      if (expanded && trace.length > 0) {
+        lines.push(theme.fg("dim", "─".repeat(48)));
+        lines.push(...renderTraceSteps(trace, theme));
+      } else if (trace.length > 0) {
+        lines.push(
+          theme.fg(
+            "dim",
+            `${trace.length} trace step${trace.length === 1 ? "" : "s"} · ${keyHint("app.tools.expand", "to expand")}`,
+          ),
+        );
+      }
+      return new Text(lines.join("\n"), 0, 0);
     },
   });
 
@@ -1517,7 +1685,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
   pi.registerCommand("fusion", {
     description: "Fusion hybrid harness: status, model configuration, routing and stats",
     getArgumentCompletions: (prefix: string) => {
-      const items = ["on", "off", "main", "sidekick", "status", "stats", "models", "route", "reset", "help"].map((value) => ({
+      const items = ["on", "off", "main", "sidekick", "status", "stats", "models", "route", "trace", "reset", "help"].map((value) => ({
         value,
         label: value,
       }));
@@ -1659,6 +1827,16 @@ export default function fusionExtension(pi: ExtensionAPI) {
           return;
         }
 
+        case "trace": {
+          const trace = activeEngine.lastTrace;
+          if (!trace || trace.steps.length === 0) {
+            ctx.ui.notify("No sidekick delegation has run yet in this session.", "info");
+            return;
+          }
+          pi.appendEntry("fusion-trace", trace);
+          return;
+        }
+
         case "reset": {
           activeEngine.resetSidekick();
           activeEngine.resetSessionStats();
@@ -1718,7 +1896,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
         }
 
         default: {
-          ctx.ui.notify("Usage: /fusion [on|off|main|sidekick|status|stats|models|route|reset]", "info");
+          ctx.ui.notify("Usage: /fusion [on|off|main|sidekick|status|stats|models|route|trace|reset]", "info");
         }
       }
     },
@@ -1744,6 +1922,34 @@ export default function fusionExtension(pi: ExtensionAPI) {
   });
 
   // -- transcript rendering ------------------------------------------------
+
+  pi.registerEntryRenderer("fusion-trace", (entry, { expanded }, theme) => {
+    const trace = (entry.data ?? {}) as DelegationTrace;
+    const steps = trace.steps ?? [];
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    const flag = trace.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+    box.addChild(
+      new Text(`${theme.bold("sidekick trace")} ${flag} ${theme.fg("dim", trace.meta ?? "")}`, 0, 0),
+    );
+    if (trace.task) box.addChild(new Text(theme.fg("muted", truncate(trace.task, 200)), 0, 0));
+    if (!expanded) {
+      box.addChild(
+        new Text(
+          theme.fg(
+            "dim",
+            `${steps.length} step${steps.length === 1 ? "" : "s"} · ${keyHint("app.tools.expand", "to expand")}`,
+          ),
+          0,
+          0,
+        ),
+      );
+      return box;
+    }
+    const lines = renderTraceSteps(steps, theme);
+    if (lines.length === 0) box.addChild(new Text(theme.fg("dim", "(no steps recorded)"), 0, 0));
+    for (const line of lines) box.addChild(new Text(line, 0, 0));
+    return box;
+  });
 
   pi.registerEntryRenderer("fusion-route", (entry, { expanded }, theme) => {
     const record = (entry.data ?? {}) as RouteRecord;
@@ -1870,6 +2076,7 @@ async function openConfigWizard(
       `menu shortcut: ${resolveFusionShortcut(engine.config)}`,
       `state: ${engine.config.enabled ? "enabled" : "disabled"}`,
       "session stats",
+      "last delegation trace",
       "route now",
       "reset sidekick context",
       "done",
@@ -1970,6 +2177,15 @@ async function openConfigWizard(
 
     if (choice === "session stats") {
       hooks.appendStats(engine);
+      continue;
+    }
+
+    if (choice === "last delegation trace") {
+      if (!engine.lastTrace || engine.lastTrace.steps.length === 0) {
+        ctx.ui.notify("No sidekick delegation has run yet.", "info");
+      } else {
+        pi.appendEntry("fusion-trace", engine.lastTrace);
+      }
       continue;
     }
 

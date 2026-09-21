@@ -152,7 +152,9 @@ A typical first-run session:
 5. **Use pi normally.** The main agent plans, resolves ambiguity and verifies;
    it delegates mechanical work (reads, greps, tests, builds, mechanical edits)
    to the sidekick via the `sidekick` tool. Each delegation streams live
-   progress and reports model · turns · tokens · cost.
+   progress and reports model · turns · tokens · cost. The delegation's full
+   log — the sidekick's thinking, tool calls and their outputs — stays
+   collapsed: expand the tool row to see it, or run `/fusion trace`.
 6. **Routing (optional).** In `/fusion` → routing, pick `llm` or `heuristic`
    mode and auto-apply vs suggest-only. At each `/compact`, the classifier may
    move the main and/or sidekick model up or down the `small → daily →
@@ -190,6 +192,7 @@ survives until you explicitly enable Fusion.
 | `/fusion on` | Enable Fusion: activate the sidekick tool + prompt section and switch the session model to the fusion main slot (idempotent — re-run to re-sync) |
 | `/fusion off` | Disable Fusion: remove the tool and prompt section and restore your pre-Fusion model (unless you picked a model yourself meanwhile) |
 | `/fusion stats` | Session + lifetime cost/savings report in the transcript |
+| `/fusion trace` | Dump the latest delegation's log (thinking, tool calls, outputs) into the transcript as an expandable entry |
 | `/fusion route` | Classify the current task now and apply the routing decision |
 | `/fusion reset` | Drop the sidekick's context and reset session stats |
 | `Ctrl+Shift+D` | Open the Fusion menu |
@@ -211,6 +214,25 @@ search, so it is left alone). Rebind it with `"shortcut"` in
 Delegations are serialized, so parallel tool calls from the main agent queue up.
 The sidekick's tools default to `read, grep, find, ls, bash`; add `edit`/`write`
 in `/fusion → sidekick tools` if you want it to make changes.
+
+### Sidekick trace (thinking + output logs)
+
+Every delegation records a bounded, structured trace of what the sidekick did:
+its thinking blocks (including redacted ones, marked as such), every tool call
+with a described command/target, and each tool's output as a line- and
+character-capped excerpt. Failures and aborts appear as error steps.
+
+It is hidden by default — three ways to see it on demand:
+
+- **Expand the tool row** (pi's expand key, shown as a hint under the result):
+  the collapsed row keeps the compact preview; expanding appends the full trace
+  under a divider. This also works on old entries after a reload (traces are
+  stored in the session).
+- **`/fusion trace`** — appends the latest delegation's trace to the transcript
+  as an expandable `sidekick trace` entry. Also in `/fusion` → *last
+  delegation trace*.
+- **Failed delegations** embed a compact tail of the last steps in the error
+  itself, so the failure context is visible without any extra step.
 
 ### Cost accounting
 
