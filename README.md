@@ -8,7 +8,7 @@ Model tooling for the [pi coding agent](https://github.com/badlogic/pi-mono):
    plus a persistent cheap "sidekick" agent, with dynamic mid-session routing.
 
 ```bash
-pi install git:github.com/rsudharshan/pi-model-picker@v1.4.0
+pi install git:github.com/FaceMe/pi-dev-team
 ```
 
 All extensions ship in the same package and load independently.
@@ -293,15 +293,19 @@ only, no extra model call), or `off`.
 
 ## Development
 
-The package is one file per extension:
-[`extensions/model-picker.ts`](extensions/model-picker.ts) and
-[`extensions/fusion.ts`](extensions/fusion.ts).
-Pi core packages (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`,
-`@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`) are peer dependencies
-supplied by pi itself — no `npm install` needed. Try it without installing:
+Each extension is a thin entry point under `extensions/<name>/index.ts`; the
+code lives in `src/`:
+
+- `src/shared/` — config files, model helpers, capability tiers, traces, usage
+- `src/picker/` — the two-panel model picker, roles and effort controller
+- `src/fusion/` — the Fusion engine (`engine.ts`) and its commands/UI (`extension.ts`)
+
+Pi core packages are peer dependencies supplied by pi itself. For development:
 
 ```bash
-pi -e /path/to/pi-model-picker
+npm install        # dev dependencies: pi packages for types, vitest, typescript
+npm run check      # typecheck + tests
+pi -e ./extensions/model-picker/index.ts -e ./extensions/fusion/index.ts
 ```
 
 ## License

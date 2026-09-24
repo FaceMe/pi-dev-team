@@ -78,9 +78,38 @@ import {
   getSupportedThinkingLevels,
   modelsAreEqual,
 } from "@earendil-works/pi-ai";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import * as os from "node:os";
+import {
+  agentDir,
+  fusionConfigPath,
+  FUSION_CONFIG_EVENT,
+  getModelThinkingLevel,
+  loadFusionConfig,
+  loadRolesState,
+  readSettings,
+  rolesPath,
+  saveDefaultModelToSettings,
+  saveFusionConfig,
+  saveModelThinkingLevel,
+  saveRolesState,
+  settingsPath,
+  updateFusionConfig,
+} from "../shared/config.js";
+import type { FusionConfig, FusionSlot, ModelRolesState, RoleConfig } from "../shared/config.js";
+
+export {
+  getModelThinkingLevel,
+  loadFusionConfig,
+  loadRolesState,
+  saveDefaultModelToSettings,
+  saveFusionConfig,
+  saveModelThinkingLevel,
+  saveRolesState,
+};
+export type { ModelRolesState, RoleConfig };
+/** @deprecated use FusionSlot from src/shared/config */
+export type FusionSlotConfig = FusionSlot;
+/** @deprecated use FusionConfig from src/shared/config */
+export type FusionConfigFile = FusionConfig;
 
 // --- Types & Interfaces ---
 
@@ -140,24 +169,6 @@ export const EFFORT_ALIASES: Record<string, ThinkingLevel> = {
   "6": "max",
 };
 
-export interface RoleConfig {
-  provider: string;
-  modelId: string;
-  effort?: ThinkingLevel;
-}
-
-export interface ModelRolesState {
-  roles: {
-    daily?: RoleConfig;
-    small?: RoleConfig;
-    frontier?: RoleConfig;
-  };
-  defaultModel?: {
-    provider: string;
-    modelId: string;
-  };
-}
-
 interface ProviderGroup {
   id: string;
   displayName: string;
@@ -187,72 +198,15 @@ export function getModelSupportedThinkingLevels(model?: Model<any> | null): Thin
   return getSupportedThinkingLevels(model) as ThinkingLevel[];
 }
 
-// --- Persistence Helpers ---
+// --- Persistence Helpers (single source of truth: src/shared/config.ts) ---
 
 export function getAgentDir(): string {
-  const custom = process.env.PI_CODING_AGENT_DIR;
-  return custom && custom.trim() ? custom.trim() : path.join(os.homedir(), ".pi", "agent");
+  return agentDir();
 }
 
-export const ROLES_FILE_PATH = path.join(getAgentDir(), "model-roles.json");
-export const SETTINGS_FILE_PATH = path.join(getAgentDir(), "settings.json");
-export const FUSION_CONFIG_PATH = path.join(getAgentDir(), "fusion.json");
-
-// --- Fusion Config Helpers ---
-
-export interface FusionSlotConfig {
-  provider: string;
-  modelId: string;
-  effort?: ThinkingLevel;
-}
-
-export interface FusionConfigFile {
-  enabled?: boolean;
-  main?: FusionSlotConfig;
-  sidekick?: FusionSlotConfig;
-  sidekickTools?: string[];
-  routing?: {
-    enabled?: boolean;
-    mode?: "llm" | "heuristic" | "off";
-    autoApply?: boolean;
-    onCompact?: boolean;
-    escalateOnFailure?: boolean;
-  };
-  limits?: { maxTurns?: number; maxMessages?: number };
-  sidekickPrompt?: string;
-  [key: string]: unknown;
-}
-
-export function loadFusionConfig(): FusionConfigFile {
-  if (fs.existsSync(FUSION_CONFIG_PATH)) {
-    try {
-      const content = fs.readFileSync(FUSION_CONFIG_PATH, "utf8");
-      const data = JSON.parse(content);
-      if (data && typeof data === "object") return data as FusionConfigFile;
-    } catch {}
-  }
-
-  const roles = loadRolesState().roles;
-  return {
-    enabled: true,
-    main: roles.frontier
-      ? { provider: roles.frontier.provider, modelId: roles.frontier.modelId, effort: roles.frontier.effort }
-      : { provider: "anthropic", modelId: "claude-sonnet-4-5", effort: "high" },
-    sidekick: roles.small
-      ? { provider: roles.small.provider, modelId: roles.small.modelId, effort: roles.small.effort }
-      : { provider: "anthropic", modelId: "claude-haiku-4-5", effort: "low" },
-  };
-}
-
-export function saveFusionConfig(config: FusionConfigFile): void {
-  try {
-    const dir = path.dirname(FUSION_CONFIG_PATH);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(FUSION_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
-  } catch (e) {
-    console.error("Failed to write fusion.json:", e);
-  }
-}
+export const ROLES_FILE_PATH = rolesPath();
+export const SETTINGS_FILE_PATH = settingsPath();
+export const FUSION_CONFIG_PATH = fusionConfigPath();
 
 // --- Model Picker Options & Results ---
 
@@ -275,118 +229,6 @@ export interface ModelPickerResult {
   effort: ThinkingLevel;
 }
 
-function readSettingsFile(): Record<string, any> {
-  if (fs.existsSync(SETTINGS_FILE_PATH)) {
-    try {
-      return JSON.parse(fs.readFileSync(SETTINGS_FILE_PATH, "utf8"));
-    } catch {
-      return {};
-    }
-  }
-  return {};
-}
-
-function writeSettingsFile(settings: Record<string, any>): void {
-  try {
-    const dir = path.dirname(SETTINGS_FILE_PATH);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(SETTINGS_FILE_PATH, JSON.stringify(settings, null, 2) + "\n", "utf8");
-  } catch (e) {
-    console.error("Failed to write settings.json:", e);
-  }
-}
-
-/**
- * Read the configured thinking level for a specific model from ~/.pi/agent/settings.json
- * (under `modelThinkingLevels`). Pi core uses this setting natively when switching models.
- */
-export function getModelThinkingLevel(provider: string, modelId: string): ThinkingLevel | undefined {
-  const settings = readSettingsFile();
-  return settings.modelThinkingLevels?.[`${provider}/${modelId}`];
-}
-
-/**
- * Persist the configured thinking level for a specific model into ~/.pi/agent/settings.json
- * (under `modelThinkingLevels`).
- */
-export function saveModelThinkingLevel(provider: string, modelId: string, level: ThinkingLevel): void {
-  const settings = readSettingsFile();
-  if (!settings.modelThinkingLevels) {
-    settings.modelThinkingLevels = {};
-  }
-  settings.modelThinkingLevels[`${provider}/${modelId}`] = level;
-  writeSettingsFile(settings);
-}
-
-export function loadRolesState(): ModelRolesState {
-  if (fs.existsSync(ROLES_FILE_PATH)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(ROLES_FILE_PATH, "utf8"));
-      if (data && data.roles) return data as ModelRolesState;
-    } catch {}
-  }
-
-  // Generate intelligent initial state from settings.json
-  const settings = readSettingsFile();
-  const defaultProvider = settings.defaultProvider || "anthropic";
-  const defaultModel = settings.defaultModel || "claude-3-7-sonnet";
-
-  const initial: ModelRolesState = {
-    roles: {
-      daily: {
-        provider: defaultProvider,
-        modelId: defaultModel,
-        effort: "medium",
-      },
-      small: {
-        provider: defaultProvider === "openai" ? "openai" : "anthropic",
-        modelId: defaultProvider === "openai" ? "gpt-4o-mini" : "claude-3-5-haiku",
-        effort: "off",
-      },
-      frontier: {
-        provider: defaultProvider,
-        modelId: defaultModel,
-        effort: "high",
-      },
-    },
-    defaultModel: {
-      provider: defaultProvider,
-      modelId: defaultModel,
-    },
-  };
-
-  saveRolesState(initial);
-  return initial;
-}
-
-export function saveRolesState(state: ModelRolesState): void {
-  try {
-    const dir = path.dirname(ROLES_FILE_PATH);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(ROLES_FILE_PATH, JSON.stringify(state, null, 2) + "\n", "utf8");
-  } catch (e) {
-    console.error("Failed to write model-roles.json:", e);
-  }
-}
-
-export function saveDefaultModelToSettings(provider: string, modelId: string): void {
-  const settings = readSettingsFile();
-  settings.defaultProvider = provider;
-  settings.defaultModel = modelId;
-  writeSettingsFile(settings);
-
-  // Update roles state defaultModel as well
-  const rolesState = loadRolesState();
-  rolesState.defaultModel = { provider, modelId };
-  if (!rolesState.roles.daily) {
-    rolesState.roles.daily = { provider, modelId, effort: "medium" };
-  } else {
-    rolesState.roles.daily.provider = provider;
-    rolesState.roles.daily.modelId = modelId;
-  }
-  saveRolesState(rolesState);
-}
-
 /**
  * Determine the effective thinking effort for any model:
  * 1. If currently active in session and currentSessionEffort provided -> clamp that level.
@@ -401,7 +243,7 @@ export function getEffectiveModelEffort(
   ctxModel?: Model<any>,
   currentSessionEffort?: ThinkingLevel,
   rolesState?: ModelRolesState,
-  fusionConfig?: FusionConfigFile
+  fusionConfig?: FusionConfig
 ): ThinkingLevel {
   if (!isReasoningModel(model)) {
     return "off";
@@ -449,7 +291,7 @@ export function getEffectiveModelEffort(
   }
 
   // 5. Global defaultThinkingLevel in settings.json
-  const settings = readSettingsFile();
+  const settings = readSettings();
   if (settings.defaultThinkingLevel) {
     return clampThinkingLevel(model, settings.defaultThinkingLevel) as ThinkingLevel;
   }
@@ -838,10 +680,8 @@ export class SplitModelPickerComponent {
       fusionUpdated = true;
     }
     if (fusionUpdated) {
-      saveFusionConfig(this.fusionConfig);
-      if (this.pi.events) {
-        this.pi.events.emit("fusion_config_updated", this.fusionConfig);
-      }
+      this.fusionConfig = updateFusionConfig({ main: this.fusionConfig.main, sidekick: this.fusionConfig.sidekick });
+      this.pi.events?.emit(FUSION_CONFIG_EVENT, this.fusionConfig);
     }
   }
 
@@ -1126,17 +966,11 @@ export class SplitModelPickerComponent {
         const effort = isReasoningModel(selectedModel)
           ? (clampThinkingLevel(selectedModel, this.getModelEffort(selectedModel) || "high") as ThinkingLevel)
           : "off";
-        const fConfig = loadFusionConfig();
-        fConfig.main = {
-          provider: selectedModel.provider,
-          modelId: selectedModel.id,
-          effort,
-        };
-        saveFusionConfig(fConfig);
+        const fConfig = updateFusionConfig({
+          main: { provider: selectedModel.provider, modelId: selectedModel.id, effort },
+        });
         this.fusionConfig = fConfig;
-        if (this.pi.events) {
-          this.pi.events.emit("fusion_config_updated", fConfig);
-        }
+        this.pi.events?.emit(FUSION_CONFIG_EVENT, fConfig);
         this.setFlash(`✓ Assigned ${selectedModel.id} as Fusion Main Model (effort: ${effort})!`);
         this.tui.requestRender();
         return;
@@ -1145,17 +979,11 @@ export class SplitModelPickerComponent {
         const effort = isReasoningModel(selectedModel)
           ? (clampThinkingLevel(selectedModel, this.getModelEffort(selectedModel) || "low") as ThinkingLevel)
           : "off";
-        const fConfig = loadFusionConfig();
-        fConfig.sidekick = {
-          provider: selectedModel.provider,
-          modelId: selectedModel.id,
-          effort,
-        };
-        saveFusionConfig(fConfig);
+        const fConfig = updateFusionConfig({
+          sidekick: { provider: selectedModel.provider, modelId: selectedModel.id, effort },
+        });
         this.fusionConfig = fConfig;
-        if (this.pi.events) {
-          this.pi.events.emit("fusion_config_updated", fConfig);
-        }
+        this.pi.events?.emit(FUSION_CONFIG_EVENT, fConfig);
         this.setFlash(`✓ Assigned ${selectedModel.id} as Fusion Sidekick Model (effort: ${effort})!`);
         this.tui.requestRender();
         return;
@@ -1677,7 +1505,7 @@ async function fallbackModelPicker(
   return { model, effort };
 }
 
-async function openModelPicker(ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
+async function openModelPicker(ctx: ExtensionContext | ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
   if (ctx.mode !== "tui") {
     ctx.ui.notify("Model picker requires TUI mode", "error");
     return;
