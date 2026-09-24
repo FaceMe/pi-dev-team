@@ -1,0 +1,831 @@
+/**
+ * FusionEngine — the persistent sidekick agent, delegation, routing and
+ * accounting behind the Fusion extension. UI and command wiring live in
+ * extension.ts.
+ *
+ * 1. THE SIDEKICK APPROACH
+ *    The main agent (frontier model, this pi session) delegates well-scoped,
+ *    mechanical work to a persistent, cheaper sidekick agent with its own
+ *    transcript and tools, and keeps the plan, ambiguity and final review.
+ *
+ * 2. DYNAMIC MID-SESSION ROUTING
+ *    A lightweight classifier scores the running task and moves the main model
+ *    and/or the sidekick up or down a capability ladder at compaction
+ *    boundaries, where the prompt cache is lost anyway.
+ */
+
+import { Agent } from "@earendil-works/pi-agent-core";
+import type { AgentTool, StreamFn } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI, ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import {
+  convertToLlm,
+  createBashTool,
+  createEditTool,
+  createFindTool,
+  createGrepTool,
+  createLsTool,
+  createPowerShellTool,
+  createReadTool,
+  createWriteTool,
+} from "@earendil-works/pi-coding-agent";
+import { calculateCost, modelsAreEqual } from "@earendil-works/pi-ai";
+import type { Model, Usage } from "@earendil-works/pi-ai";
+import { fusionStatsPath, loadRolesState } from "../shared/config.js";
+import type { FusionConfig, FusionSlot } from "../shared/config.js";
+import { readJsonFile, writeJsonFile } from "../shared/json-store.js";
+import { blendedCost, clampEffort, modelKey, shortModelKey } from "../shared/models.js";
+import type { EffortLevel } from "../shared/models.js";
+import { assignTiers } from "../shared/tiers.js";
+import { contentText, truncate } from "../shared/text.js";
+import { buildTrace, delegationMeta, describeActivity, extractFinalText } from "../shared/trace.js";
+import type { DelegationTrace, TraceStep } from "../shared/trace.js";
+import { addUsage, cloneUsage, emptyUsage, formatCost } from "../shared/usage.js";
+
+export type { EffortLevel } from "../shared/models.js";
+export type { DelegationTrace, TraceStep } from "../shared/trace.js";
+
+export const EXTENSION_TAG = "fusion";
+export const SIDEKICK_TOOL_NAMES = ["read", "grep", "find", "ls", "bash", "powershell", "edit", "write"] as const;
+
+export interface RouteRecord {
+  at: number;
+  trigger: "compact" | "escalation" | "manual";
+  slot: "main" | "sidekick";
+  from: string;
+  to: string;
+  difficulty?: number;
+  reason: string;
+  applied: boolean;
+}
+
+export interface FusionStats {
+  delegations: number;
+  failures: number;
+  sidekickTurns: number;
+  sidekickUsage: Usage;
+  mainUsage: Usage;
+  /** Estimate of what the delegated work would have cost on the main model. */
+  estimatedMainCost: number;
+  routes: RouteRecord[];
+}
+
+export interface LifetimeStats {
+  delegations: number;
+  failures: number;
+  sidekickCost: number;
+  estimatedMainCost: number;
+}
+
+export interface RoutingDecision {
+  difficulty: number;
+  main: "keep" | "downgrade" | "upgrade";
+  sidekick: "keep" | "upgrade" | "downgrade";
+  reason: string;
+}
+
+export interface DelegationInput {
+  task: string;
+  context?: string;
+  files?: string[];
+  expect?: "summary" | "diff" | "evidence" | "raw";
+}
+
+export interface DelegationOutcome {
+  text: string;
+  usage: Usage;
+  turns: number;
+  isError: boolean;
+  errorMessage?: string;
+  model?: string;
+  activity: string[];
+  hitTurnCap: boolean;
+  meta: string;
+  trace: TraceStep[];
+}
+
+const EXPECT_GUIDANCE: Record<NonNullable<DelegationInput["expect"]>, string> = {
+  summary: "Answer with a short prose summary (<=15 lines).",
+  diff: "Answer with the unified diff or patch only.",
+  evidence: "Answer with the raw evidence (command output, file excerpts) only.",
+  raw: "Answer with whatever is most useful, unfiltered.",
+};
+
+// ---------------------------------------------------------------------------
+// Pure helpers (exported for tests)
+// ---------------------------------------------------------------------------
+
+export function parseClassifierJson(result: { content?: unknown }): RoutingDecision | null {
+  const text = contentText(result.content);
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[0]);
+    const difficulty = Number(parsed.difficulty);
+    if (!Number.isFinite(difficulty)) return null;
+    const norm = (value: unknown, allowed: string[], fallback: string): any =>
+      typeof value === "string" && allowed.includes(value) ? value : fallback;
+    return {
+      difficulty: Math.max(1, Math.min(5, Math.round(difficulty))),
+      main: norm(parsed.main, ["keep", "downgrade", "upgrade"], "keep"),
+      sidekick: norm(parsed.sidekick, ["keep", "upgrade", "downgrade"], "keep"),
+      reason: truncate(String(parsed.reason ?? "classifier"), 120),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Reapply the sidekick model that routing chose earlier in this session. */
+export function restoreRoutedSidekick(config: FusionConfig, ctx: ExtensionContext): void {
+  try {
+    let routed: FusionSlot | undefined;
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== "custom" || entry.customType !== "fusion-sidekick") continue;
+      const data = entry.data as FusionSlot | undefined;
+      if (data?.provider && data?.modelId) routed = data;
+    }
+    if (routed) config.sidekick = { ...routed };
+  } catch (error) {
+    console.error(`[${EXTENSION_TAG}] failed to restore routed sidekick:`, error);
+  }
+}
+
+/** Compact text view of the session, newest last, for the routing classifier. */
+export function buildTranscript(ctx: Pick<ExtensionContext, "sessionManager">, maxChars = 6000): string {
+  const lines: string[] = [];
+  try {
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== "message") continue;
+      const message = (entry as any).message;
+      if (!message) continue;
+      if (message.role === "user") {
+        // User content can be a string or an array of parts (images, attachments, RPC clients).
+        const text = contentText(message.content, " ");
+        if (text.trim()) lines.push(`USER: ${truncate(text, 600)}`);
+      } else if (message.role === "assistant" && Array.isArray(message.content)) {
+        for (const part of message.content) {
+          if (part?.type === "text" && part.text?.trim()) {
+            lines.push(`ASSISTANT: ${truncate(part.text, 300)}`);
+          } else if (part?.type === "toolCall") {
+            lines.push(`TOOL: ${part.name} ${truncate(JSON.stringify(part.arguments ?? {}), 160)}`);
+          }
+        }
+      } else if (message.role === "toolResult") {
+        const flag = message.isError ? "error" : "ok";
+        lines.push(`RESULT[${flag}]: ${truncate(contentText(message.content, " "), 200)}`);
+      }
+    }
+  } catch (error) {
+    console.error(`[${EXTENSION_TAG}] failed to read transcript:`, error);
+  }
+  const joined = lines.join("\n");
+  return joined.length > maxChars ? joined.slice(-maxChars) : joined;
+}
+
+export function heuristicClassify(transcript: string, consecutiveFailures: number): RoutingDecision {
+  const text = transcript.toLowerCase();
+  const hardSignals = [
+    "refactor", "architect", "design", "race condition", "deadlock", "security",
+    "vulnerability", "investigate", "root cause", "why does", "flaky", "memory leak",
+    "migrate", "rewrite",
+  ];
+  const easySignals = [
+    "rename", "typo", "bump version", "update docs", "format", "lint", "changelog",
+    "comment", "add a test", "revert",
+  ];
+  const hardHits = hardSignals.filter((signal) => text.includes(signal)).length;
+  const easyHits = easySignals.filter((signal) => text.includes(signal)).length;
+  let score = 2 + hardHits - easyHits;
+  if (/error|failed|exception|cannot|unable/.test(text)) score += 1;
+  score = Math.max(1, Math.min(5, score));
+  return {
+    difficulty: score,
+    main: score <= 2 ? "downgrade" : score >= 4 ? "upgrade" : "keep",
+    sidekick: consecutiveFailures >= 2 ? "upgrade" : score <= 2 ? "downgrade" : "keep",
+    reason: `heuristic ${score}/5 (hard=${hardHits}, easy=${easyHits}, failures=${consecutiveFailures})`,
+  };
+}
+
+/** Sliding window over a transcript, cut on a user-message boundary. */
+export function trimTranscript<T extends { role: string; content?: unknown }>(
+  messages: T[],
+  maxMessages: number,
+): T[] | null {
+  const max = Math.max(6, maxMessages);
+  if (messages.length <= max) return null;
+  let cut = messages.length - Math.max(4, Math.floor(max / 2));
+  while (cut < messages.length && messages[cut]?.role !== "user") cut += 1;
+  if (cut <= 1 || cut >= messages.length) return null;
+
+  const tail = messages.slice(cut);
+  const first = tail[0];
+  const note =
+    `[${EXTENSION_TAG}] Earlier delegated work in this session was dropped to keep the ` +
+    `sidekick context small. Rely on the current brief and rediscover what you need.`;
+  const prior = typeof first.content === "string" ? first.content : "";
+  tail[0] = { ...first, content: `${note}\n\n${prior}` };
+  return tail;
+}
+
+// ---------------------------------------------------------------------------
+// Prompts
+// ---------------------------------------------------------------------------
+
+export function buildSidekickPrompt(config: FusionConfig, toolNames: string[]): string {
+  if (config.sidekickPrompt?.trim()) return config.sidekickPrompt;
+  return [
+    "You are the sidekick agent inside a Fusion harness.",
+    "",
+    "A frontier main agent delegates well-scoped work to you. You are a fully",
+    "capable agent: you have your own tools and your own context, and you gather",
+    "whatever you need to finish the job.",
+    "",
+    `Your tools: ${toolNames.join(", ") || "(none)"}`,
+    "",
+    "Operating rules:",
+    "- Do exactly the delegated task. Never expand scope, never refactor nearby code.",
+    "- You cannot see the main agent's conversation. Rely only on the brief you were",
+    "  given plus what you discover yourself. If the brief is ambiguous or blocked,",
+    "  say so immediately and stop instead of guessing.",
+    "- Be economical. Prefer targeted reads and greps over whole-file dumps, and stop",
+    "  as soon as you have what you need.",
+    "- Report back concisely: what you did, what you found, exact paths and line",
+    "  numbers, and any risk the main agent must check. Include the raw evidence it",
+    "  needs to verify you (diffs, command output) but keep narration minimal.",
+    "- Never claim success you did not verify.",
+  ].join("\n");
+}
+
+export function buildMainGuidance(toolName: string, sidekickModel: Model<any> | undefined, sidekickTools: string[]): string {
+  return [
+    "You are running in Fusion mode: a hybrid two-agent harness.",
+    "",
+    `- Sidekick agent: ${modelKey(sidekickModel)}${sidekickTools.length ? ` — tools: ${sidekickTools.join(", ")}` : ""}`,
+    `- Delegate with the \`${toolName}\` tool.`,
+    "",
+    "Operating discipline:",
+    "1. You own the plan, the interpretation of ambiguity, and the final review.",
+    "   Take minimal direct actions and read only what is strictly necessary.",
+    "2. By default, delegate well-scoped work to the sidekick, then monitor and verify.",
+    "3. Delegate: targeted reads/greps/recon, mechanical edits with an exact brief,",
+    "   running tests, builds and linters, collecting verbose output, repeat checks.",
+    "4. Do not delegate: deciding what to build, resolving ambiguous requirements,",
+    "   reviewing the sidekick's work for correctness, or anything that needs",
+    "   judgement about the user's intent.",
+    "5. Every brief must be self-contained: exact paths, exact acceptance criteria,",
+    "   and the exact output you want back. The sidekick cannot see this conversation.",
+    "6. Delegations run one at a time. Prefer one well-scoped brief over many tiny ones.",
+    "7. Verify the sidekick's result before reporting success. If a delegated task",
+    "   fails or comes back wrong, take it over yourself rather than re-sending it.",
+  ].join("\n");
+}
+
+function loadLifetime(): LifetimeStats {
+  const stored = readJsonFile<LifetimeStats>(fusionStatsPath());
+  return {
+    delegations: stored?.delegations ?? 0,
+    failures: stored?.failures ?? 0,
+    sidekickCost: stored?.sidekickCost ?? 0,
+    estimatedMainCost: stored?.estimatedMainCost ?? 0,
+  };
+}
+
+function freshStats(): FusionStats {
+  return {
+    delegations: 0,
+    failures: 0,
+    sidekickTurns: 0,
+    sidekickUsage: emptyUsage(),
+    mainUsage: emptyUsage(),
+    estimatedMainCost: 0,
+    routes: [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Engine
+// ---------------------------------------------------------------------------
+
+export class FusionEngine {
+  config: FusionConfig;
+  stats: FusionStats = freshStats();
+  lifetime: LifetimeStats;
+  activity: string[] = [];
+  /** Trace of the most recent delegation, shown on demand via /fusion trace. */
+  lastTrace?: DelegationTrace;
+  /** Latest extension context, used to push UI updates and read the live model. */
+  latestCtx?: ExtensionContext;
+
+  private pi: ExtensionAPI;
+  private modelRegistry: ModelRegistry;
+  private cwd: string;
+  private agent?: Agent;
+  private sidekickModel?: Model<any>;
+  private sidekickToolNames: string[] = [];
+  private turnCounter = 0;
+  private consecutiveFailures = 0;
+  private queue: Promise<unknown> = Promise.resolve();
+
+  constructor(pi: ExtensionAPI, modelRegistry: ModelRegistry, cwd: string, config: FusionConfig) {
+    this.pi = pi;
+    this.modelRegistry = modelRegistry;
+    this.cwd = cwd;
+    this.config = config;
+    this.lifetime = loadLifetime();
+  }
+
+  get enabled(): boolean {
+    return this.config.enabled && this.resolveSidekickModel() !== undefined;
+  }
+
+  setContext(ctx: ExtensionContext): void {
+    this.latestCtx = ctx;
+  }
+
+  // -- model resolution ----------------------------------------------------
+
+  resolveModel(slot?: FusionSlot): Model<any> | undefined {
+    return slot ? this.modelRegistry.find(slot.provider, slot.modelId) : undefined;
+  }
+
+  private tiers() {
+    return assignTiers(this.modelRegistry, loadRolesState().roles);
+  }
+
+  /** Configured main slot, else the frontier tier derived from logged-in models. */
+  resolveMainModel(): Model<any> | undefined {
+    return this.resolveModel(this.config.main) ?? (this.config.main ? undefined : this.tiers().frontier);
+  }
+
+  /** Configured sidekick slot, else the small tier derived from logged-in models. */
+  resolveSidekickModel(): Model<any> | undefined {
+    return this.resolveModel(this.config.sidekick) ?? (this.config.sidekick ? undefined : this.tiers().small);
+  }
+
+  /** The model the session is actually running — routing may have moved it off the slot. */
+  liveMainModel(): Model<any> | undefined {
+    return this.latestCtx?.model ?? this.resolveMainModel();
+  }
+
+  // -- sidekick agent lifecycle -------------------------------------------
+
+  private configuredToolNames(): string[] {
+    return this.config.sidekickTools.filter((name) => (SIDEKICK_TOOL_NAMES as readonly string[]).includes(name));
+  }
+
+  private buildSidekickTools(): AgentTool<any>[] {
+    const isWindows = process.platform === "win32";
+    const factories: Record<string, (cwd: string) => AgentTool<any>> = {
+      read: createReadTool,
+      grep: createGrepTool,
+      find: createFindTool,
+      ls: createLsTool,
+      bash: isWindows ? createPowerShellTool : createBashTool,
+      powershell: createPowerShellTool,
+      edit: createEditTool,
+      write: createWriteTool,
+    };
+    const tools: AgentTool<any>[] = [];
+    for (const name of this.configuredToolNames()) {
+      const factory = factories[name];
+      if (!factory) continue;
+      try {
+        tools.push(factory(this.cwd));
+      } catch (error) {
+        console.error(`[${EXTENSION_TAG}] failed to build sidekick tool "${name}":`, error);
+      }
+    }
+    return tools;
+  }
+
+  ensureAgent(): Agent | undefined {
+    const model = this.resolveSidekickModel();
+    if (!model) return undefined;
+    const toolNames = this.configuredToolNames();
+
+    if (this.agent && this.sidekickToolNames.join() === toolNames.join()) {
+      if (!this.sidekickModel || !modelsAreEqual(this.sidekickModel, model)) {
+        this.agent.state.model = model;
+        this.agent.state.thinkingLevel = clampEffort(model, this.config.sidekick?.effort) ?? "off";
+        this.sidekickModel = model;
+      }
+      return this.agent;
+    }
+
+    const streamFn: StreamFn = (streamModel, context, options) =>
+      this.modelRegistry.streamSimple(streamModel, context, options);
+
+    this.agent = new Agent({
+      streamFn,
+      convertToLlm,
+      initialState: {
+        systemPrompt: buildSidekickPrompt(this.config, toolNames),
+        model,
+        thinkingLevel: clampEffort(model, this.config.sidekick?.effort ?? "low") ?? "off",
+        tools: this.buildSidekickTools(),
+      },
+      // Turn cap: end the run after the turn that reaches maxTurns. (turn_end,
+      // which increments turnCounter, fires after this hook.)
+      finishTurn: () =>
+        this.turnCounter + 1 >= Math.max(1, this.config.limits.maxTurns) ? { action: "end" } : undefined,
+      toolExecution: "sequential",
+    });
+    this.sidekickModel = model;
+    this.sidekickToolNames = toolNames;
+    return this.agent;
+  }
+
+  /**
+   * Swap the sidekick model in place — no cache penalty, context is preserved.
+   * `record` marks a routing decision (session-scoped, replayed on resume);
+   * a deliberate user choice is persisted to fusion.json by the caller instead.
+   */
+  setSidekickModel(model: Model<any>, effort?: EffortLevel, options: { record?: boolean } = {}): void {
+    this.config.sidekick = {
+      provider: model.provider,
+      modelId: model.id,
+      effort: effort ?? this.config.sidekick?.effort,
+    };
+    const agent = this.agent;
+    this.sidekickModel = model;
+    if (agent) {
+      agent.state.model = model;
+      agent.state.thinkingLevel = clampEffort(model, this.config.sidekick.effort) ?? "off";
+    }
+    if (options.record) this.pi.appendEntry("fusion-sidekick", { ...this.config.sidekick });
+  }
+
+  resetSidekick(): void {
+    const agent = this.agent;
+    this.agent = undefined;
+    this.sidekickModel = undefined;
+    this.sidekickToolNames = [];
+    this.consecutiveFailures = 0;
+    try {
+      agent?.abort();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  dispose(): void {
+    const agent = this.agent;
+    this.agent = undefined;
+    try {
+      agent?.abort();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // -- delegation ----------------------------------------------------------
+
+  buildBrief(input: DelegationInput): string {
+    const parts: string[] = [`## Task\n${input.task.trim()}`];
+    if (input.context?.trim()) parts.push(`## Context from the main agent\n${input.context.trim()}`);
+    if (input.files?.length) parts.push(`## Focus files\n${input.files.map((file) => `- ${file}`).join("\n")}`);
+    if (input.expect) parts.push(`## Expected response\n${EXPECT_GUIDANCE[input.expect]}`);
+    parts.push(
+      "Work autonomously with your own tools and report back when done. " +
+        "Do not ask questions — if something is genuinely blocked, report the blocker.",
+    );
+    return parts.join("\n\n");
+  }
+
+  /** Serialized so parallel tool calls from the main agent queue up safely. */
+  delegate(input: DelegationInput, signal?: AbortSignal): Promise<DelegationOutcome> {
+    const run = this.queue.then(() => this.runDelegation(input, signal));
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
+  private async runDelegation(input: DelegationInput, signal?: AbortSignal): Promise<DelegationOutcome> {
+    const agent = this.ensureAgent();
+    const model = this.resolveSidekickModel();
+    if (!agent || !model) {
+      return {
+        text: "",
+        usage: emptyUsage(),
+        turns: 0,
+        isError: true,
+        hitTurnCap: false,
+        errorMessage:
+          "Fusion sidekick is unavailable: no sidekick model could be resolved. Configure one with /fusion sidekick.",
+        activity: [],
+        meta: "sidekick unavailable",
+        trace: [],
+      };
+    }
+
+    this.activity = [];
+    this.turnCounter = 0;
+    const startIndex = agent.state.messages.length;
+    const usage = emptyUsage();
+
+    const unsubscribe = agent.subscribe((event) => {
+      if (event.type === "turn_end" && event.message?.role === "assistant") {
+        this.turnCounter += 1;
+        addUsage(usage, event.message.usage);
+        if (event.message.errorMessage) this.activity.push(`✗ ${truncate(event.message.errorMessage, 120)}`);
+      } else if (event.type === "tool_execution_start") {
+        this.activity.push(describeActivity(event.toolName, event.args));
+        if (this.activity.length > 12) this.activity.shift();
+      }
+    });
+
+    const abortHandler = () => {
+      try {
+        agent.abort();
+      } catch {
+        /* ignore */
+      }
+    };
+    if (signal) {
+      if (signal.aborted) abortHandler();
+      else signal.addEventListener("abort", abortHandler, { once: true });
+    }
+
+    let isError = false;
+    let errorMessage: string | undefined;
+    try {
+      await agent.prompt(this.buildBrief(input));
+    } catch (error) {
+      isError = true;
+      errorMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      unsubscribe();
+      signal?.removeEventListener("abort", abortHandler);
+    }
+
+    const messages = agent.state.messages.slice(startIndex).filter(Boolean);
+    const turns = messages.filter((message) => message.role === "assistant").length;
+    const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
+    if (lastAssistant && lastAssistant.role === "assistant") {
+      if (lastAssistant.stopReason === "error" || lastAssistant.stopReason === "aborted") {
+        isError = true;
+        errorMessage = lastAssistant.errorMessage ?? `sidekick stopped early (${lastAssistant.stopReason})`;
+      }
+    }
+
+    const hitTurnCap = this.turnCounter >= Math.max(1, this.config.limits.maxTurns);
+    let text = extractFinalText(messages);
+    if (!isError && !text) text = "(sidekick produced no text output)";
+    if (!isError && hitTurnCap) {
+      text +=
+        `\n\n[${EXTENSION_TAG}] sidekick hit its ${this.config.limits.maxTurns}-turn cap; ` +
+        "the result above may be incomplete.";
+    }
+    const trimmed = trimTranscript(agent.state.messages as any[], this.config.limits.maxMessages);
+    if (trimmed) agent.state.messages = trimmed;
+
+    const trace = buildTrace(messages as any[]);
+    const meta = delegationMeta({ model: modelKey(model), turns, usage });
+    this.lastTrace = { at: Date.now(), task: truncate(input.task, 200), model: modelKey(model), meta, isError, steps: trace };
+
+    // Accounting: price the sidekick's tokens at the rates of the model the
+    // session is actually running. This is an estimate — the main model would
+    // have spent a different number of tokens on the same work.
+    const mainModel = this.liveMainModel() ?? model;
+    const estimated = calculateCost(mainModel, cloneUsage(usage)).total;
+    this.stats.delegations += 1;
+    this.stats.sidekickTurns += turns;
+    addUsage(this.stats.sidekickUsage, usage);
+    this.stats.estimatedMainCost += estimated;
+    this.lifetime.delegations += 1;
+    this.lifetime.sidekickCost += usage.cost.total;
+    this.lifetime.estimatedMainCost += estimated;
+
+    if (isError) {
+      this.stats.failures += 1;
+      this.lifetime.failures += 1;
+      this.consecutiveFailures += 1;
+    } else {
+      this.consecutiveFailures = 0;
+    }
+    writeJsonFile(fusionStatsPath(), this.lifetime);
+
+    return { text, usage, turns, isError, errorMessage, model: modelKey(model), activity: [...this.activity], hitTurnCap, meta, trace };
+  }
+
+  // -- routing -------------------------------------------------------------
+
+  /** Capability ladder, cheapest first, from the tiers plus both slots. */
+  ladder(): Model<any>[] {
+    const tiers = this.tiers();
+    const seen = new Set<string>();
+    const models: Model<any>[] = [];
+    const add = (model?: Model<any>): void => {
+      if (!model) return;
+      const key = modelKey(model);
+      if (seen.has(key)) return;
+      seen.add(key);
+      models.push(model);
+    };
+    add(tiers.small);
+    add(tiers.daily);
+    add(tiers.frontier);
+    add(this.resolveSidekickModel());
+    add(this.resolveMainModel());
+    models.sort((a, b) => blendedCost(a) - blendedCost(b));
+    return models;
+  }
+
+  ladderIndex(models: Model<any>[], current?: Model<any>): number {
+    if (!current) return 0;
+    const exact = models.findIndex((model) => modelsAreEqual(model, current));
+    if (exact >= 0) return exact;
+    // Anchor by price when the active model is not part of the ladder.
+    const price = blendedCost(current);
+    let best = 0;
+    let bestDelta = Number.POSITIVE_INFINITY;
+    models.forEach((model, index) => {
+      const delta = Math.abs(blendedCost(model) - price);
+      if (delta < bestDelta) {
+        bestDelta = delta;
+        best = index;
+      }
+    });
+    return best;
+  }
+
+  move(models: Model<any>[], current: Model<any> | undefined, direction: -1 | 1): Model<any> | undefined {
+    if (models.length < 2) return undefined;
+    const index = this.ladderIndex(models, current);
+    const next = Math.min(models.length - 1, Math.max(0, index + direction));
+    if (next === index) return undefined;
+    return models[next];
+  }
+
+  /** Score the running task and decide where the main/sidekick models should sit. */
+  async classify(_ctx: ExtensionContext, transcript: string): Promise<RoutingDecision | null> {
+    const mode = this.config.routing.mode;
+    if (mode === "off") return null;
+
+    const heuristic = heuristicClassify(transcript, this.consecutiveFailures);
+    if (mode === "heuristic") return heuristic;
+
+    const classifierModel = this.resolveSidekickModel() ?? this.resolveMainModel();
+    if (!classifierModel) return heuristic;
+
+    const prompt = [
+      "You are a routing classifier for a hybrid coding-agent harness.",
+      "Read the task transcript and decide whether the MAIN agent model and the",
+      "SIDEKICK model should move up or down a capability ladder.",
+      "",
+      "Reply with JSON only, no prose:",
+      '{"difficulty":1-5,"main":"keep|downgrade|upgrade","sidekick":"keep|upgrade|downgrade","reason":"<=100 chars"}',
+      "",
+      "Rules:",
+      "- downgrade the main model only when the remaining work is mechanical and low risk.",
+      "- upgrade the main model when the task needs deep design, has hit repeated",
+      "  failures, or the sidekick has struggled.",
+      "- upgrade the sidekick when delegated subtasks keep failing or need more reasoning.",
+      "- downgrade the sidekick only when delegated subtasks are trivially mechanical.",
+      "- prefer keep unless the evidence is clear.",
+      "",
+      "Task transcript:",
+      transcript.slice(0, 6000),
+    ].join("\n");
+
+    try {
+      const stream = this.modelRegistry.streamSimple(classifierModel, {
+        systemPrompt: "You are a precise, terse routing classifier. Reply with JSON only.",
+        messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
+      });
+      return parseClassifierJson(await stream.result()) ?? heuristic;
+    } catch (error) {
+      console.error(`[${EXTENSION_TAG}] classifier failed, using heuristic:`, error);
+      return heuristic;
+    }
+  }
+
+  /** Apply a routing decision. Returns the records produced. */
+  async applyRouting(decision: RoutingDecision, trigger: RouteRecord["trigger"]): Promise<RouteRecord[]> {
+    const records: RouteRecord[] = [];
+    const models = this.ladder();
+
+    const attempt = async (slot: "main" | "sidekick", direction: "keep" | "upgrade" | "downgrade"): Promise<void> => {
+      if (direction === "keep") return;
+      // Main: measure from the model the session is actually running, since a
+      // previous route may have moved it away from the configured slot.
+      const current = slot === "main" ? this.liveMainModel() : this.resolveSidekickModel();
+      const target = this.move(models, current, direction === "upgrade" ? 1 : -1);
+      if (!target || (current && modelsAreEqual(target, current))) return;
+
+      const record: RouteRecord = {
+        at: Date.now(),
+        trigger,
+        slot,
+        from: modelKey(current),
+        to: modelKey(target),
+        difficulty: decision.difficulty,
+        reason: decision.reason,
+        applied: false,
+      };
+
+      if (!this.config.routing.autoApply) {
+        records.push(record);
+        return;
+      }
+
+      if (slot === "sidekick") {
+        this.setSidekickModel(target, undefined, { record: true });
+        record.applied = true;
+      } else {
+        const ok = await this.pi.setModel(target);
+        if (ok) {
+          const effort = clampEffort(target, this.config.main?.effort);
+          if (effort) this.pi.setThinkingLevel(effort);
+          record.applied = true;
+        } else {
+          record.reason = `${decision.reason} (no auth for ${modelKey(target)})`;
+        }
+      }
+      records.push(record);
+    };
+
+    await attempt("main", decision.main);
+    await attempt("sidekick", decision.sidekick);
+
+    for (const record of records) {
+      this.stats.routes.push(record);
+      if (this.stats.routes.length > 50) this.stats.routes.shift();
+      this.pi.appendEntry("fusion-route", record);
+    }
+    return records;
+  }
+
+  /** Escalate the sidekick after repeated failed delegations. */
+  async maybeEscalate(): Promise<RouteRecord[]> {
+    if (!this.config.routing.enabled || !this.config.routing.escalateOnFailure) return [];
+    if (this.consecutiveFailures < 2) return [];
+    const failures = this.consecutiveFailures;
+    const records = await this.applyRouting(
+      {
+        difficulty: 4,
+        main: "keep",
+        sidekick: "upgrade",
+        reason: `${failures} consecutive failed delegations — escalating the sidekick`,
+      },
+      "escalation",
+    );
+    if (records.some((record) => record.applied)) this.consecutiveFailures = 0;
+    return records;
+  }
+
+  // -- reporting -----------------------------------------------------------
+
+  savingsRatio(): number {
+    if (this.stats.estimatedMainCost <= 0) return 0;
+    const saved = this.stats.estimatedMainCost - this.stats.sidekickUsage.cost.total;
+    return Math.max(0, saved / this.stats.estimatedMainCost);
+  }
+
+  lifetimeSavings(): number {
+    return Math.max(0, this.lifetime.estimatedMainCost - this.lifetime.sidekickCost);
+  }
+
+  statusLines(): string[] {
+    const main = this.liveMainModel();
+    const sidekick = this.resolveSidekickModel();
+    const ratio = this.savingsRatio();
+    return [
+      `main ${shortModelKey(main)}${this.config.main?.effort ? ` (${this.config.main.effort})` : ""}` +
+        `  ·  sidekick ${shortModelKey(sidekick)}` +
+        `${this.config.sidekick?.effort ? ` (${this.config.sidekick.effort})` : ""}`,
+      `delegations ${this.stats.delegations} (${this.stats.failures} failed)  ·  ` +
+        `sidekick ${formatCost(this.stats.sidekickUsage.cost.total)}  ·  ` +
+        `est. main-only ${formatCost(this.stats.estimatedMainCost)}  ·  ` +
+        `saved ${(ratio * 100).toFixed(0)}% (est.)`,
+    ];
+  }
+
+  footerStatus(): string {
+    const base = `⚛ fusion ${shortModelKey(this.resolveSidekickModel())}`;
+    if (this.stats.delegations === 0) return base;
+    const saved = this.lifetimeSavings();
+    return `${base} · ${(this.savingsRatio() * 100).toFixed(0)}% saved` + `${saved > 0 ? ` (${formatCost(saved)})` : ""}`;
+  }
+
+  snapshot(): FusionStats & { lifetime: LifetimeStats } {
+    return {
+      delegations: this.stats.delegations,
+      failures: this.stats.failures,
+      sidekickTurns: this.stats.sidekickTurns,
+      sidekickUsage: cloneUsage(this.stats.sidekickUsage),
+      mainUsage: cloneUsage(this.stats.mainUsage),
+      estimatedMainCost: this.stats.estimatedMainCost,
+      routes: [...this.stats.routes],
+      lifetime: { ...this.lifetime },
+    };
+  }
+
+  resetSessionStats(): void {
+    this.stats = freshStats();
+  }
+
+  /** Test hook: number of consecutive failed delegations. */
+  get failureStreak(): number {
+    return this.consecutiveFailures;
+  }
+}

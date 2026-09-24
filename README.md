@@ -1,21 +1,96 @@
-# pi-model-picker
+# pi dev team
 
-Model tooling for the [pi coding agent](https://github.com/badlogic/pi-mono):
+A software factory, a model picker and a hybrid model harness for the
+[pi coding agent](https://github.com/badlogic/pi-mono):
 
-1. **Model picker, roles & reasoning effort** — a two-panel picker, a role manager
+1. **Software factory** (`/factory`) — a team of role-specialised agents
+   (analyst, researcher, architect, planner, backend, frontend, devops,
+   reviewer, docs) that interviews you, writes a spec, designs, builds
+   test-first, reviews, documents and merges a maintainable project. Works with
+   any model pi supports.
+2. **Model picker, roles & reasoning effort** — a two-panel picker, a role manager
    (`daily` / `small` / `frontier`) and a reasoning-effort controller.
-2. **Fusion** — a hybrid model harness: a frontier main agent
+3. **Fusion** — a hybrid model harness: a frontier main agent
    plus a persistent cheap "sidekick" agent, with dynamic mid-session routing.
-3. **Qwen** — brainstorming and web research with Qwen models (`qwen3.8-max`
-   and friends) on chat.qwen.ai, through your logged-in Chrome session.
 
 ```bash
-pi install git:github.com/rsudharshan/pi-model-picker@v1.4.0
+pi install git:github.com/FaceMe/pi-dev-team
 ```
 
 All extensions ship in the same package and load independently.
 
-## Features
+## Software factory — quick start
+
+```bash
+mkdir habit-tracker && cd habit-tracker && pi
+```
+
+```text
+/factory new a habit tracker with a web UI and a REST API
+```
+
+1. **Quick setup** — one screen of prefilled answers. Press Enter to accept them
+   all, or open any line to change it:
+
+   | Question | Prefilled default |
+   |---|---|
+   | Team | Built automatically from the models you are logged in to (any provider, including custom and local models); presets `balanced` / `cheap` / `best`, or pin any role to a model with the picker |
+   | Autonomy | `balanced` — you approve the spec and one build plan (`auto`: spec only; `careful`: every phase and ticket) |
+   | Project | New project, or "add to the existing project" when the folder already has code |
+   | Stack | Let the architect choose (or keep the detected stack of an existing project) |
+   | Web research | [pi-web-access](https://www.npmjs.com/package/pi-web-access) (`web_search`, `fetch_content`); offered for install if missing |
+   | Deployment | Run locally; or generate deploy config; or deploy with a detected, logged-in CLI (always asks first) |
+   | Budget | Estimated from your team's prices and the size of the idea; pauses at 80% |
+
+   Your answers are remembered: team, autonomy and research for every project,
+   the rest per folder.
+2. **Interview** — at most 4 questions per round, each with a recommended
+   answer and a "use your defaults" option. Small ideas get one round.
+3. **Spec → architecture → plan** — `.factory/spec/spec.md` (FR/NFR IDs with
+   Given/When/Then), an ADR, a stack profile with gate commands, and a ticket
+   list. You approve per the autonomy preset.
+4. **Build** — a walking skeleton first, then each ticket test-first in a git
+   worktree (`factory/<run>` branch). Gates (install/build/typecheck/lint/test)
+   are run by the factory, not claimed by the agent; a reviewer from a
+   different model family approves each ticket. Failures retry with feedback,
+   then escalate to a stronger model, then ask you.
+5. **Docs and release** — README, architecture notes, `AGENTS.md`, CHANGELOG;
+   the branch is merged into yours when the gates pass; `.factory/report.md`
+   lists tickets and cost by role.
+
+| Command | Action |
+|---|---|
+| `/factory new [idea]` | Quick setup, then run the whole flow |
+| `/factory status` · `/factory cost` | Where the run is; spend by role and model |
+| `/factory pause` · `/factory resume` | Pause after the current step; continue (also after restarting pi) |
+| `/factory doctor [probe]` | Check git, pi, models, team, pi-web-access, toolchains and deploy CLIs, with fixes; `probe` sends one tool call to each team model |
+| `/factory team [balanced\|cheap\|best]` | Show or change the team |
+| `/factory autonomy auto\|balanced\|careful` | Switch at any time, even mid-run |
+| `/factory settings` | Change the quick-setup answers for this folder |
+| `/factory run <role> <brief>` | Run one role once, read-only (try a model, ask the architect) |
+| `/factory demo` | Build a tiny to-do CLI in a temp folder on `auto` |
+
+How it works:
+
+- **Workers are real `pi` processes** (`pi --mode json`) with a persistent
+  session per role and ticket, so they reuse context and prompt cache, load
+  your providers and extensions (pi-web-access for research), and a crash
+  never takes down your session.
+- **Guard rails inside every worker**: `edit`/`write` outside the ticket's
+  write scope are blocked, and so are `git push`/commit, `sudo`, publishing,
+  piped remote scripts, and deploy commands (unless you approved a deploy).
+  The factory also reverts any out-of-scope change before running gates.
+- **Headless**: without a UI (print/JSON/RPC mode) `/factory new` accepts the
+  prefilled answers and runs to completion.
+- **Roles are Markdown** — override any role (tier, effort, tools, prompt) in
+  `~/.pi/agent/factory/roles/<role>.md`.
+
+Project state lives in `.factory/` (spec, ADRs, profile, tickets, reviews,
+ledger, report; worker sessions and the worktree are git-ignored). See
+[docs/software-factory-plan.md](docs/software-factory-plan.md) for the design
+and roadmap.
+
+## Model picker
 
 ### Two-panel model picker
 
@@ -286,84 +361,34 @@ only, no extra model call), or `off`.
 - Automatic main-model routing is skipped in any session where you picked the
   model yourself (`/model`, `Ctrl+P`, `--model`).
 
-## Qwen (chat.qwen.ai)
-
-Brainstorm and research with Qwen's chat models — including the flagship
-**Qwen3.8-Max** — from inside pi. Access goes through your logged-in Chrome
-session (pi browser harness → CDP → the real chat.qwen.ai page), which is the
-only reliable path: Alibaba's risk engine blocks direct API calls from Node
-(`RGV587_ERROR::SM`). Your browser session is the authentication — no tokens to
-manage.
-
-### Setup
-
-1. Connect the browser harness: `/browser-setup`.
-2. Log in to chat.qwen.ai once in that Chrome, then `/qwen-auth` to verify.
-
-### Tools for the agent
-
-| Tool | Purpose |
-|---|---|
-| `qwen_brainstorm` | Ideation, design review, stress-tests. Modes: `general`, `divergent`, `critical`, `comparative`, `deep`, `synthesis`. Params: `model`, `search`, `thinking`, `new_chat`. Multi-turn within a thread. |
-| `qwen_research` | Web-search research with citations; `deep: true` runs Qwen Deep Research (slow, thorough). |
-
-### Commands
-
-| Command | Action |
-|---|---|
-| `/brainstorm [topic]` | Quick brainstorm (general mode); asks to inject the result. |
-| `/qwen-research <query>` | Web-search research with sources. |
-| `/qwen status` | Daemon, login, model list, timeouts. |
-| `/qwen ask [topic]` / `/qwen research [query]` | Interactive ask/research. |
-| `/qwen model [id]` | List or switch models; saves the default. |
-| `/qwen thinking <auto\|thinking\|fast>` | Default thinking chip. |
-| `/qwen new` | Fresh thread on chat.qwen.ai. |
-| `/qwen cleanup` | Delete chats created during testing. |
-| `/qwen-auth` | Open/verify the chat.qwen.ai login. |
-
-### Configuration
-
-`~/.pi/agent/qwen.json`:
-
-```json
-{
-  "defaultModel": "qwen3.8-max",
-  "defaultThinking": "Auto",
-  "timeoutSec": 240,
-  "researchTimeoutSec": 420,
-  "deepResearchTimeoutSec": 900
-}
-```
-
-### How it works
-
-The extension talks CDP through the pi browser daemon, attaches to the
-chat.qwen.ai tab, and drives the real page: switches the model, toggles Web
-search / Deep Research, sends prompts with React-safe input events, and detects
-completion by tee-ing the page's own SSE stream (clone-based fetch hook) plus
-the composer's Stop button. Thinking summaries, search phases and citations are
-extracted from the stream and DOM without touching the app's own connection.
-
 ## State
 
 - `~/.pi/agent/model-roles.json` — role assignments and startup defaults.
 - `~/.pi/agent/settings.json` — `defaultProvider`, `defaultModel`, and `modelThinkingLevels` (per-model reasoning efforts natively recognized by Pi core on model switch).
 - `~/.pi/agent/fusion.json` — Fusion configuration (main/sidekick slots, routing, limits).
 - `~/.pi/agent/fusion-stats.json` — Fusion lifetime cost/savings ledger.
-- `~/.pi/agent/qwen.json` — Qwen extension defaults (model, thinking, timeouts).
+- `~/.pi/agent/factory.json` — factory answers remembered across projects (team preset, pins, autonomy, research).
+- `~/.pi/agent/factory/roles/*.md` — optional role overrides.
+- `<project>/.factory/` — a factory run's state, artifacts and ledger.
 
 ## Development
 
-The package is one file per extension:
-[`extensions/model-picker.ts`](extensions/model-picker.ts),
-[`extensions/fusion.ts`](extensions/fusion.ts) and
-[`extensions/qwen.ts`](extensions/qwen.ts).
-Pi core packages (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`,
-`@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`) are peer dependencies
-supplied by pi itself — no `npm install` needed. Try it without installing:
+Each extension is a thin entry point under `extensions/<name>/index.ts`; the
+code lives in `src/`:
+
+- `src/shared/` — config files, model helpers, capability tiers, traces, usage
+- `src/picker/` — the two-panel model picker, roles and effort controller
+- `src/fusion/` — the Fusion engine (`engine.ts`) and its commands/UI (`extension.ts`)
+- `src/factory/` — the software factory: `pipeline.ts` (phase machine), `runner.ts`
+  (pi worker subprocesses), `guard.ts`, `team.ts`, `setup.ts`, `gates.ts`,
+  `git.ts`, `prompts.ts`, and the default roles in `roles/*.md`
+
+Pi core packages are peer dependencies supplied by pi itself. For development:
 
 ```bash
-pi -e /path/to/pi-model-picker
+npm install        # dev dependencies: pi packages for types, vitest, typescript
+npm run check      # typecheck + tests (includes real pi workers against a mock model)
+pi -e ./extensions/model-picker/index.ts -e ./extensions/fusion/index.ts -e ./extensions/factory/index.ts
 ```
 
 ## License

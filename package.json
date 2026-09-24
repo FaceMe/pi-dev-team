@@ -1,27 +1,27 @@
 {
   "name": "pi-model-picker",
-  "version": "1.5.0",
-  "description": "Two-panel model picker, role manager (daily/small/frontier), reasoning-effort controller, a hybrid main/sidekick model harness, and Qwen (chat.qwen.ai) brainstorm/research via your Chrome session for the pi coding agent",
+  "version": "2.0.0",
+  "description": "Software factory (/factory): a team of role-specialised agents that interviews you, specs, designs, builds test-first, reviews and documents software with any pi model; plus a two-panel model picker, roles, reasoning effort and the Fusion main/sidekick harness for the pi coding agent",
   "type": "module",
   "license": "MIT",
   "author": "rsudharshan",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rsudharshan/pi-model-picker.git"
+    "url": "git+https://github.com/FaceMe/pi-dev-team.git"
   },
   "keywords": [
-    "brainstorm",
-    "chat-qwen-ai",
+    "factory",
+    "software-factory",
+    "multi-agent",
+    "agents",
     "fusion",
     "model-picker",
     "model-roles",
     "model-routing",
     "pi",
     "pi-package",
-    "qwen",
     "reasoning-effort",
-    "sidekick",
-    "web-research"
+    "sidekick"
   ],
   "pi": {
     "extensions": [
@@ -29,9 +29,28 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.87.1",
+    "@earendil-works/pi-ai": "^0.87.1",
+    "@earendil-works/pi-coding-agent": "^0.87.1",
+    "@earendil-works/pi-tui": "^0.87.1",
+    "@types/node": "^22.20.4",
+    "typebox": "^1.3.34",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  },
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
