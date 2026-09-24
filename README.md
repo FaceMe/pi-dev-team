@@ -6,8 +6,6 @@ Model tooling for the [pi coding agent](https://github.com/badlogic/pi-mono):
    (`daily` / `small` / `frontier`) and a reasoning-effort controller.
 2. **Fusion** — a hybrid model harness: a frontier main agent
    plus a persistent cheap "sidekick" agent, with dynamic mid-session routing.
-3. **Qwen** — brainstorming and web research with Qwen models (`qwen3.8-max`
-   and friends) on chat.qwen.ai, through your logged-in Chrome session.
 
 ```bash
 pi install git:github.com/rsudharshan/pi-model-picker@v1.4.0
@@ -286,78 +284,18 @@ only, no extra model call), or `off`.
 - Automatic main-model routing is skipped in any session where you picked the
   model yourself (`/model`, `Ctrl+P`, `--model`).
 
-## Qwen (chat.qwen.ai)
-
-Brainstorm and research with Qwen's chat models — including the flagship
-**Qwen3.8-Max** — from inside pi. Access goes through your logged-in Chrome
-session (pi browser harness → CDP → the real chat.qwen.ai page), which is the
-only reliable path: Alibaba's risk engine blocks direct API calls from Node
-(`RGV587_ERROR::SM`). Your browser session is the authentication — no tokens to
-manage.
-
-### Setup
-
-1. Connect the browser harness: `/browser-setup`.
-2. Log in to chat.qwen.ai once in that Chrome, then `/qwen-auth` to verify.
-
-### Tools for the agent
-
-| Tool | Purpose |
-|---|---|
-| `qwen_brainstorm` | Ideation, design review, stress-tests. Modes: `general`, `divergent`, `critical`, `comparative`, `deep`, `synthesis`. Params: `model`, `search`, `thinking`, `new_chat`. Multi-turn within a thread. |
-| `qwen_research` | Web-search research with citations; `deep: true` runs Qwen Deep Research (slow, thorough). |
-
-### Commands
-
-| Command | Action |
-|---|---|
-| `/brainstorm [topic]` | Quick brainstorm (general mode); asks to inject the result. |
-| `/qwen-research <query>` | Web-search research with sources. |
-| `/qwen status` | Daemon, login, model list, timeouts. |
-| `/qwen ask [topic]` / `/qwen research [query]` | Interactive ask/research. |
-| `/qwen model [id]` | List or switch models; saves the default. |
-| `/qwen thinking <auto\|thinking\|fast>` | Default thinking chip. |
-| `/qwen new` | Fresh thread on chat.qwen.ai. |
-| `/qwen cleanup` | Delete chats created during testing. |
-| `/qwen-auth` | Open/verify the chat.qwen.ai login. |
-
-### Configuration
-
-`~/.pi/agent/qwen.json`:
-
-```json
-{
-  "defaultModel": "qwen3.8-max",
-  "defaultThinking": "Auto",
-  "timeoutSec": 240,
-  "researchTimeoutSec": 420,
-  "deepResearchTimeoutSec": 900
-}
-```
-
-### How it works
-
-The extension talks CDP through the pi browser daemon, attaches to the
-chat.qwen.ai tab, and drives the real page: switches the model, toggles Web
-search / Deep Research, sends prompts with React-safe input events, and detects
-completion by tee-ing the page's own SSE stream (clone-based fetch hook) plus
-the composer's Stop button. Thinking summaries, search phases and citations are
-extracted from the stream and DOM without touching the app's own connection.
-
 ## State
 
 - `~/.pi/agent/model-roles.json` — role assignments and startup defaults.
 - `~/.pi/agent/settings.json` — `defaultProvider`, `defaultModel`, and `modelThinkingLevels` (per-model reasoning efforts natively recognized by Pi core on model switch).
 - `~/.pi/agent/fusion.json` — Fusion configuration (main/sidekick slots, routing, limits).
 - `~/.pi/agent/fusion-stats.json` — Fusion lifetime cost/savings ledger.
-- `~/.pi/agent/qwen.json` — Qwen extension defaults (model, thinking, timeouts).
 
 ## Development
 
 The package is one file per extension:
-[`extensions/model-picker.ts`](extensions/model-picker.ts),
-[`extensions/fusion.ts`](extensions/fusion.ts) and
-[`extensions/qwen.ts`](extensions/qwen.ts).
+[`extensions/model-picker.ts`](extensions/model-picker.ts) and
+[`extensions/fusion.ts`](extensions/fusion.ts).
 Pi core packages (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`,
 `@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`) are peer dependencies
 supplied by pi itself — no `npm install` needed. Try it without installing:

@@ -1,7 +1,7 @@
 {
   "name": "pi-model-picker",
   "version": "1.5.0",
-  "description": "Two-panel model picker, role manager (daily/small/frontier), reasoning-effort controller, a hybrid main/sidekick model harness, and Qwen (chat.qwen.ai) brainstorm/research via your Chrome session for the pi coding agent",
+  "description": "Two-panel model picker, role manager (daily/small/frontier), reasoning-effort controller, and a hybrid main/sidekick model harness for the pi coding agent",
   "type": "module",
   "license": "MIT",
   "author": "rsudharshan",
@@ -10,18 +10,14 @@
     "url": "git+https://github.com/rsudharshan/pi-model-picker.git"
   },
   "keywords": [
-    "brainstorm",
-    "chat-qwen-ai",
     "fusion",
     "model-picker",
     "model-roles",
     "model-routing",
     "pi",
     "pi-package",
-    "qwen",
     "reasoning-effort",
-    "sidekick",
-    "web-research"
+    "sidekick"
   ],
   "pi": {
     "extensions": [
