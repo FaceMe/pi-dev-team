@@ -11,11 +11,41 @@ It builds on the ideas in Cognition's
 [Devin Fusion](https://cognition.com/blog/devin-fusion) post, which the existing
 `fusion` extension already implements in part.
 
-- Status: proposal, not yet implemented
+- Status: **M0 and M1 implemented** (see [Implementation status](#implementation-status)); M2–M7 planned
 - Scope: this repository (pi extension package)
 - Last updated: 2026-09-24
 
 ---
+
+## Implementation status
+
+| Milestone | State | Notes |
+|---|---|---|
+| M0 hygiene | Done | Code split into `extensions/*/index.ts` + `src/`; one config module (`src/shared/config.ts`); bugs B1–B9 fixed plus B10 (the sidekick turn cap never worked: `shouldStopAfterTurn` is not an `Agent` option; now `finishTurn`); tsconfig, vitest, CI; v2.0.0 |
+| M1 quick-start slice | Done | `/factory` with quick setup, automatic team from any provider, interview, spec, architecture, plan, skeleton, test-first build with gates and cross-family review, escalation, docs, merge, report, budget breaker, pause/resume, doctor, demo, headless mode |
+| M2–M7 | Planned | Parallel tickets, deeper discovery (brainstorm fan-out, readiness scoring), profile templates, QA role, deploy hardening, benchmarks |
+
+Verification: 71 tests, including the whole pipeline with **real `pi` worker
+processes** against a mock OpenAI-compatible model, and the real `/factory new`
+command run headless in a pi session.
+
+Decisions made while building M1:
+
+- **Runner: option C** (a `pi --mode json` subprocess per worker, §6.3), with
+  a persistent pi session per role and ticket (`--session-id`). It loads the
+  user's providers and extensions — needed for pi-web-access research — keeps
+  context and cache between calls, and isolates crashes. The write-scope guard
+  runs *inside* each worker as a `tool_call` hook (this package detects
+  `PI_FACTORY_WORKER=1`), and the harness re-checks the diff after each attempt.
+- **Setup questions are all asked up front, prefilled** (§5.1): team, autonomy,
+  project mode (new or existing, detected), stack (architect's choice or the
+  detected stack), web research (pi-web-access, offered for install), deployment
+  (local / config / deploy with a detected logged-in CLI), and budget (estimated
+  from the team's prices and the idea's size). Enter accepts all.
+- **Existing repositories are supported from M1** (architect keeps the stack,
+  skeleton only adds missing tooling, merge returns to the user's branch).
+- **QA-first tests are written by the builder** in M1 (test-first prompt, gates
+  enforce); a separate QA role arrives with parallel tickets (M5).
 
 ## Contents
 
@@ -252,23 +282,26 @@ What happens next:
    Anything missing gets a one-line fix, for example "no models are logged in:
    run `/login`".
 2. **Automatic team** (§5.2), built from the models you have logged in.
-3. **Setup card**, one screen, shown the first time only:
+3. **Quick setup**, one screen of questions with prefilled answers. The first
+   line starts with every default, so agreeing is a single Enter:
 
    ```text
-   ┌ Factory setup ─────────────────────────────────────────────────────┐
-   │ Models found   3 providers · 14 models logged in                   │
-   │ Team           orchestrator, analyst, architect, reviewer → <A>    │
-   │                backend, frontend, qa → <B> · devops, docs → <C>    │
-   │ Autonomy       balanced: you approve the spec and the build plan   │
-   │ Budget         $25 per project (pause at 80%)                      │
-   │                                                                    │
-   │ Enter start · e edit a role · t team preset · a autonomy · b budget│
-   └────────────────────────────────────────────────────────────────────┘
+   Factory setup — Enter starts with these answers
+   ▶ Start with these answers
+     Team: balanced — analyst, architect, planner, reviewer → <A> · backend, … → <B> · docs → <C>
+     Autonomy: balanced — you approve the spec and one build plan
+     Project: new project in this folder            (detected: empty folder)
+     Stack: let the architect choose                (existing code: "keep: <detected stack>")
+     Web research: pi-web-access (web_search, fetch_content)   (or "install pi-web-access now")
+     Deployment: run locally only                   (or config only, or a detected logged-in CLI)
+     Budget: $15 (estimate for a small project with this team) · pauses at 80%
    ```
 
-   Pressing `e` opens the existing two-panel model picker for that role. Your
-   choices are saved in `~/.pi/agent/factory.json`. Later projects skip the card
-   and show a one-line team summary instead.
+   Opening a line offers the alternatives (and free text where it makes sense:
+   any stack, any deploy target, any budget). "Team" also lets you pin any role
+   to a model with the two-panel picker. Team, autonomy and research are
+   remembered in `~/.pi/agent/factory.json`; the rest per folder in
+   `.factory/project.json`, and prefilled next time.
 4. **Discovery starts** with the first interview question.
 
 Targets: about **two minutes** from install to the first question, **zero** files
@@ -401,7 +434,7 @@ for anyone who wants them, but no one needs them.
 | **Ledger and traces** | Usage and cost per agent, ticket and phase; routing records; gate history; delegation traces. | Generalises Fusion's stats and `buildTrace` |
 | **Interview UI** | Structured questions with options, recommended defaults and a free-text "other"; approval dialogs; a board widget. | pi's `questionnaire` example, `ctx.ui.select/confirm/custom`, `setWidget` |
 
-### 6.3 Runner backend: decided by a spike in M1
+### 6.3 Runner backend (decided in M1: option C)
 
 Workers need persistent context (for cache reuse), their own tools pointed at a
 worktree, streaming progress, abort, and usage accounting. There are three
@@ -413,7 +446,7 @@ options:
 | B. `createAgentSession` from the pi SDK, in-process | Full pi sessions: compaction (so compaction-time routing works per worker), session files (resumable), skills | Heavier; the API surface still needs checking for concurrent sessions in one process |
 | C. `pi --mode json -p` subprocess (pi's `subagent` example) | Strong isolation; real parallelism; loads the user's extensions and skills | Loses the persistent cache between calls unless sessions are kept; process overhead |
 
-**Recommendation:** use **B** if the spike shows concurrent sessions are stable,
+**Decision (M1):** option **C** with persistent sessions (`--session-id`), because the researcher needs the user's pi-web-access extension and workers need the user's providers; see [Implementation status](#implementation-status). Originally considered: use **B** if concurrent sessions are stable,
 otherwise **A** plus a small compaction routine of our own. Keep a `WorkerRunner`
 interface so **C** can be added later as an isolation mode for untrusted projects.
 
@@ -1080,16 +1113,19 @@ milestones deepen each stage without changing how you start.
   any mix. The team is derived automatically (§5.2), and cross-family
   review is used when available, never required.
 
+- **Q2, Q5, Q6, Q9 — stacks, existing repos, deployment, budget:** flexible,
+  asked in the quick setup with prefilled defaults (§5.1): stack = architect's
+  choice or the detected stack; project = new or existing (detected); deploy =
+  local, config only, or a detected logged-in CLI (always confirmed); budget =
+  estimated from the team's prices.
+- **Q4, web research:** through the pi-web-access extension (`web_search`,
+  `fetch_content`), offered for install during setup when missing.
+
 **Still open.** Each question has the default the plan assumes. Answering any of
 them changes the plan in the section noted.
 
 | # | Question | Default assumption | Affects |
 |---|---|---|---|
-| Q2 | Which stacks matter most to you first? | Stack-agnostic core; first profiles `node-ts-api`, `react-vite`, `python-fastapi` | §11.1, M4 |
-| Q4 | How should the researcher search the web: a search API key (e.g. Brave or Tavily), an MCP server, or fetch-only? | Fetch-only `web_fetch` in v1, with a pluggable search provider | §7.1, M3 |
-| Q5 | Greenfield projects only, or also adding features to existing repositories? | Greenfield first; brownfield onboarding in M7 | §17 |
-| Q6 | Should DevOps stop at Dockerfile, CI and IaC files, or also deploy (e.g. Fly, Vercel, AWS) with real credentials? | Stop at files plus local `docker compose up`; no cloud credentials | §4, §15 |
 | Q7 | Should the frontend role get browser tooling (screenshots, visual checks, Playwright)? | Yes, via Playwright end-to-end tests plus screenshots given to a vision-capable reviewer | §7.1, M5 |
 | Q8 | Keep the factory in this package (named `pi-model-picker`, now in the `FaceMe/pi-dev-team` repository), or split it into its own package (e.g. `pi-factory`) that depends on shared code published from here? | Build it here under `extensions/factory` through M2, then decide | §16 |
-| Q9 | What budget per project is reasonable for your use (e.g. $10, $25, $100)? | $25 total, with the breaker at 80% | §14, §15 |
 | Q10 | Should factory runs be usable headless (CI, RPC) from the start? | Design for it (`ctx.hasUI` fallbacks) but test interactively first | §13.3 |
