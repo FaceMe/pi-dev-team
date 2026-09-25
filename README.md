@@ -195,6 +195,20 @@ Enable with `/fusion on` (on by default once configured). Open the menu with
 
 ### How it works
 
+0. **Delegation is enforced, not just suggested.** Telling a frontier model to
+   "delegate by default" is not enough — with bash/edit/write at hand it does
+   the work itself. `delegation.mode` makes it structural:
+
+   | Mode | Main agent | What goes to the sidekick |
+   |---|---|---|
+   | `balanced` (default) | reads, edits, runs commands | tests, builds, linters, type checks and installs (direct calls are redirected with a ready-made `sidekick(...)` call); any direct command output over 8k chars is condensed by the sidekick's model (full log kept on disk); a nudge after 6 direct calls in a row |
+   | `strict` | read-only (`read`, `grep`, `find`, `ls`) + sidekick | everything that executes or edits — Devin's "minimal direct action" |
+   | `advisory` | everything | only what the model chooses (the old behaviour) |
+
+   Switch with `/fusion mode strict|balanced|advisory` or in the `/fusion` menu.
+   If delegations fail twice in a row, the policy relaxes so the main agent is
+   never stuck.
+
 1. **Sidekick delegation.** The main agent gets a `sidekick` tool. A prompt
    section tells it to take minimal direct action, delegate mechanical work
    (targeted reads/greps, mechanical edits, running tests, collecting verbose
@@ -249,8 +263,9 @@ What you'll see in the footer while Fusion is on:
   which case your pick wins.
 - **Extension status line:** `⚛ fusion <sidekick-model> · N% saved ($x)` — the
   sidekick lives here (it is an in-process agent, not the session model).
-- **Widget above the footer:** `main ... · sidekick ...` plus delegation,
-  failure and cost counters.
+- **Widget above the footer:** `main ... · sidekick ...`, delegation, failure
+  and cost counters, and the delegation mode with the share of work that went
+  through the sidekick (redirected calls, condensed outputs, background tasks).
 
 Notes on the sync: `/fusion on` is idempotent — run it again after startup or
 `pi -m <model>` to re-sync the session model with the main slot. Fusion never
@@ -264,6 +279,7 @@ survives until you explicitly enable Fusion.
 | `/fusion` | Interactive menu: main/sidekick models, sidekick tools, routing, state, stats |
 | `/fusion main [model]` | Select or set the main (frontier) agent model via the Model Picker |
 | `/fusion sidekick [model]` | Select or set the sidekick (cheap) agent model via the Model Picker |
+| `/fusion mode [strict\|balanced\|advisory]` | Show or set how strongly the main agent is made to delegate |
 | `/fusion on` | Enable Fusion: activate the sidekick tool + prompt section and switch the session model to the fusion main slot (idempotent — re-run to re-sync) |
 | `/fusion off` | Disable Fusion: remove the tool and prompt section and restore your pre-Fusion model (unless you picked a model yourself meanwhile) |
 | `/fusion stats` | Session + lifetime cost/savings report in the transcript |
@@ -285,8 +301,15 @@ search, so it is left alone). Rebind it with `"shortcut"` in
 | `context` | Extra context the sidekick needs but cannot discover itself |
 | `files` | Files the sidekick should focus on |
 | `expect` | `summary` \| `diff` \| `evidence` \| `raw` — shape of the answer |
+| `background` | `true` runs the delegation in parallel with the main agent; the result is delivered into the conversation when it finishes |
 
-Delegations are serialized, so parallel tool calls from the main agent queue up.
+`sidekick_wait` collects background results (all outstanding, or by id). A run
+never settles with background work outstanding: the main agent gets the
+results for one more turn to review them.
+
+The sidekick itself works on one delegation at a time (it has one persistent
+context); background delegations queue behind each other while the main agent
+keeps working.
 The sidekick's tools default to `read, grep, find, ls, bash`; add `edit`/`write`
 in `/fusion → sidekick tools` if you want it to make changes.
 
@@ -339,6 +362,7 @@ roles (`frontier` → main, `small` → sidekick):
     "escalateOnFailure": true
   },
   "limits": { "maxTurns": 12, "maxMessages": 40 },
+  "delegation": { "mode": "balanced", "nudgeAfter": 6, "compressOutputChars": 8000 },
   "sidekickPrompt": "optional override for the sidekick system prompt"
 }
 ```
