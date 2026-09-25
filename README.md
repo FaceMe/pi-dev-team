@@ -393,7 +393,8 @@ roles (`frontier` → main, `small` → sidekick):
     "onCompact": true,
     "escalateOnFailure": true
   },
-  "limits": { "maxTurns": 12, "maxMessages": 40 },
+  "limits": { "maxTurns": 12, "maxMessages": 400, "maxContextFraction": 0.5 },
+  "cache": { "sidekickRetention": "auto" },
   "delegation": {
     "mode": "balanced",
     "nudgeAfter": 6,
@@ -413,13 +414,26 @@ only, no extra model call), or `off`.
 
 ### Notes and limits
 
-- The sidekick keeps a persistent transcript, but provider prompt caches expire
-  (commonly after ~5 minutes). Delegations spaced further apart than that pay a
-  cold prefix; the system prompt and tool declarations stay stable so the prefix
-  is still cacheable.
-- The sidekick transcript is a sliding window (`limits.maxMessages`) cut on a
-  user-message boundary, so old delegated work is dropped rather than overflowing
-  the sidekick's context.
+- **Prompt caching.** The main agent and the sidekick keep separate
+  persistent, cached contexts. The main agent is pi's own session (pi marks
+  the cacheable prefix and keeps it warm during runs). The sidekick sends a
+  stable cache session id, and with `cache.sidekickRetention: "auto"` it asks
+  for long retention (e.g. 1 h on Anthropic, 24 h on OpenAI) when the model
+  declares it, so its cache survives gaps between delegations; set `short`,
+  `long` or `none` to override (`PI_CACHE_RETENTION` in the environment wins
+  for `auto`). Factory workers run with `PI_CACHE_RETENTION=long` unless you
+  set it.
+- **The sidekick's history is compacted rarely:** only when its last prompt
+  used more than `limits.maxContextFraction` (50%) of its model's context
+  window, or past `limits.maxMessages` (400). The older half is replaced by a
+  short, deterministic summary of those delegations (task → result), so the
+  new prefix caches again from the next request. `/fusion stats` counts
+  compactions.
+- **The main agent's prompt stays stable.** Fusion's prompt section does not
+  name the sidekick's model, and a `/fusion mode` change is enforced
+  immediately but only changes the main agent's prompt and tool list at the
+  next compaction (`/compact` applies it now), so it never invalidates the
+  main agent's cache mid-session.
 - `sidekickTools` with `edit`/`write` gives a cheaper model write access to your
   repo; those tools share pi's per-file mutation queue with the built-ins.
 - Automatic main-model routing is skipped in any session where you picked the

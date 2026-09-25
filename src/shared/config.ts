@@ -118,6 +118,23 @@ export interface FusionLimits {
   maxTurns: number;
   /** Sliding-window size for the persistent sidekick transcript. */
   maxMessages: number;
+  /**
+   * Trim the sidekick's history when its last prompt used more than this
+   * fraction of its model's context window. Trimming changes the cached
+   * prefix, so it should be rare.
+   */
+  maxContextFraction: number;
+}
+
+export interface FusionCacheConfig {
+  /**
+   * Prompt-cache retention for sidekick requests. "auto" asks for long
+   * retention when the model declares a long cache lifetime (e.g. 1 h on
+   * Anthropic, 24 h on OpenAI) so the cache survives gaps between
+   * delegations, and otherwise uses the provider default. PI_CACHE_RETENTION
+   * in the environment still wins for "auto".
+   */
+  sidekickRetention: "auto" | "short" | "long" | "none";
 }
 
 export interface FusionConfig {
@@ -129,6 +146,8 @@ export interface FusionConfig {
   sidekickTools: string[];
   routing: FusionRoutingConfig;
   limits: FusionLimits;
+  /** Prompt-cache settings for the sidekick. */
+  cache: FusionCacheConfig;
   /** How strongly the main agent is steered to delegate (see src/fusion/policy.ts). */
   delegation: DelegationConfig;
   /** Optional override for the sidekick system prompt. */
@@ -145,7 +164,8 @@ export function defaultFusionConfig(): FusionConfig {
     enabled: true,
     sidekickTools: [...DEFAULT_SIDEKICK_TOOLS],
     routing: { enabled: true, mode: "llm", autoApply: true, onCompact: true, escalateOnFailure: true },
-    limits: { maxTurns: 12, maxMessages: 40 },
+    limits: { maxTurns: 12, maxMessages: 400, maxContextFraction: 0.5 },
+    cache: { sidekickRetention: "auto" },
     delegation: { ...DEFAULT_DELEGATION },
     shortcut: DEFAULT_FUSION_SHORTCUT,
   };
@@ -174,7 +194,12 @@ export function loadFusionConfig(): FusionConfig {
       ? stored.sidekickTools.filter((name: unknown) => typeof name === "string")
       : [...DEFAULT_SIDEKICK_TOOLS],
     routing: { ...defaults.routing, ...(stored.routing ?? {}) },
-    limits: { ...defaults.limits, ...(stored.limits ?? {}) },
+    limits: normalizeLimits(stored.limits, defaults.limits),
+    cache: {
+      sidekickRetention: ["auto", "short", "long", "none"].includes(stored.cache?.sidekickRetention)
+        ? stored.cache.sidekickRetention
+        : defaults.cache.sidekickRetention,
+    },
     delegation: normalizeDelegation(stored.delegation),
     sidekickPrompt: typeof stored.sidekickPrompt === "string" ? stored.sidekickPrompt : undefined,
     shortcut:
@@ -183,6 +208,17 @@ export function loadFusionConfig(): FusionConfig {
         : defaults.shortcut,
   };
   return config;
+}
+
+function normalizeLimits(raw: any, defaults: FusionLimits): FusionLimits {
+  const limits = { ...defaults, ...(raw && typeof raw === "object" ? raw : {}) };
+  // 40 was the old default written into fusion.json; it trimmed (and broke the
+  // sidekick's prompt cache) every 10-20 delegations. Treat it as the new default.
+  if (limits.maxMessages === 40) limits.maxMessages = defaults.maxMessages;
+  if (!Number.isFinite(limits.maxContextFraction) || limits.maxContextFraction <= 0 || limits.maxContextFraction > 0.95) {
+    limits.maxContextFraction = defaults.maxContextFraction;
+  }
+  return limits;
 }
 
 function normalizeDelegation(raw: any): DelegationConfig {

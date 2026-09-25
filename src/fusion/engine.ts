@@ -83,6 +83,8 @@ export interface FusionStats {
   /** Verbose direct outputs compressed by the sidekick model, and characters kept out of the main context. */
   compressed: number;
   charsKeptOut: number;
+  /** Times the sidekick's history was compacted (each costs one cold request). */
+  sidekickCompactions: number;
 }
 
 export interface BackgroundTask {
@@ -241,25 +243,61 @@ export function heuristicClassify(transcript: string, consecutiveFailures: numbe
   };
 }
 
-/** Sliding window over a transcript, cut on a user-message boundary. */
-export function trimTranscript<T extends { role: string; content?: unknown }>(
-  messages: T[],
-  maxMessages: number,
-): T[] | null {
-  const max = Math.max(6, maxMessages);
-  if (messages.length <= max) return null;
-  let cut = messages.length - Math.max(4, Math.floor(max / 2));
+function firstText(content: unknown): string {
+  return contentText(content, "\n").trim();
+}
+
+/** The task line of a brief (the first line after "## Task"). */
+function briefTask(brief: string): string {
+  const match = brief.match(/## Task\s*\n([^\n]+)/);
+  return truncate(match ? match[1] : brief.replace(/^\[fusion\][^\n]*\n+/, ""), 140);
+}
+
+/**
+ * Drop the older half of a transcript (cut on a user-message boundary) and
+ * replace it with a compact, deterministic summary of those delegations: the
+ * task and the start of the sidekick's answer for each. Deterministic, so the
+ * new prefix is stable and caches from the next request on.
+ */
+export function compactTranscript<T extends { role: string; content?: unknown }>(messages: T[]): T[] | null {
+  if (messages.length < 6) return null;
+  let cut = Math.floor(messages.length / 2);
   while (cut < messages.length && messages[cut]?.role !== "user") cut += 1;
   if (cut <= 1 || cut >= messages.length) return null;
+
+  const dropped = messages.slice(0, cut);
+  const lines: string[] = [];
+  for (let i = 0; i < dropped.length; i++) {
+    const message = dropped[i];
+    if (message.role !== "user") continue;
+    const task = briefTask(firstText(message.content));
+    if (!task || task.startsWith(`[${EXTENSION_TAG}] Summary`)) continue;
+    let answer = "";
+    for (let j = i + 1; j < dropped.length && dropped[j].role !== "user"; j++) {
+      if (dropped[j].role === "assistant") answer = firstText(dropped[j].content) || answer;
+    }
+    lines.push(`- ${task}${answer ? ` → ${truncate(answer, 160)}` : ""}`);
+  }
+  const previous = firstText(dropped[0]?.content).match(/\[fusion\] Summary[\s\S]*?\n\n(?=## Task)/)?.[0] ?? "";
+  const carried = previous
+    .split("\n")
+    .filter((l) => l.startsWith("- "))
+    .slice(-30);
+  const summary = [...carried, ...lines].slice(-40);
 
   const tail = messages.slice(cut);
   const first = tail[0];
   const note =
-    `[${EXTENSION_TAG}] Earlier delegated work in this session was dropped to keep the ` +
-    `sidekick context small. Rely on the current brief and rediscover what you need.`;
-  const prior = typeof first.content === "string" ? first.content : "";
+    `[${EXTENSION_TAG}] Summary of earlier delegations in this session (their full transcript was dropped to keep ` +
+    `your context small; rediscover details from the repository when needed):\n${summary.join("\n")}`;
+  const prior = typeof first.content === "string" ? first.content : firstText(first.content);
   tail[0] = { ...first, content: `${note}\n\n${prior}` };
   return tail;
+}
+
+/** Trim only past a hard message cap (the token-based trigger lives in the engine). */
+export function trimTranscript<T extends { role: string; content?: unknown }>(messages: T[], maxMessages: number): T[] | null {
+  return messages.length > Math.max(6, maxMessages) ? compactTranscript(messages) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +352,9 @@ export function buildMainGuidance(
     "You are running in Fusion mode: you are the main (frontier) agent, paired with a persistent,",
     "cheaper sidekick agent that has its own tools and its own cached context.",
     "",
-    `- Sidekick: ${modelKey(sidekickModel)}${sidekickTools.length ? ` — tools: ${sidekickTools.join(", ")}` : ""}`,
+    // The sidekick's model is deliberately not named: routing can change it,
+    // and any change to this text would invalidate the main agent's cache.
+    `- Sidekick tools: ${sidekickTools.join(", ") || "(none)"}`,
     `- Delegate with \`${toolName}\`; collect background results with \`${toolName}_wait\`.`,
     ...modeRules[mode].map((line) => `- ${line}`),
     "",
@@ -361,6 +401,7 @@ function freshStats(): FusionStats {
     background: 0,
     compressed: 0,
     charsKeptOut: 0,
+    sidekickCompactions: 0,
   };
 }
 
@@ -507,8 +548,10 @@ export class FusionEngine {
       return this.agent;
     }
 
-    const streamFn: StreamFn = (streamModel, context, options) =>
-      this.modelRegistry.streamSimple(streamModel, context, options);
+    const streamFn: StreamFn = (streamModel, context, options) => {
+      const cacheRetention = this.sidekickCacheRetention(streamModel);
+      return this.modelRegistry.streamSimple(streamModel, context, cacheRetention ? { ...options, cacheRetention } : options);
+    };
 
     this.agent = new Agent({
       streamFn,
@@ -529,6 +572,27 @@ export class FusionEngine {
     this.sidekickModel = model;
     this.sidekickToolNames = toolNames;
     return this.agent;
+  }
+
+  /**
+   * Cache retention for sidekick requests. "auto" asks for long retention when
+   * the model declares a long cache lifetime, so the sidekick's cache survives
+   * gaps between delegations (pi's cache warming only covers the main
+   * session). An explicit PI_CACHE_RETENTION in the environment wins.
+   */
+  sidekickCacheRetention(model: Model<any>): "short" | "long" | "none" | undefined {
+    const setting = this.config.cache?.sidekickRetention ?? "auto";
+    if (setting !== "auto") return setting;
+    if (process.env.PI_CACHE_RETENTION) return undefined;
+    return model.promptCache?.long ? "long" : undefined;
+  }
+
+  /** Whether the sidekick's history should be compacted after this delegation. */
+  private shouldCompact(lastPrompt: number, messageCount: number, model: Model<any>): boolean {
+    if (messageCount > Math.max(6, this.config.limits.maxMessages)) return true;
+    const window = model.contextWindow || 0;
+    const fraction = this.config.limits.maxContextFraction ?? 0.5;
+    return window > 0 && lastPrompt > window * fraction;
   }
 
   /**
@@ -829,8 +893,18 @@ export class FusionEngine {
     }
     const capped = this.capResult(text);
     text = capped.text;
-    const trimmed = trimTranscript(agent.state.messages as any[], this.config.limits.maxMessages);
-    if (trimmed) agent.state.messages = trimmed;
+    // Compact rarely: only when the last prompt filled a good part of the
+    // context window (or past a hard message cap). Every compaction changes the
+    // cached prefix, so the sidekick pays one cold request afterwards.
+    const lastUsage = ([...messages].reverse().find((m: any) => m.role === "assistant" && m.usage) as any)?.usage as Usage | undefined;
+    const lastPrompt = lastUsage ? lastUsage.input + lastUsage.cacheRead + lastUsage.cacheWrite : 0;
+    if (this.shouldCompact(lastPrompt, agent.state.messages.length, model)) {
+      const compacted = compactTranscript(agent.state.messages as any[]);
+      if (compacted) {
+        agent.state.messages = compacted;
+        this.stats.sidekickCompactions += 1;
+      }
+    }
 
     const trace = buildTrace(messages as any[]);
     const meta = delegationMeta({ model: modelKey(model), turns, usage });
@@ -1156,6 +1230,7 @@ export class FusionEngine {
       background: this.stats.background,
       compressed: this.stats.compressed,
       charsKeptOut: this.stats.charsKeptOut,
+      sidekickCompactions: this.stats.sidekickCompactions,
       lifetime: { ...this.lifetime },
     };
   }

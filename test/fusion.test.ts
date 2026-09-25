@@ -126,7 +126,7 @@ describe("sidekick turn cap", () => {
       ...defaultFusionConfig(),
       sidekick: { provider: model.provider, modelId: model.id },
       sidekickTools: ["ls"],
-      limits: { maxTurns: 3, maxMessages: 40 },
+      limits: { maxTurns: 3, maxMessages: 400, maxContextFraction: 0.5 },
     };
     const engine = new FusionEngine(rec.api, registry, tempDir(), config);
     const outcome = await engine.delegate({ task: "list files forever" });
