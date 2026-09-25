@@ -40,7 +40,10 @@ import { contentText, truncate } from "../shared/text.js";
 import { buildTrace, delegationMeta, describeActivity, extractFinalText } from "../shared/trace.js";
 import type { DelegationTrace, TraceStep } from "../shared/trace.js";
 import { addUsage, cloneUsage, emptyUsage, formatCost } from "../shared/usage.js";
-import { compressionPrompt } from "./policy.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { compressionPrompt, neverExits } from "./policy.js";
 import type { DelegationMode } from "./policy.js";
 
 export type { EffortLevel } from "../shared/models.js";
@@ -83,7 +86,11 @@ export interface FusionStats {
 export interface BackgroundTask {
   id: string;
   task: string;
-  status: "queued" | "running" | "done" | "failed";
+  status: "queued" | "running" | "done" | "failed" | "cancelled";
+  /** Aborts this delegation (queued or running). */
+  controller: AbortController;
+  /** Absolute paths this delegation edits or will edit; the main agent must not touch them meanwhile. */
+  leases: Set<string>;
   startedAt: number;
   promise: Promise<DelegationOutcome>;
   outcome?: DelegationOutcome;
@@ -110,6 +117,8 @@ export interface DelegationInput {
   context?: string;
   files?: string[];
   expect?: "summary" | "diff" | "evidence" | "raw";
+  /** Context gathered by the harness (files the main agent read, git status). */
+  harnessContext?: string;
 }
 
 export interface DelegationOutcome {
@@ -123,6 +132,8 @@ export interface DelegationOutcome {
   hitTurnCap: boolean;
   meta: string;
   trace: TraceStep[];
+  /** Where the full result was saved when it was longer than the cap. */
+  fullTextPath?: string;
 }
 
 const EXPECT_GUIDANCE: Record<NonNullable<DelegationInput["expect"]>, string> = {
@@ -290,9 +301,10 @@ export function buildMainGuidance(
       "edit and file write goes through the sidekick; direct bash/edit/write calls are blocked.",
     ],
     balanced: [
-      "Mode: BALANCED. Tests, builds, linters, type checks and dependency installs are always run by",
-      "the sidekick (direct calls are redirected). Very long direct command output is condensed by the",
-      "sidekick's model before you see it; the full log path is included if you need details.",
+      "Mode: BALANCED. You may run a test, build, lint or install command directly once; if it proves",
+      "slow or verbose, later runs are redirected to the sidekick — delegate known-slow suites with",
+      "background: true from the start. Very long direct output is condensed by the sidekick's model",
+      "(the full log path is included). Commands that never exit (dev servers, --watch) are refused.",
     ],
     advisory: ["Mode: ADVISORY. Delegation is your call, but follow the rules below."],
   };
@@ -448,12 +460,31 @@ export class FusionEngine {
       const factory = factories[name];
       if (!factory) continue;
       try {
-        tools.push(factory(this.cwd));
+        const tool = factory(this.cwd);
+        tools.push(name === "bash" || name === "powershell" ? this.guardShellTool(tool) : tool);
       } catch (error) {
         console.error(`[${EXTENSION_TAG}] failed to build sidekick tool "${name}":`, error);
       }
     }
     return tools;
+  }
+
+  /**
+   * The sidekick's shell: refuse commands that never exit, and give test/build
+   * style commands a default timeout so one bad command cannot hang it.
+   */
+  private guardShellTool(tool: AgentTool<any>): AgentTool<any> {
+    return {
+      ...tool,
+      execute: (toolCallId, params: any, signal, onUpdate) => {
+        const command = String(params?.command ?? "");
+        const hang = neverExits(command);
+        if (hang) return Promise.reject(new Error(`Blocked by Fusion: ${hang}`));
+        const timeout = this.config.delegation?.commandTimeoutSec ?? 0;
+        const next = timeout > 0 && params && params.timeout === undefined ? { ...params, timeout } : params;
+        return tool.execute(toolCallId, next, signal, onUpdate);
+      },
+    };
   }
 
   ensureAgent(): Agent | undefined {
@@ -544,6 +575,7 @@ export class FusionEngine {
     if (input.context?.trim()) parts.push(`## Context from the main agent\n${input.context.trim()}`);
     if (input.files?.length) parts.push(`## Focus files\n${input.files.map((file) => `- ${file}`).join("\n")}`);
     if (input.expect) parts.push(`## Expected response\n${EXPECT_GUIDANCE[input.expect]}`);
+    if (input.harnessContext?.trim()) parts.push(`## Context gathered by the harness\n${input.harnessContext.trim()}`);
     parts.push(
       "Work autonomously with your own tools and report back when done. " +
         "Do not ask questions — if something is genuinely blocked, report the blocker.",
@@ -552,10 +584,16 @@ export class FusionEngine {
   }
 
   /** Serialized so parallel tool calls from the main agent queue up safely. */
-  delegate(input: DelegationInput, signal?: AbortSignal, onStart?: () => void): Promise<DelegationOutcome> {
+  delegate(
+    input: DelegationInput,
+    signal?: AbortSignal,
+    onStart?: () => void,
+    onTool?: (toolName: string, args: Record<string, unknown>) => void,
+  ): Promise<DelegationOutcome> {
     const run = this.queue.then(() => {
+      if (signal?.aborted) return this.cancelledOutcome();
       onStart?.();
-      return this.runDelegation(input, signal);
+      return this.runDelegation(input, signal, onTool);
     });
     this.queue = run.catch(() => undefined);
     return run;
@@ -568,24 +606,83 @@ export class FusionEngine {
   startBackground(input: DelegationInput, onDone?: (task: BackgroundTask) => void): BackgroundTask {
     this.taskCounter += 1;
     const id = `D${this.taskCounter}`;
+    const controller = new AbortController();
     const task: BackgroundTask = {
       id,
       task: truncate(input.task, 200),
       status: "queued",
       startedAt: Date.now(),
+      controller,
+      leases: new Set(),
       promise: Promise.resolve(undefined as unknown as DelegationOutcome),
     };
-    task.promise = this.delegate(input, undefined, () => {
-      task.status = "running";
-    }).then((outcome) => {
+    // Files named in the brief are leased up front when the sidekick can edit.
+    if (this.canEdit()) for (const file of input.files ?? []) task.leases.add(path.resolve(this.cwd, file));
+    task.promise = this.delegate(
+      input,
+      controller.signal,
+      () => {
+        if (task.status === "queued") task.status = "running";
+      },
+      (toolName, args) => {
+        if (toolName !== "edit" && toolName !== "write") return;
+        const target = String(args.path ?? args.file_path ?? "");
+        if (target) task.leases.add(path.resolve(this.cwd, target));
+      },
+    ).then((outcome) => {
       task.outcome = outcome;
-      task.status = outcome.isError ? "failed" : "done";
-      onDone?.(task);
+      if (task.status !== "cancelled") {
+        task.status = outcome.isError ? "failed" : "done";
+        onDone?.(task);
+      }
+      task.leases.clear();
       return outcome;
     });
     this.tasks.set(id, task);
     this.stats.background += 1;
     return task;
+  }
+
+  private canEdit(): boolean {
+    const names = this.configuredToolNames();
+    return names.includes("edit") || names.includes("write");
+  }
+
+  private cancelledOutcome(): DelegationOutcome {
+    return {
+      text: "",
+      usage: emptyUsage(),
+      turns: 0,
+      isError: true,
+      errorMessage: "cancelled",
+      activity: [],
+      hitTurnCap: false,
+      meta: "cancelled",
+      trace: [],
+    };
+  }
+
+  /** Cancel background delegations by id (or all unfinished ones). Returns the ids cancelled. */
+  cancel(ids?: string[]): string[] {
+    const targets = ids?.length
+      ? ids.map((id) => this.tasks.get(id)).filter((t): t is BackgroundTask => Boolean(t))
+      : this.pendingTasks();
+    const cancelled: string[] = [];
+    for (const task of targets) {
+      if (task.status !== "queued" && task.status !== "running") continue;
+      task.status = "cancelled";
+      task.collected = true;
+      task.leases.clear();
+      task.controller.abort();
+      cancelled.push(task.id);
+    }
+    return cancelled;
+  }
+
+  /** The unfinished background delegation that holds a lease on this path, if any. */
+  leaseHolder(target: string): BackgroundTask | undefined {
+    const absolute = path.resolve(this.cwd, target);
+    return this.pendingTasks().find((task) => task.leases.has(absolute));
   }
 
   /** Wait for background delegations (all unfinished ones when no ids are given). */
@@ -639,7 +736,11 @@ export class FusionEngine {
     }
   }
 
-  private async runDelegation(input: DelegationInput, signal?: AbortSignal): Promise<DelegationOutcome> {
+  private async runDelegation(
+    input: DelegationInput,
+    signal?: AbortSignal,
+    onTool?: (toolName: string, args: Record<string, unknown>) => void,
+  ): Promise<DelegationOutcome> {
     const agent = this.ensureAgent();
     const model = this.resolveSidekickModel();
     if (!agent || !model) {
@@ -670,6 +771,7 @@ export class FusionEngine {
       } else if (event.type === "tool_execution_start") {
         this.activity.push(describeActivity(event.toolName, event.args));
         if (this.activity.length > 12) this.activity.shift();
+        onTool?.(event.toolName, (event.args ?? {}) as Record<string, unknown>);
       }
     });
 
@@ -715,6 +817,8 @@ export class FusionEngine {
         `\n\n[${EXTENSION_TAG}] sidekick hit its ${this.config.limits.maxTurns}-turn cap; ` +
         "the result above may be incomplete.";
     }
+    const capped = this.capResult(text);
+    text = capped.text;
     const trimmed = trimTranscript(agent.state.messages as any[], this.config.limits.maxMessages);
     if (trimmed) agent.state.messages = trimmed;
 
@@ -744,7 +848,44 @@ export class FusionEngine {
     }
     writeJsonFile(fusionStatsPath(), this.lifetime);
 
-    return { text, usage, turns, isError, errorMessage, model: modelKey(model), activity: [...this.activity], hitTurnCap, meta, trace };
+    return {
+      text,
+      usage,
+      turns,
+      isError,
+      errorMessage,
+      model: modelKey(model),
+      activity: [...this.activity],
+      hitTurnCap,
+      meta,
+      trace,
+      fullTextPath: capped.path,
+    };
+  }
+
+  /**
+   * Keep the main agent's context lean: a sidekick result longer than the cap
+   * is cut, and the full text is saved to a file the main agent can read.
+   */
+  capResult(text: string): { text: string; path?: string } {
+    const cap = this.config.delegation?.resultCapChars ?? 0;
+    if (cap <= 0 || text.length <= cap) return { text };
+    let file: string | undefined;
+    try {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fusion-result-"));
+      file = path.join(dir, "result.md");
+      fs.writeFileSync(file, text);
+    } catch {
+      file = undefined;
+    }
+    const head = text.slice(0, cap);
+    const cut = head.lastIndexOf("\n") > cap * 0.6 ? head.slice(0, head.lastIndexOf("\n")) : head;
+    return {
+      text:
+        `${cut}\n\n[${EXTENSION_TAG}] result cut at ${cut.length.toLocaleString()} of ${text.length.toLocaleString()} chars` +
+        `${file ? `; full result: ${file} (read targeted ranges only if needed)` : ""}.`,
+      path: file,
+    };
   }
 
   // -- routing -------------------------------------------------------------

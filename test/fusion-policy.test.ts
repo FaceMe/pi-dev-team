@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createFauxCore, fauxAssistantMessage, fauxText } from "@earendil-works/pi-ai";
-import { classifyCommand, decideDirectCall } from "../src/fusion/policy.js";
+import { createFauxCore, fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
+import { classifyCommand, decideDirectCall, DEFAULT_DELEGATION, neverExits, recordCommand } from "../src/fusion/policy.js";
 import fusionExtension from "../src/fusion/extension.js";
 import { defaultFusionConfig, loadFusionConfig, saveFusionConfig } from "../src/shared/config.js";
 import { fakeRegistry, fakeUi, recordingPi, tempDir, useTempAgentDir } from "./helpers.js";
@@ -32,11 +32,30 @@ describe("command classification", () => {
 describe("direct-call decisions", () => {
   const fresh = () => ({ directStreak: 0, failedDelegations: 0 });
 
-  it("balanced redirects tests/builds/installs but not reads or edits", () => {
-    expect(decideDirectCall("balanced", "bash", { command: "npm test" }, fresh(), true).block).toBe(true);
-    expect(decideDirectCall("balanced", "bash", { command: "npm install" }, fresh(), true).reason).toMatch(/sidekick/);
-    expect(decideDirectCall("balanced", "bash", { command: "cat a.ts" }, fresh(), true).block).toBe(false);
-    expect(decideDirectCall("balanced", "edit", { path: "a.ts" }, fresh(), true).block).toBe(false);
+  it("balanced lets a quick command run directly and redirects it once it proved slow or verbose", () => {
+    const state = fresh();
+    expect(decideDirectCall("balanced", "bash", { command: "npm test" }, state, true).block).toBe(false);
+    recordCommand(state, "npm test", 1_200, 300);
+    expect(decideDirectCall("balanced", "bash", { command: "npm  test" }, state, true).block).toBe(false);
+    recordCommand(state, "npm test", 95_000, 300);
+    const slow = decideDirectCall("balanced", "bash", { command: "npm test" }, state, true);
+    expect(slow.block).toBe(true);
+    expect(slow.reason).toMatch(/took 95s/);
+    expect(slow.reason).toMatch(/background: true/);
+    recordCommand(state, "npm install", 2_000, 50_000);
+    expect(decideDirectCall("balanced", "bash", { command: "npm install" }, state, true).reason).toMatch(/printed 50,000 chars/);
+    expect(decideDirectCall("balanced", "bash", { command: "cat a.ts" }, state, true).block).toBe(false);
+    expect(decideDirectCall("balanced", "edit", { path: "a.ts" }, state, true).block).toBe(false);
+  });
+
+  it("refuses commands that never exit, in every mode", () => {
+    for (const cmd of ["npm run dev", "pnpm start", "vitest --watch", "jest --watchAll", "vitest --watch=true", "tsc -w", "next dev", "python -m http.server 8000", "docker compose up", "tail -f app.log", "npx vite"]) {
+      expect(neverExits(cmd), cmd).toBeDefined();
+      expect(decideDirectCall("advisory", "bash", { command: cmd }, fresh(), true).block, cmd).toBe(true);
+    }
+    for (const cmd of ["npm test", "vitest run", "npx tsc --noEmit", "docker compose up -d", "npm run dev > /tmp/dev.log 2>&1 &", "timeout 5 npm start", "jest --watchAll=false", "vitest --watch=false"]) {
+      expect(neverExits(cmd), cmd).toBeUndefined();
+    }
   });
 
   it("strict blocks every execution tool; advisory blocks nothing", () => {
@@ -52,15 +71,16 @@ describe("direct-call decisions", () => {
 });
 
 describe("fusion extension with the policy", () => {
-  function boot(mode: "strict" | "balanced" | "advisory", responses: string[] = ["condensed: 3 tests failed at a.test.ts:4"]) {
+  function boot(mode: "strict" | "balanced" | "advisory", responses: Array<string | object | ((context: any) => any)> = ["condensed: 3 tests failed at a.test.ts:4"]) {
     const core = createFauxCore({ provider: "faux", models: [{ id: "cheap", contextWindow: 128_000 }, { id: "big", reasoning: true, contextWindow: 200_000 }] });
-    core.setResponses(responses.map((text) => fauxAssistantMessage([fauxText(text)])));
+    core.setResponses(responses.map((r) => (typeof r === "string" ? fauxAssistantMessage([fauxText(r)]) : r)) as any);
     const [cheap, big] = core.models;
     saveFusionConfig({
       ...defaultFusionConfig(),
       main: { provider: big.provider, modelId: big.id },
       sidekick: { provider: cheap.provider, modelId: cheap.id },
-      delegation: { mode, nudgeAfter: 3, compressOutputChars: 200 },
+      delegation: { ...DEFAULT_DELEGATION, mode, nudgeAfter: 3, compressOutputChars: 200, resultCapChars: 300 },
+      sidekickTools: ["read", "grep", "find", "ls", "bash", "edit", "write"],
     });
     const rec = recordingPi();
     rec.activeTools = ["read", "bash", "edit", "write"];
@@ -107,13 +127,26 @@ describe("fusion extension with the policy", () => {
     expect(loadFusionConfig().delegation.mode).toBe("balanced");
   });
 
-  it("balanced mode redirects a direct test run to the sidekick", async () => {
+  it("balanced mode runs a test command directly first (with a timeout), then redirects it once it proved verbose", async () => {
+    const { fire } = boot("balanced", ["condensed test output"]);
+    await fire("session_start", {});
+    const first = { toolName: "bash", toolCallId: "t1", input: { command: "npm test" } as Record<string, unknown> };
+    expect(await fire("tool_call", first)).toBeUndefined();
+    expect(first.input.timeout).toBe(600);
+    const noisy = Array.from({ length: 40 }, (_, i) => `test ${i} ok`).join("\n");
+    await fire("tool_result", { toolName: "bash", toolCallId: "t1", input: first.input, content: [{ type: "text", text: noisy }], isError: false });
+    const second = await fire("tool_call", { toolName: "bash", toolCallId: "t2", input: { command: "npm test" } });
+    expect(second.block).toBe(true);
+    expect(second.reason).toMatch(/sidekick\(/);
+    expect(await fire("tool_call", { toolName: "bash", toolCallId: "t3", input: { command: "cat package.json" } })).toBeUndefined();
+  });
+
+  it("refuses a dev server on the main agent", async () => {
     const { fire } = boot("balanced");
     await fire("session_start", {});
-    const blocked = await fire("tool_call", { toolName: "bash", input: { command: "npm test" } });
+    const blocked = await fire("tool_call", { toolName: "bash", toolCallId: "d1", input: { command: "npm run dev" } });
     expect(blocked.block).toBe(true);
-    expect(blocked.reason).toMatch(/sidekick\(/);
-    expect(await fire("tool_call", { toolName: "bash", input: { command: "cat package.json" } })).toBeUndefined();
+    expect(blocked.reason).toMatch(/does not exit/);
   });
 
   it("condenses verbose direct output with the sidekick model and keeps the full log", async () => {
@@ -169,6 +202,72 @@ describe("fusion extension with the policy", () => {
     expect(result.continue).toBe(true);
     expect(result.entries[0].content).toContain("build ok");
     expect(await fire("agent_before_settle", { outcome: "completed" })).toBeUndefined();
+  });
+
+  it("caps long sidekick results and keeps the full text in a file", async () => {
+    const long = Array.from({ length: 60 }, (_, i) => `finding ${i}: something in src/file${i}.ts`).join("\n");
+    const { rec, fire, ctx } = boot("balanced", [long]);
+    await fire("session_start", {});
+    const result = await rec.tools.get("sidekick").execute("c1", { task: "audit" }, undefined, undefined, ctx);
+    const text = result.content[0].text as string;
+    expect(text.length).toBeLessThan(500);
+    const file = text.match(/full result: (\S+)/)![1];
+    expect(fs.readFileSync(file, "utf8")).toBe(long);
+  });
+
+  it("attaches the files the main agent read to the sidekick's brief", async () => {
+    let brief = "";
+    const { rec, fire, ctx } = boot("balanced", [
+      (context: any) => {
+        brief = JSON.stringify(context.messages.at(-1)?.content ?? "");
+        return fauxAssistantMessage([fauxText("done")]);
+      },
+    ]);
+    await fire("session_start", {});
+    await fire("tool_call", { toolName: "read", toolCallId: "r1", input: { path: "src/parser.ts", offset: 10, limit: 20 } });
+    await rec.tools.get("sidekick").execute("c1", { task: "fix the parser" }, undefined, undefined, ctx);
+    expect(brief).toContain("Files the main agent has already read");
+    expect(brief).toContain("src/parser.ts (lines 10–29)");
+  });
+
+  it("blocks the main agent from editing a file a background delegation is changing, and can cancel it", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const { rec, fire, ctx } = boot("balanced", [
+      async () => {
+        await gate;
+        return fauxAssistantMessage([fauxText("edited")]);
+      },
+    ]);
+    await fire("session_start", {});
+    await rec.tools.get("sidekick").execute("c1", { task: "refactor", files: ["src/a.ts"], background: true }, undefined, undefined, ctx);
+    const blocked = await fire("tool_call", { toolName: "edit", toolCallId: "e1", input: { path: "src/a.ts" } });
+    expect(blocked.block).toBe(true);
+    expect(blocked.reason).toMatch(/D1 is changing src\/a\.ts/);
+    expect(await fire("tool_call", { toolName: "edit", toolCallId: "e2", input: { path: "src/b.ts" } })).toBeUndefined();
+
+    await rec.commands.get("fusion").handler("cancel D1", ctx);
+    release();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(await fire("tool_call", { toolName: "edit", toolCallId: "e3", input: { path: "src/a.ts" } })).toBeUndefined();
+    expect(rec.messages).toHaveLength(0);
+    await rec.commands.get("fusion").handler("tasks", ctx);
+    const list = rec.entries.filter((e) => e.type === "fusion-tasks").at(-1) as any;
+    expect(list.data.lines[0]).toMatch(/D1 cancelled/);
+  });
+
+  it("refuses never-exiting commands in the sidekick's own shell", async () => {
+    let toolResult = "";
+    const { rec, fire, ctx } = boot("balanced", [
+      fauxAssistantMessage([fauxToolCall("bash", { command: "npm run dev" }, { id: "s1" })], { stopReason: "toolUse" }),
+      (context: any) => {
+        toolResult = JSON.stringify(context.messages.at(-1)?.content ?? "");
+        return fauxAssistantMessage([fauxText("could not start the dev server")]);
+      },
+    ]);
+    await fire("session_start", {});
+    await rec.tools.get("sidekick").execute("c1", { task: "start the app" }, undefined, undefined, ctx);
+    expect(toolResult).toContain("Blocked by Fusion");
   });
 
   it("puts the decision rule and mode into the main agent's prompt", async () => {
