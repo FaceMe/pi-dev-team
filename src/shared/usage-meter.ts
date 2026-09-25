@@ -1,0 +1,92 @@
+/**
+ * Per-agent token meter: requests, input/output, cache reads/writes, cost and
+ * cache hit rate, updated as each model response lands (real time).
+ *
+ * pi-ai normalises every provider so that `input` excludes cached tokens; the
+ * prompt a request sent is therefore input + cacheRead + cacheWrite, and the
+ * cache hit rate is cacheRead / prompt.
+ */
+
+import type { Usage } from "@earendil-works/pi-ai";
+import { formatCost, formatTokens } from "./usage.js";
+
+export interface MeterTotals {
+  requests: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+}
+
+export interface MeterSnapshot extends MeterTotals {
+  /** Prompt tokens sent (input + cacheRead + cacheWrite). */
+  prompt: number;
+  /** cacheRead / prompt over all requests, or undefined when nothing was sent. */
+  hitRate?: number;
+  /** The most recent request, for spotting a cold cache as it happens. */
+  last?: MeterTotals & { prompt: number; hitRate?: number; at: number };
+  /** True once the provider reported any cache activity. */
+  cacheReported: boolean;
+}
+
+const zero = (): MeterTotals => ({ requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+
+export function promptTokens(u: Pick<MeterTotals, "input" | "cacheRead" | "cacheWrite">): number {
+  return u.input + u.cacheRead + u.cacheWrite;
+}
+
+export function hitRate(u: Pick<MeterTotals, "input" | "cacheRead" | "cacheWrite">): number | undefined {
+  const prompt = promptTokens(u);
+  return prompt > 0 ? u.cacheRead / prompt : undefined;
+}
+
+export class UsageMeter {
+  private totals = zero();
+  private last?: MeterSnapshot["last"];
+
+  /** Record one model response's usage. Ignores empty/zero usage (e.g. aborted before any tokens). */
+  add(usage?: Partial<Usage> | null): void {
+    if (!usage) return;
+    const entry: MeterTotals = {
+      requests: 1,
+      input: usage.input ?? 0,
+      output: usage.output ?? 0,
+      cacheRead: usage.cacheRead ?? 0,
+      cacheWrite: usage.cacheWrite ?? 0,
+      cost: usage.cost?.total ?? 0,
+    };
+    if (promptTokens(entry) + entry.output === 0) return;
+    for (const key of Object.keys(entry) as Array<keyof MeterTotals>) this.totals[key] += entry[key];
+    this.last = { ...entry, prompt: promptTokens(entry), hitRate: hitRate(entry), at: Date.now() };
+  }
+
+  snapshot(): MeterSnapshot {
+    const t = { ...this.totals };
+    return {
+      ...t,
+      prompt: promptTokens(t),
+      hitRate: hitRate(t),
+      last: this.last ? { ...this.last } : undefined,
+      cacheReported: t.cacheRead + t.cacheWrite > 0,
+    };
+  }
+
+  reset(): void {
+    this.totals = zero();
+    this.last = undefined;
+  }
+}
+
+const pct = (value?: number) => (value === undefined ? "–" : `${Math.round(value * 100)}%`);
+
+/** One compact line: "12 req · in 3.1k · out 2.4k · cache r 180k w 12k · hit 92% (last 97%) · $0.41". */
+export function formatMeter(s: MeterSnapshot): string {
+  if (s.requests === 0) return "no requests yet";
+  const cache = s.cacheReported
+    ? `cache r ${formatTokens(s.cacheRead)} w ${formatTokens(s.cacheWrite)} · hit ${pct(s.hitRate)}${s.last ? ` (last ${pct(s.last.hitRate)})` : ""}`
+    : "no cache reported";
+  return `${s.requests} req · in ${formatTokens(s.input)} · out ${formatTokens(s.output)} · ${cache} · ${formatCost(s.cost)}`;
+}
+
+export { pct as formatPercent };
