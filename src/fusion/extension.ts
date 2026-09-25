@@ -148,6 +148,27 @@ export default function fusionExtension(pi: ExtensionAPI) {
   };
 
   const waitToolName = `${toolName}_wait`;
+
+  /**
+   * The Fusion prompt section and the strict-mode tool set the main agent sees.
+   * Changing either mid-session changes the main agent's cached prefix (the
+   * expensive cache), so they only change at a "prompt epoch": session start,
+   * compaction (the cache is rebuilt anyway) or fusion on/off. Delegation
+   * enforcement itself (tool_call hooks) always follows the live config.
+   */
+  let promptEpoch: { mode: DelegationMode; sidekickTools: string[] } | undefined;
+  const startPromptEpoch = (): void => {
+    promptEpoch = { mode: config.delegation.mode, sidekickTools: [...config.sidekickTools] };
+  };
+  const epochMode = (): DelegationMode => promptEpoch?.mode ?? config.delegation.mode;
+  /** True before the conversation's first message, when changing the prompt costs nothing. */
+  const conversationStarted = (ctx: ExtensionContext): boolean => {
+    try {
+      return ctx.sessionManager.getBranch().some((entry: any) => entry.type === "message");
+    } catch {
+      return true;
+    }
+  };
   /** Execution tools removed from the main agent by strict mode, to restore later. */
   let strictRemoved: string[] = [];
   const policy: PolicyState = { directStreak: 0, failedDelegations: 0, history: new Map() };
@@ -199,7 +220,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
     } else {
       next = next.filter((name) => !ours.includes(name));
     }
-    const strict = active && config.delegation.mode === "strict";
+    const strict = active && epochMode() === "strict";
     if (strict) {
       const removing = next.filter((name) => EXECUTION_TOOLS.includes(name));
       strictRemoved = [...new Set([...strictRemoved, ...removing])];
@@ -612,6 +633,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
       );
     }
 
+    startPromptEpoch();
     setSidekickToolActive(config.enabled);
     refreshUi(ctx);
   });
@@ -651,13 +673,15 @@ export default function fusionExtension(pi: ExtensionAPI) {
       delete options.sections[EXTENSION_TAG];
       return;
     }
+    if (!promptEpoch) startPromptEpoch();
+    const epoch = promptEpoch!;
     options.sections[EXTENSION_TAG] = buildMainGuidance(
       toolName,
-      sidekickModel,
-      activeEngine.config.delegation.mode === "strict"
-        ? [...new Set([...activeEngine.config.sidekickTools, "read", "grep", "find", "ls", "bash", "edit", "write"])]
-        : activeEngine.config.sidekickTools,
-      activeEngine.config.delegation.mode,
+      undefined,
+      epoch.mode === "strict"
+        ? [...new Set([...epoch.sidekickTools, "read", "grep", "find", "ls", "bash", "edit", "write"])]
+        : epoch.sidekickTools,
+      epoch.mode,
     );
   });
 
@@ -672,6 +696,10 @@ export default function fusionExtension(pi: ExtensionAPI) {
   // -- dynamic mid-session routing ----------------------------------------
 
   pi.on("session_compact", async (_event, ctx) => {
+    // Compaction rebuilds the main agent's cache anyway: apply deferred
+    // prompt/tool changes (delegation mode, sidekick tools) now.
+    startPromptEpoch();
+    if (engine) setSidekickToolActive(config.enabled && engine.resolveSidekickModel() !== undefined);
     const activeEngine = engine;
 
     if (!activeEngine || !config.enabled) return;
@@ -868,6 +896,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
           config.enabled = sub === "on";
           persistConfig();
           activeEngine.config = config;
+          startPromptEpoch();
           setSidekickToolActive(config.enabled);
           // Sync the session model (footer bottom-right) with the fusion main
           // slot on enable; hand it back on disable.
@@ -918,9 +947,19 @@ export default function fusionExtension(pi: ExtensionAPI) {
           config.delegation = { ...config.delegation, mode: value };
           activeEngine.config = config;
           persistConfig();
-          setSidekickToolActive(config.enabled);
+          const deferred = conversationStarted(ctx) && epochMode() !== value;
+          if (!deferred) {
+            startPromptEpoch();
+            setSidekickToolActive(config.enabled);
+          }
           refreshUi(ctx);
-          ctx.ui.notify(`Fusion delegation mode: ${value}.`, "info");
+          ctx.ui.notify(
+            deferred
+              ? `Fusion delegation mode: ${value}. Enforcement changes now; the main agent's prompt and tools switch at the next compaction ` +
+                  "(run /compact to switch now) so its prompt cache is not invalidated."
+              : `Fusion delegation mode: ${value}.`,
+            "info",
+          );
           return;
         }
 
@@ -1119,7 +1158,8 @@ export default function fusionExtension(pi: ExtensionAPI) {
       new Text(
         `direct calls ${stats.directCalls ?? 0} · redirected to sidekick ${stats.redirected ?? 0} · ` +
           `background ${stats.background ?? 0} · outputs condensed ${stats.compressed ?? 0}` +
-          `${stats.charsKeptOut ? ` (${Math.round(stats.charsKeptOut / 1000)}k chars kept out of the main context)` : ""}`,
+          `${stats.charsKeptOut ? ` (${Math.round(stats.charsKeptOut / 1000)}k chars kept out of the main context)` : ""}` +
+          ` · sidekick history compactions ${(stats as any).sidekickCompactions ?? 0}`,
         0,
         0,
       ),
@@ -1243,7 +1283,11 @@ async function openConfigWizard(
         engine.config.delegation = { ...engine.config.delegation, mode: modeChoice.split(" ")[0] as DelegationMode };
         hooks.persist();
         hooks.refreshUi(ctx);
-        ctx.ui.notify(`Delegation mode: ${engine.config.delegation.mode} (applies from your next message).`, "info");
+        ctx.ui.notify(
+          `Delegation mode: ${engine.config.delegation.mode}. Enforcement applies from your next message; the main agent's ` +
+            "prompt and tools switch at the next compaction (/compact to switch now) to keep its prompt cache.",
+          "info",
+        );
       }
       continue;
     }

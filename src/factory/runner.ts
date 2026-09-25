@@ -130,6 +130,10 @@ export class PiSubprocessRunner implements WorkerRunner {
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
         env: {
+          // Workers exit between phases and pi's cache warming stops with them;
+          // long retention keeps their persistent sessions' caches alive across
+          // the gap (where the provider supports it). An explicit setting wins.
+          PI_CACHE_RETENTION: "long",
           ...this.env,
           [WORKER_ENV.worker]: "1",
           [WORKER_ENV.role]: request.role,
