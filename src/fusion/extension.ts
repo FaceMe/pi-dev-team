@@ -35,7 +35,9 @@ import type { EffortLevel } from "../shared/models.js";
 import { truncate } from "../shared/text.js";
 import { renderTraceSteps } from "../shared/trace.js";
 import type { DelegationTrace, TraceStep } from "../shared/trace.js";
-import { addUsage, formatCost } from "../shared/usage.js";
+import { formatCost, formatTokens } from "../shared/usage.js";
+import { formatPercent } from "../shared/usage-meter.js";
+import type { MeterSnapshot } from "../shared/usage-meter.js";
 import { showModelPicker } from "../picker/model-picker.js";
 import {
   buildMainGuidance,
@@ -122,6 +124,17 @@ export default function fusionExtension(pi: ExtensionAPI) {
       refreshUi();
     }
   });
+
+  /** Refresh at most every 250 ms when meters tick during streaming work. */
+  let refreshTimer: NodeJS.Timeout | undefined;
+  const scheduleRefresh = (): void => {
+    if (refreshTimer) return;
+    refreshTimer = setTimeout(() => {
+      refreshTimer = undefined;
+      refreshUi();
+    }, 250);
+    refreshTimer.unref?.();
+  };
 
   const refreshUi = (ctx?: ExtensionContext): void => {
     const target = ctx ?? engine?.latestCtx;
@@ -586,6 +599,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
     restoreRoutedSidekick(config, ctx);
     engine = new FusionEngine(pi, ctx.modelRegistry, ctx.cwd, config);
     engine.setContext(ctx);
+    engine.onUsage = scheduleRefresh;
     userPickedModel = false;
 
     // Another extension may have claimed the same tool name; surface it rather
@@ -603,6 +617,8 @@ export default function fusionExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = undefined;
     strictRemoved = [];
     engine?.cancel();
     recentReads = [];
@@ -650,9 +666,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
   pi.on("turn_end", async (event) => {
     const activeEngine = engine;
     if (!activeEngine) return;
-    if (event.message?.role === "assistant") {
-      addUsage(activeEngine.stats.mainUsage, event.message.usage);
-    }
+    if (event.message?.role === "assistant") activeEngine.recordMainUsage(event.message.usage);
   });
 
   // -- dynamic mid-session routing ----------------------------------------
@@ -1060,6 +1074,29 @@ export default function fusionExtension(pi: ExtensionAPI) {
           )
         : 0;
     box.addChild(new Text(theme.bold("fusion session"), 0, 0));
+    const meters = (stats as any).meters as Record<string, MeterSnapshot> | undefined;
+    if (meters) {
+      box.addChild(new Text(theme.fg("dim", "agent      requests  input    output   cache read  cache write  hit    last   cost"), 0, 0));
+      for (const [name, m] of Object.entries(meters)) {
+        if (!m || (name === "helpers" && m.requests === 0)) continue;
+        const cell = (v: string, w: number) => v.padEnd(w);
+        box.addChild(
+          new Text(
+            cell(name, 11) +
+              cell(String(m.requests), 10) +
+              cell(formatTokens(m.input), 9) +
+              cell(formatTokens(m.output), 9) +
+              cell(m.cacheReported ? formatTokens(m.cacheRead) : "–", 12) +
+              cell(m.cacheReported ? formatTokens(m.cacheWrite) : "–", 13) +
+              cell(m.cacheReported ? formatPercent(m.hitRate) : "–", 7) +
+              cell(m.cacheReported ? formatPercent(m.last?.hitRate) : "–", 7) +
+              formatCost(m.cost),
+            0,
+            0,
+          ),
+        );
+      }
+    }
     box.addChild(
       new Text(
         `delegations ${stats.delegations ?? 0} (${stats.failures ?? 0} failed) · ` +

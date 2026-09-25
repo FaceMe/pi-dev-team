@@ -84,12 +84,13 @@ afterAll(async () => {
   await server?.close();
 });
 
-function runPi(prompt: string, cwd: string): Promise<string> {
+function runPi(prompt: string | string[], cwd: string): Promise<string> {
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) if (!/^(AWS_|ANTHROPIC_|OPENAI_|GEMINI_|GOOGLE_|AZURE_)/.test(k)) env[k] = v;
   Object.assign(env, { PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" });
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [piCli, "--mode", "json", "-p", "--no-session", "--model", "mock/main", prompt], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    const prompts = Array.isArray(prompt) ? prompt : [prompt];
+    const child = spawn(process.execPath, [piCli, "--mode", "json", "-p", "--no-session", "--model", "mock/main", ...prompts], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     let err = "";
     child.stdout.on("data", (d) => (out += String(d)));
@@ -130,6 +131,22 @@ describe.skipIf(!fs.existsSync(piCli))("fusion in a real pi session", () => {
     expect(server.requests.filter((r) => r.model === "cheap").length).toBeGreaterThanOrEqual(3);
     const final = events.filter((e: any) => e.type === "message_end" && e.message?.role === "assistant").at(-1);
     expect(JSON.stringify(final.message.content)).toContain("MAIN DONE");
+  }, 180_000);
+
+  it("reports tokens, cache reads/writes and hit rate for main and sidekick", async () => {
+    const out = await runPi(["BACKGROUND: run the tests.", "/fusion stats"], tempDir("fusion-meter-"));
+    const events = out.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const stats = events.filter((e: any) => e.type === "entry_appended" && e.entry?.customType === "fusion-stats").at(-1)?.entry.data;
+    expect(stats).toBeDefined();
+    const { main, sidekick } = stats.meters;
+    expect(main.requests).toBeGreaterThanOrEqual(3);
+    expect(sidekick.requests).toBeGreaterThanOrEqual(2);
+    for (const m of [main, sidekick]) {
+      expect(m.output).toBeGreaterThan(0);
+      expect(m.cacheRead).toBeGreaterThan(0);
+      expect(m.hitRate).toBeGreaterThan(0);
+      expect(m.cacheReported).toBe(true);
+    }
   }, 180_000);
 
   it("adds a default timeout to the main agent's test commands", async () => {

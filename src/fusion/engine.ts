@@ -44,6 +44,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { compressionPrompt, neverExits } from "./policy.js";
+import { formatMeter, formatPercent, UsageMeter } from "../shared/usage-meter.js";
+import type { MeterSnapshot } from "../shared/usage-meter.js";
 import type { DelegationMode } from "./policy.js";
 
 export type { EffortLevel } from "../shared/models.js";
@@ -375,6 +377,10 @@ export class FusionEngine {
   lastTrace?: DelegationTrace;
   /** Latest extension context, used to push UI updates and read the live model. */
   latestCtx?: ExtensionContext;
+  /** Real-time token meters: the main agent, the sidekick, and helper calls (output condensing, routing). */
+  readonly meters = { main: new UsageMeter(), sidekick: new UsageMeter(), helpers: new UsageMeter() };
+  /** Called whenever a meter changes, so the UI can refresh as tokens land. */
+  onUsage?: () => void;
 
   private pi: ExtensionAPI;
   private modelRegistry: ModelRegistry;
@@ -722,6 +728,8 @@ export class FusionEngine {
       if (!text) return undefined;
       const usage = cloneUsage(result.usage ?? emptyUsage());
       addUsage(this.stats.sidekickUsage, usage);
+      this.meters.helpers.add(usage);
+      this.onUsage?.();
       const mainModel = this.liveMainModel() ?? model;
       const estimated = calculateCost(mainModel, { ...cloneUsage(emptyUsage()), input: Math.ceil(output.length / 4) } as Usage).total;
       this.stats.estimatedMainCost += estimated;
@@ -767,6 +775,8 @@ export class FusionEngine {
       if (event.type === "turn_end" && event.message?.role === "assistant") {
         this.turnCounter += 1;
         addUsage(usage, event.message.usage);
+        this.meters.sidekick.add(event.message.usage);
+        this.onUsage?.();
         if (event.message.errorMessage) this.activity.push(`✗ ${truncate(event.message.errorMessage, 120)}`);
       } else if (event.type === "tool_execution_start") {
         this.activity.push(describeActivity(event.toolName, event.args));
@@ -973,7 +983,10 @@ export class FusionEngine {
         systemPrompt: "You are a precise, terse routing classifier. Reply with JSON only.",
         messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
       });
-      return parseClassifierJson(await stream.result()) ?? heuristic;
+      const result = await stream.result();
+      this.meters.helpers.add(result.usage);
+      this.onUsage?.();
+      return parseClassifierJson(result) ?? heuristic;
     } catch (error) {
       console.error(`[${EXTENSION_TAG}] classifier failed, using heuristic:`, error);
       return heuristic;
@@ -1073,12 +1086,36 @@ export class FusionEngine {
     return total > 0 ? delegated / total : 0;
   }
 
+  /** Record one main-agent response (called from the extension's turn_end). */
+  recordMainUsage(usage?: Partial<Usage> | null): void {
+    if (!usage) return;
+    addUsage(this.stats.mainUsage, usage);
+    this.meters.main.add(usage);
+    this.onUsage?.();
+  }
+
+  meterSnapshots(): { main: MeterSnapshot; sidekick: MeterSnapshot; helpers: MeterSnapshot } {
+    return { main: this.meters.main.snapshot(), sidekick: this.meters.sidekick.snapshot(), helpers: this.meters.helpers.snapshot() };
+  }
+
+  /** Per-agent token lines for the widget: tokens, cache reads/writes, hit rate, cost. */
+  usageLines(): string[] {
+    const m = this.meterSnapshots();
+    const lines = [
+      `main      ${shortModelKey(this.liveMainModel())} · ${formatMeter(m.main)}`,
+      `sidekick  ${shortModelKey(this.resolveSidekickModel())} · ${formatMeter(m.sidekick)}`,
+    ];
+    if (m.helpers.requests > 0) lines.push(`helpers   condense/route · ${formatMeter(m.helpers)}`);
+    return lines;
+  }
+
   statusLines(): string[] {
     const main = this.liveMainModel();
     const sidekick = this.resolveSidekickModel();
     const ratio = this.savingsRatio();
     const pending = this.pendingTasks().length;
     return [
+      ...this.usageLines(),
       `main ${shortModelKey(main)}${this.config.main?.effort ? ` (${this.config.main.effort})` : ""}` +
         `  ·  sidekick ${shortModelKey(sidekick)}` +
         `${this.config.sidekick?.effort ? ` (${this.config.sidekick.effort})` : ""}`,
@@ -1094,13 +1131,19 @@ export class FusionEngine {
 
   footerStatus(): string {
     const base = `⚛ fusion ${shortModelKey(this.resolveSidekickModel())}`;
-    if (this.stats.delegations === 0) return base;
-    const saved = this.lifetimeSavings();
-    return `${base} · ${(this.savingsRatio() * 100).toFixed(0)}% saved` + `${saved > 0 ? ` (${formatCost(saved)})` : ""}`;
+    const m = this.meterSnapshots();
+    const hits =
+      m.main.requests + m.sidekick.requests > 0
+        ? ` · hit main ${formatPercent(m.main.hitRate)} sk ${formatPercent(m.sidekick.hitRate)}` +
+          ` · ${formatCost(m.main.cost + m.sidekick.cost + m.helpers.cost)}`
+        : "";
+    if (this.stats.delegations === 0) return `${base}${hits}`;
+    return `${base}${hits} · ${(this.savingsRatio() * 100).toFixed(0)}% saved (est.)`;
   }
 
-  snapshot(): FusionStats & { lifetime: LifetimeStats } {
+  snapshot(): FusionStats & { lifetime: LifetimeStats; meters: ReturnType<FusionEngine["meterSnapshots"]> } {
     return {
+      meters: this.meterSnapshots(),
       delegations: this.stats.delegations,
       failures: this.stats.failures,
       sidekickTurns: this.stats.sidekickTurns,
@@ -1119,6 +1162,9 @@ export class FusionEngine {
 
   resetSessionStats(): void {
     this.stats = freshStats();
+    this.meters.main.reset();
+    this.meters.sidekick.reset();
+    this.meters.helpers.reset();
   }
 
   /** Test hook: number of consecutive failed delegations. */

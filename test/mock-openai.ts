@@ -41,7 +41,7 @@ export async function startMockOpenAI(respond: (messages: any[], index: number) 
         });
         chunk({}, "tool_calls");
       }
-      res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", created: 0, model: payload.model, choices: [], usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } })}\n\n`);
+      res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", created: 0, model: payload.model, choices: [], usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110, prompt_tokens_details: { cached_tokens: requests.length > 1 ? 60 : 0 } } })}\n\n`);
       res.write("data: [DONE]\n\n");
       res.end();
     });
