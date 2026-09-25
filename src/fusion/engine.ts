@@ -40,6 +40,8 @@ import { contentText, truncate } from "../shared/text.js";
 import { buildTrace, delegationMeta, describeActivity, extractFinalText } from "../shared/trace.js";
 import type { DelegationTrace, TraceStep } from "../shared/trace.js";
 import { addUsage, cloneUsage, emptyUsage, formatCost } from "../shared/usage.js";
+import { compressionPrompt } from "./policy.js";
+import type { DelegationMode } from "./policy.js";
 
 export type { EffortLevel } from "../shared/models.js";
 export type { DelegationTrace, TraceStep } from "../shared/trace.js";
@@ -67,6 +69,26 @@ export interface FusionStats {
   /** Estimate of what the delegated work would have cost on the main model. */
   estimatedMainCost: number;
   routes: RouteRecord[];
+  /** Direct tool calls made by the main agent. */
+  directCalls: number;
+  /** Direct calls redirected to the sidekick by the delegation policy. */
+  redirected: number;
+  /** Background delegations started. */
+  background: number;
+  /** Verbose direct outputs compressed by the sidekick model, and characters kept out of the main context. */
+  compressed: number;
+  charsKeptOut: number;
+}
+
+export interface BackgroundTask {
+  id: string;
+  task: string;
+  status: "queued" | "running" | "done" | "failed";
+  startedAt: number;
+  promise: Promise<DelegationOutcome>;
+  outcome?: DelegationOutcome;
+  /** Someone (sidekick_wait) is collecting this result, so it must not be delivered again. */
+  collected?: boolean;
 }
 
 export interface LifetimeStats {
@@ -256,27 +278,48 @@ export function buildSidekickPrompt(config: FusionConfig, toolNames: string[]): 
   ].join("\n");
 }
 
-export function buildMainGuidance(toolName: string, sidekickModel: Model<any> | undefined, sidekickTools: string[]): string {
+export function buildMainGuidance(
+  toolName: string,
+  sidekickModel: Model<any> | undefined,
+  sidekickTools: string[],
+  mode: DelegationMode = "balanced",
+): string {
+  const modeRules: Record<DelegationMode, string[]> = {
+    strict: [
+      "Mode: STRICT. You have read-only tools (read, grep, find, ls) plus the sidekick. Every command,",
+      "edit and file write goes through the sidekick; direct bash/edit/write calls are blocked.",
+    ],
+    balanced: [
+      "Mode: BALANCED. Tests, builds, linters, type checks and dependency installs are always run by",
+      "the sidekick (direct calls are redirected). Very long direct command output is condensed by the",
+      "sidekick's model before you see it; the full log path is included if you need details.",
+    ],
+    advisory: ["Mode: ADVISORY. Delegation is your call, but follow the rules below."],
+  };
   return [
-    "You are running in Fusion mode: a hybrid two-agent harness.",
+    "You are running in Fusion mode: you are the main (frontier) agent, paired with a persistent,",
+    "cheaper sidekick agent that has its own tools and its own cached context.",
     "",
-    `- Sidekick agent: ${modelKey(sidekickModel)}${sidekickTools.length ? ` — tools: ${sidekickTools.join(", ")}` : ""}`,
-    `- Delegate with the \`${toolName}\` tool.`,
+    `- Sidekick: ${modelKey(sidekickModel)}${sidekickTools.length ? ` — tools: ${sidekickTools.join(", ")}` : ""}`,
+    `- Delegate with \`${toolName}\`; collect background results with \`${toolName}_wait\`.`,
+    ...modeRules[mode].map((line) => `- ${line}`),
     "",
-    "Operating discipline:",
-    "1. You own the plan, the interpretation of ambiguity, and the final review.",
-    "   Take minimal direct actions and read only what is strictly necessary.",
-    "2. By default, delegate well-scoped work to the sidekick, then monitor and verify.",
-    "3. Delegate: targeted reads/greps/recon, mechanical edits with an exact brief,",
-    "   running tests, builds and linters, collecting verbose output, repeat checks.",
-    "4. Do not delegate: deciding what to build, resolving ambiguous requirements,",
-    "   reviewing the sidekick's work for correctness, or anything that needs",
-    "   judgement about the user's intent.",
-    "5. Every brief must be self-contained: exact paths, exact acceptance criteria,",
-    "   and the exact output you want back. The sidekick cannot see this conversation.",
-    "6. Delegations run one at a time. Prefer one well-scoped brief over many tiny ones.",
-    "7. Verify the sidekick's result before reporting success. If a delegated task",
-    "   fails or comes back wrong, take it over yourself rather than re-sending it.",
+    "Decision rule — before each action ask: is this judgement or labour?",
+    "- Judgement stays with you: the plan, interpreting ambiguous requirements, design choices,",
+    "  and the final review of the sidekick's work against the user's intent.",
+    "- Labour goes to the sidekick: running tests/builds/linters, reproducing a bug, recon across",
+    "  many files (\"find every caller of X\"), mechanical or multi-file edits from an exact brief,",
+    "  collecting and condensing verbose output, repetitive checks.",
+    "- Read directly only what you need to decide (a few targeted files or ranges).",
+    "",
+    "How to delegate well:",
+    "1. Briefs are self-contained: exact paths, the exact change or command, acceptance criteria and",
+    "   the shape of the answer you want. The sidekick cannot see this conversation.",
+    "2. Use background: true for anything slow (test suites, builds, broad recon) and keep working",
+    "   on something else; the result is delivered to you when it finishes. Do not duplicate it.",
+    `3. Before you report completion, call \`${toolName}_wait\` so no background work is outstanding.`,
+    "4. Verify what the sidekick reports (diffs, test output) before relying on it. If a delegation",
+    "   fails twice, do that piece yourself.",
   ].join("\n");
 }
 
@@ -299,6 +342,11 @@ function freshStats(): FusionStats {
     mainUsage: emptyUsage(),
     estimatedMainCost: 0,
     routes: [],
+    directCalls: 0,
+    redirected: 0,
+    background: 0,
+    compressed: 0,
+    charsKeptOut: 0,
   };
 }
 
@@ -325,6 +373,11 @@ export class FusionEngine {
   private turnCounter = 0;
   private consecutiveFailures = 0;
   private queue: Promise<unknown> = Promise.resolve();
+  private taskCounter = 0;
+  /** Background delegations of this session, by id. */
+  readonly tasks = new Map<string, BackgroundTask>();
+  /** Stable id so cache-aware providers keep the sidekick's prefix warm across delegations. */
+  private readonly cacheSessionId = `fusion-sidekick-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
   constructor(pi: ExtensionAPI, modelRegistry: ModelRegistry, cwd: string, config: FusionConfig) {
     this.pi = pi;
@@ -370,7 +423,12 @@ export class FusionEngine {
   // -- sidekick agent lifecycle -------------------------------------------
 
   private configuredToolNames(): string[] {
-    return this.config.sidekickTools.filter((name) => (SIDEKICK_TOOL_NAMES as readonly string[]).includes(name));
+    const names = this.config.sidekickTools.filter((name) => (SIDEKICK_TOOL_NAMES as readonly string[]).includes(name));
+    // In strict mode the main agent cannot execute or edit, so the sidekick must be able to.
+    if (this.config.delegation?.mode === "strict") {
+      for (const name of ["read", "grep", "find", "ls", "bash", "edit", "write"]) if (!names.includes(name)) names.push(name);
+    }
+    return names;
   }
 
   private buildSidekickTools(): AgentTool<any>[] {
@@ -429,6 +487,7 @@ export class FusionEngine {
       finishTurn: () =>
         this.turnCounter + 1 >= Math.max(1, this.config.limits.maxTurns) ? { action: "end" } : undefined,
       toolExecution: "sequential",
+      sessionId: this.cacheSessionId,
     });
     this.sidekickModel = model;
     this.sidekickToolNames = toolNames;
@@ -493,10 +552,91 @@ export class FusionEngine {
   }
 
   /** Serialized so parallel tool calls from the main agent queue up safely. */
-  delegate(input: DelegationInput, signal?: AbortSignal): Promise<DelegationOutcome> {
-    const run = this.queue.then(() => this.runDelegation(input, signal));
+  delegate(input: DelegationInput, signal?: AbortSignal, onStart?: () => void): Promise<DelegationOutcome> {
+    const run = this.queue.then(() => {
+      onStart?.();
+      return this.runDelegation(input, signal);
+    });
     this.queue = run.catch(() => undefined);
     return run;
+  }
+
+  /**
+   * Start a delegation in the background: the main agent keeps working while
+   * the sidekick runs. `onDone` fires when it finishes (to deliver the result).
+   */
+  startBackground(input: DelegationInput, onDone?: (task: BackgroundTask) => void): BackgroundTask {
+    this.taskCounter += 1;
+    const id = `D${this.taskCounter}`;
+    const task: BackgroundTask = {
+      id,
+      task: truncate(input.task, 200),
+      status: "queued",
+      startedAt: Date.now(),
+      promise: Promise.resolve(undefined as unknown as DelegationOutcome),
+    };
+    task.promise = this.delegate(input, undefined, () => {
+      task.status = "running";
+    }).then((outcome) => {
+      task.outcome = outcome;
+      task.status = outcome.isError ? "failed" : "done";
+      onDone?.(task);
+      return outcome;
+    });
+    this.tasks.set(id, task);
+    this.stats.background += 1;
+    return task;
+  }
+
+  /** Wait for background delegations (all unfinished ones when no ids are given). */
+  async waitFor(ids?: string[]): Promise<BackgroundTask[]> {
+    const wanted = ids?.length
+      ? ids.map((id) => this.tasks.get(id)).filter((t): t is BackgroundTask => Boolean(t))
+      : [...this.tasks.values()].filter((t) => t.status === "queued" || t.status === "running");
+    for (const task of wanted) task.collected = true;
+    await Promise.all(wanted.map((t) => t.promise.catch(() => undefined)));
+    return wanted;
+  }
+
+  pendingTasks(): BackgroundTask[] {
+    return [...this.tasks.values()].filter((t) => t.status === "queued" || t.status === "running");
+  }
+
+  /**
+   * Summarise a verbose direct output with the sidekick model (a stateless call:
+   * only the output is sent, not the task context), so it stays out of the
+   * expensive main context. Returns undefined when compression is unavailable.
+   */
+  async compressOutput(command: string, output: string, signal?: AbortSignal): Promise<{ text: string; usage: Usage } | undefined> {
+    const model = this.resolveSidekickModel();
+    if (!model) return undefined;
+    try {
+      const stream = this.modelRegistry.streamSimple(
+        model,
+        {
+          systemPrompt: "You condense tool output for a busy engineer. Be exact and terse; quote error lines verbatim.",
+          messages: [{ role: "user", content: compressionPrompt(command, output.slice(-60_000)), timestamp: Date.now() }],
+        },
+        { signal },
+      );
+      const result = await stream.result();
+      if (result.stopReason === "error" || result.stopReason === "aborted") return undefined;
+      const text = contentText(result.content).trim();
+      if (!text) return undefined;
+      const usage = cloneUsage(result.usage ?? emptyUsage());
+      addUsage(this.stats.sidekickUsage, usage);
+      const mainModel = this.liveMainModel() ?? model;
+      const estimated = calculateCost(mainModel, { ...cloneUsage(emptyUsage()), input: Math.ceil(output.length / 4) } as Usage).total;
+      this.stats.estimatedMainCost += estimated;
+      this.lifetime.sidekickCost += usage.cost.total;
+      this.lifetime.estimatedMainCost += estimated;
+      this.stats.compressed += 1;
+      this.stats.charsKeptOut += Math.max(0, output.length - text.length);
+      return { text, usage };
+    } catch (error) {
+      console.error(`[${EXTENSION_TAG}] output compression failed:`, error);
+      return undefined;
+    }
   }
 
   private async runDelegation(input: DelegationInput, signal?: AbortSignal): Promise<DelegationOutcome> {
@@ -785,10 +925,18 @@ export class FusionEngine {
     return Math.max(0, this.lifetime.estimatedMainCost - this.lifetime.sidekickCost);
   }
 
+  /** Share of the main agent's work that went through the sidekick. */
+  delegationRate(): number {
+    const delegated = this.stats.delegations + this.stats.compressed;
+    const total = delegated + this.stats.directCalls;
+    return total > 0 ? delegated / total : 0;
+  }
+
   statusLines(): string[] {
     const main = this.liveMainModel();
     const sidekick = this.resolveSidekickModel();
     const ratio = this.savingsRatio();
+    const pending = this.pendingTasks().length;
     return [
       `main ${shortModelKey(main)}${this.config.main?.effort ? ` (${this.config.main.effort})` : ""}` +
         `  ·  sidekick ${shortModelKey(sidekick)}` +
@@ -797,6 +945,9 @@ export class FusionEngine {
         `sidekick ${formatCost(this.stats.sidekickUsage.cost.total)}  ·  ` +
         `est. main-only ${formatCost(this.stats.estimatedMainCost)}  ·  ` +
         `saved ${(ratio * 100).toFixed(0)}% (est.)`,
+      `mode ${this.config.delegation?.mode ?? "balanced"}  ·  delegated ${(this.delegationRate() * 100).toFixed(0)}% of work  ·  ` +
+        `redirected ${this.stats.redirected}  ·  compressed ${this.stats.compressed}` +
+        `${pending ? `  ·  ${pending} running in background` : ""}`,
     ];
   }
 
@@ -816,6 +967,11 @@ export class FusionEngine {
       mainUsage: cloneUsage(this.stats.mainUsage),
       estimatedMainCost: this.stats.estimatedMainCost,
       routes: [...this.stats.routes],
+      directCalls: this.stats.directCalls,
+      redirected: this.stats.redirected,
+      background: this.stats.background,
+      compressed: this.stats.compressed,
+      charsKeptOut: this.stats.charsKeptOut,
       lifetime: { ...this.lifetime },
     };
   }

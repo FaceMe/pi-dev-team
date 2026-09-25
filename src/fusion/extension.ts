@@ -16,6 +16,11 @@ import type { Model } from "@earendil-works/pi-ai";
 import { Box, Text } from "@earendil-works/pi-tui";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { decideDirectCall, EXECUTION_TOOLS, nudgeText } from "./policy.js";
+import type { DelegationMode, PolicyState } from "./policy.js";
 import {
   DEFAULT_FUSION_SHORTCUT,
   FUSION_CONFIG_EVENT,
@@ -38,7 +43,7 @@ import {
   FusionEngine,
   restoreRoutedSidekick,
 } from "./engine.js";
-import type { FusionStats, LifetimeStats, RouteRecord } from "./engine.js";
+import type { BackgroundTask, DelegationOutcome, FusionStats, LifetimeStats, RouteRecord } from "./engine.js";
 
 /** Effective Fusion menu shortcut. Falls back to the default when unset or blank. */
 export function resolveFusionShortcut(config: FusionConfig): string {
@@ -126,11 +131,64 @@ export default function fusionExtension(pi: ExtensionAPI) {
     }
   };
 
+  const waitToolName = `${toolName}_wait`;
+  /** Execution tools removed from the main agent by strict mode, to restore later. */
+  let strictRemoved: string[] = [];
+  const policy: PolicyState = { directStreak: 0, failedDelegations: 0 };
+
+  /**
+   * Keep the main agent's active tools in line with fusion's state: the
+   * sidekick tools while enabled, and (strict mode) no execution tools.
+   */
   const setSidekickToolActive = (active: boolean): void => {
+    let next = pi.getActiveTools();
+    const ours = [toolName, waitToolName];
+    if (active) {
+      for (const name of ours) if (!next.includes(name)) next = [...next, name];
+    } else {
+      next = next.filter((name) => !ours.includes(name));
+    }
+    const strict = active && config.delegation.mode === "strict";
+    if (strict) {
+      const removing = next.filter((name) => EXECUTION_TOOLS.includes(name));
+      strictRemoved = [...new Set([...strictRemoved, ...removing])];
+      next = next.filter((name) => !EXECUTION_TOOLS.includes(name));
+    } else if (strictRemoved.length) {
+      for (const name of strictRemoved) if (!next.includes(name)) next = [...next, name];
+      strictRemoved = [];
+    }
     const current = pi.getActiveTools();
-    const has = current.includes(toolName);
-    if (active && !has) pi.setActiveTools([...current, toolName]);
-    if (!active && has) pi.setActiveTools(current.filter((name) => name !== toolName));
+    if (next.length !== current.length || next.some((name, i) => name !== current[i])) pi.setActiveTools(next);
+  };
+
+  /** Deliver a finished background delegation into the main conversation. */
+  const deliverBackground = (task: BackgroundTask): void => {
+    const outcome = task.outcome;
+    if (!outcome) return;
+    if (outcome.isError) policy.failedDelegations += 1;
+    else policy.failedDelegations = 0;
+    // Already handed to the main agent through sidekick_wait: don't deliver it twice.
+    if (task.collected) {
+      refreshUi();
+      return;
+    }
+    const header = outcome.isError
+      ? `[fusion] Background delegation ${task.id} FAILED: ${outcome.errorMessage ?? "unknown error"} (${outcome.meta})`
+      : `[fusion] Background delegation ${task.id} finished (${outcome.meta}). Task: ${task.task}`;
+    try {
+      pi.sendMessage(
+        {
+          customType: "fusion-result",
+          content: outcome.isError ? header : `${header}\n\n${outcome.text}`,
+          display: true,
+          details: { id: task.id, task: task.task, meta: outcome.meta, isError: outcome.isError, trace: outcome.trace },
+        },
+        { deliverAs: "steer", triggerTurn: true },
+      );
+    } catch (error) {
+      console.error(`[${EXTENSION_TAG}] failed to deliver background result:`, error);
+    }
+    refreshUi();
   };
 
   // -- tool ----------------------------------------------------------------
@@ -139,15 +197,17 @@ export default function fusionExtension(pi: ExtensionAPI) {
     name: toolName,
     label: "Sidekick",
     description: [
-      "Delegate one well-scoped, self-contained subtask to the cheaper Fusion sidekick agent",
-      "and get its result back. The sidekick is a fully capable agent with its own tools and",
-      "its own context; it cannot see this conversation, so the brief must stand alone.",
-      "Delegations run one at a time.",
+      "Hand labour to the Fusion sidekick — a persistent, cheaper agent with its own tools and cached context.",
+      "Use it for running tests, builds, linters and installs; recon across many files; reproducing bugs;",
+      "mechanical or multi-file edits from an exact brief; and condensing verbose output.",
+      "It cannot see this conversation, so the brief must stand alone.",
+      "Set background: true to keep working while it runs; the result is delivered to you when done.",
     ].join(" "),
-    promptSnippet: "Delegate a well-scoped subtask to the cheaper Fusion sidekick agent",
+    promptSnippet: "Delegate labour (tests, builds, recon, mechanical edits) to the cheaper Fusion sidekick agent",
     promptGuidelines: [
-      `Use ${toolName} for mechanical, well-scoped work (targeted reads, greps, mechanical edits, running tests or builds) so the main model is reserved for planning, ambiguity and review.`,
+      `Use ${toolName} by default for labour — tests/builds/linters, multi-file recon, mechanical edits, verbose output — and keep the plan, ambiguity and final review for yourself.`,
       `Every ${toolName} brief must be self-contained: exact paths, exact acceptance criteria, and the exact output you want back.`,
+      `Use background: true for slow work and continue with something else; call ${toolName}_wait before you report completion.`,
     ],
     parameters: Type.Object({
       task: Type.String({
@@ -162,6 +222,9 @@ export default function fusionExtension(pi: ExtensionAPI) {
           description: "Shape of the answer you want back. Default: summary.",
         }),
       ),
+      background: Type.Optional(
+        Type.Boolean({ description: "Run in the background and keep working; the result is delivered when it finishes." }),
+      ),
     }),
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -170,6 +233,26 @@ export default function fusionExtension(pi: ExtensionAPI) {
         throw new Error("Fusion is not active in this session.");
       }
       activeEngine.setContext(ctx);
+      policy.directStreak = 0;
+      const input = { task: params.task, context: params.context, files: params.files, expect: params.expect };
+
+      if (params.background) {
+        const task = activeEngine.startBackground(input, deliverBackground);
+        refreshUi(ctx);
+        const queued = activeEngine.pendingTasks().length - 1;
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Started background delegation ${task.id}${queued > 0 ? ` (queued behind ${queued})` : ""}. ` +
+                "Continue with other work; its result will be delivered to you when it finishes. " +
+                `Do not repeat this task. Call ${waitToolName} if you need the result before continuing.`,
+            },
+          ],
+          details: { background: true, id: task.id, meta: "background" },
+        };
+      }
 
       let lastActivityCount = 0;
       const progress = setInterval(() => {
@@ -183,16 +266,15 @@ export default function fusionExtension(pi: ExtensionAPI) {
 
       let outcome;
       try {
-        outcome = await activeEngine.delegate(
-          { task: params.task, context: params.context, files: params.files, expect: params.expect },
-          signal ?? undefined,
-        );
+        outcome = await activeEngine.delegate(input, signal ?? undefined);
       } finally {
         clearInterval(progress);
       }
 
       const meta = outcome.meta;
       refreshUi(ctx);
+      if (outcome.isError) policy.failedDelegations += 1;
+      else policy.failedDelegations = 0;
 
       if (outcome.isError) {
         await activeEngine.maybeEscalate();
@@ -243,7 +325,8 @@ export default function fusionExtension(pi: ExtensionAPI) {
       if (isPartial) {
         return new Text(theme.fg("warning", "… sidekick working"), 0, 0);
       }
-      const details = (result.details ?? {}) as { meta?: string; trace?: TraceStep[] };
+      const details = (result.details ?? {}) as { meta?: string; trace?: TraceStep[]; background?: boolean; id?: string };
+      if (details.background) return new Text(theme.fg("accent", `⇢ sidekick ${details.id ?? ""} running in the background`), 0, 0);
       const head = theme.fg("success", "✓ sidekick");
       const meta = theme.fg("dim", ` ${details.meta ?? ""}`);
       const preview = truncate(
@@ -265,6 +348,145 @@ export default function fusionExtension(pi: ExtensionAPI) {
       }
       return new Text(lines.join("\n"), 0, 0);
     },
+  });
+
+  pi.registerTool({
+    name: waitToolName,
+    label: "Sidekick wait",
+    description:
+      "Wait for background sidekick delegations to finish and return their results. With no ids, waits for all outstanding ones.",
+    promptSnippet: "Wait for background sidekick delegations and collect their results",
+    parameters: Type.Object({
+      ids: Type.Optional(Type.Array(Type.String(), { description: "Delegation ids such as D1. Default: all outstanding." })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const activeEngine = engine;
+      if (!activeEngine) throw new Error("Fusion is not active in this session.");
+      activeEngine.setContext(ctx);
+      const tasks = await activeEngine.waitFor(params.ids);
+      refreshUi(ctx);
+      if (tasks.length === 0) return { content: [{ type: "text", text: "No background delegations are outstanding." }], details: undefined };
+      const text = tasks
+        .map((t) => {
+          const o = t.outcome as DelegationOutcome | undefined;
+          if (!o) return `${t.id}: no result`;
+          return o.isError ? `${t.id} FAILED: ${o.errorMessage} (${o.meta})` : `${t.id} (${o.meta}):\n${o.text}`;
+        })
+        .join("\n\n");
+      return { content: [{ type: "text", text }], details: { ids: tasks.map((t) => t.id) } };
+    },
+  });
+
+  // -- delegation policy on the main agent's direct tool calls --------------
+
+  const policyActive = (): boolean =>
+    Boolean(engine && allowed && config.enabled && engine.resolveSidekickModel());
+
+  pi.on("tool_call", async (event: any) => {
+    const activeEngine = engine;
+    const name = String(event.toolName ?? "");
+    if (!activeEngine || !policyActive() || name === toolName || name === waitToolName) return undefined;
+    activeEngine.stats.directCalls += 1;
+    policy.directStreak += 1;
+    const decision = decideDirectCall(config.delegation.mode, name, (event.input ?? {}) as Record<string, unknown>, policy, true);
+    if (decision.block) {
+      activeEngine.stats.redirected += 1;
+      activeEngine.stats.directCalls -= 1;
+      refreshUi();
+      return { block: true, reason: decision.reason };
+    }
+    return undefined;
+  });
+
+  pi.on("tool_result", async (event: any, ctx) => {
+    const activeEngine = engine;
+    const name = String(event.toolName ?? "");
+    if (!activeEngine || !policyActive() || name === toolName || name === waitToolName) return undefined;
+    let content = Array.isArray(event.content) ? [...event.content] : [];
+    let changed = false;
+
+    // Verbose direct shell output: condense it with the sidekick's model.
+    const threshold = config.delegation.compressOutputChars;
+    if ((name === "bash" || name === "powershell") && threshold > 0 && config.delegation.mode !== "advisory") {
+      const text = content.map((part: any) => (part?.type === "text" ? String(part.text ?? "") : "")).join("\n");
+      if (text.length > threshold) {
+        const command = String(event.input?.command ?? "");
+        const summary = await activeEngine.compressOutput(command, text, ctx.signal);
+        if (summary) {
+          let logPath: string | undefined = event.details?.fullOutputPath;
+          if (!logPath) {
+            try {
+              const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fusion-"));
+              logPath = path.join(dir, "output.log");
+              fs.writeFileSync(logPath, text);
+            } catch {
+              logPath = undefined;
+            }
+          }
+          content = [
+            {
+              type: "text",
+              text:
+                `[fusion] ${text.length.toLocaleString()} chars of output condensed by the sidekick model` +
+                `${logPath ? ` (full log: ${logPath} — read targeted ranges only if needed)` : ""}:\n\n${summary.text}`,
+            },
+          ];
+          changed = true;
+          refreshUi(ctx);
+        }
+      }
+    }
+
+    // Long runs of direct actions: remind the main agent to delegate.
+    const every = config.delegation.nudgeAfter;
+    if (every > 0 && config.delegation.mode !== "strict" && policy.directStreak >= every && policy.directStreak % every === 0) {
+      content = [...content, { type: "text", text: `\n${nudgeText(policy.directStreak)}` }];
+      changed = true;
+    }
+    return changed ? { content } : undefined;
+  });
+
+  // Never let a run settle with sidekick work outstanding: wait for it and hand
+  // the results to the main agent for one more turn (it owns the final review).
+  pi.on("agent_before_settle", async (event: any) => {
+    const activeEngine = engine;
+    if (!activeEngine || event.outcome !== "completed") return undefined;
+    const pending = activeEngine.pendingTasks().filter((t) => !t.collected);
+    if (pending.length === 0) return undefined;
+    const tasks = await activeEngine.waitFor(pending.map((t) => t.id));
+    refreshUi();
+    const body = tasks
+      .map((t) => {
+        const o = t.outcome as DelegationOutcome | undefined;
+        if (!o) return `${t.id}: no result`;
+        return o.isError ? `${t.id} FAILED: ${o.errorMessage} (${o.meta})` : `${t.id} (${o.meta}) — ${t.task}\n${o.text}`;
+      })
+      .join("\n\n");
+    return {
+      entries: [
+        {
+          type: "custom_message",
+          customType: "fusion-result",
+          content: `[fusion] Background delegations finished before you wrapped up. Review them and update your answer if needed.\n\n${body}`,
+          display: true,
+          details: { id: tasks.map((t) => t.id).join(", "), meta: `${tasks.length} background result(s)`, isError: tasks.some((t) => t.outcome?.isError) },
+        },
+      ],
+      continue: true,
+    };
+  });
+
+  pi.registerMessageRenderer("fusion-result", (message: any, { expanded }: any, theme: any) => {
+    const details = (message.details ?? {}) as { id?: string; meta?: string; isError?: boolean; trace?: TraceStep[]; task?: string };
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    const flag = details.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+    box.addChild(new Text(`${theme.bold(`sidekick ${details.id ?? ""}`)} ${flag} ${theme.fg("dim", details.meta ?? "")}`, 0, 0));
+    if (details.task) box.addChild(new Text(theme.fg("muted", truncate(details.task, 160)), 0, 0));
+    const body = typeof message.content === "string" ? message.content : "";
+    const text = body.split("\n\n").slice(1).join("\n\n");
+    if (text) box.addChild(new Text(expanded ? text : truncate(text, 200), 0, 0));
+    if (expanded && details.trace?.length) for (const line of renderTraceSteps(details.trace, theme)) box.addChild(new Text(line, 0, 0));
+    return box;
   });
 
   // -- session lifecycle ---------------------------------------------------
@@ -292,6 +514,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    strictRemoved = [];
     engine?.dispose();
     engine = undefined;
   });
@@ -313,6 +536,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
     const shouldEnable = activeEngine.config.enabled && sidekickModel !== undefined;
 
     setSidekickToolActive(shouldEnable);
+    policy.directStreak = 0;
     if (!options.sections) return;
     if (!shouldEnable) {
       // Removing the key makes pi emit a section patch that drops it.
@@ -322,7 +546,10 @@ export default function fusionExtension(pi: ExtensionAPI) {
     options.sections[EXTENSION_TAG] = buildMainGuidance(
       toolName,
       sidekickModel,
-      activeEngine.config.sidekickTools,
+      activeEngine.config.delegation.mode === "strict"
+        ? [...new Set([...activeEngine.config.sidekickTools, "read", "grep", "find", "ls", "bash", "edit", "write"])]
+        : activeEngine.config.sidekickTools,
+      activeEngine.config.delegation.mode,
     );
   });
 
@@ -472,7 +699,12 @@ export default function fusionExtension(pi: ExtensionAPI) {
   pi.registerCommand("fusion", {
     description: "Fusion hybrid harness: status, model configuration, routing and stats",
     getArgumentCompletions: (prefix: string) => {
-      const items = ["on", "off", "main", "sidekick", "status", "stats", "models", "route", "trace", "reset", "help"].map((value) => ({
+      if (prefix.startsWith("mode ")) {
+        const rest = prefix.slice(5);
+        const modes = ["strict", "balanced", "advisory"].filter((m) => m.startsWith(rest)).map((m) => ({ value: `mode ${m}`, label: m }));
+        return modes.length ? modes : null;
+      }
+      const items = ["on", "off", "main", "sidekick", "mode", "status", "stats", "models", "route", "trace", "reset", "help"].map((value) => ({
         value,
         label: value,
       }));
@@ -543,6 +775,25 @@ export default function fusionExtension(pi: ExtensionAPI) {
           return;
         }
 
+        case "mode": {
+          const value = args.trim().split(/\s+/)[1]?.toLowerCase() as DelegationMode | undefined;
+          if (!value || !["strict", "balanced", "advisory"].includes(value)) {
+            ctx.ui.notify(
+              `Delegation mode: ${config.delegation.mode}. Usage: /fusion mode strict|balanced|advisory\n` +
+                "strict = main agent read-only, sidekick does all execution; balanced = tests/builds/installs and verbose output go to the sidekick; advisory = prompt only.",
+              "info",
+            );
+            return;
+          }
+          config.delegation = { ...config.delegation, mode: value };
+          activeEngine.config = config;
+          persistConfig();
+          setSidekickToolActive(config.enabled);
+          refreshUi(ctx);
+          ctx.ui.notify(`Fusion delegation mode: ${value}.`, "info");
+          return;
+        }
+
         case "stats":
         case "status": {
           pi.appendEntry("fusion-stats", activeEngine.snapshot());
@@ -608,7 +859,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
         }
 
         default: {
-          ctx.ui.notify("Usage: /fusion [on|off|main|sidekick|status|stats|models|route|trace|reset]", "info");
+          ctx.ui.notify("Usage: /fusion [on|off|main|sidekick|mode|status|stats|models|route|trace|reset]", "info");
         }
       }
     },
@@ -711,6 +962,15 @@ export default function fusionExtension(pi: ExtensionAPI) {
         0,
       ),
     );
+    box.addChild(
+      new Text(
+        `direct calls ${stats.directCalls ?? 0} · redirected to sidekick ${stats.redirected ?? 0} · ` +
+          `background ${stats.background ?? 0} · outputs condensed ${stats.compressed ?? 0}` +
+          `${stats.charsKeptOut ? ` (${Math.round(stats.charsKeptOut / 1000)}k chars kept out of the main context)` : ""}`,
+        0,
+        0,
+      ),
+    );
     if (stats.lifetime) {
       box.addChild(
         new Text(
@@ -774,6 +1034,7 @@ async function openConfigWizard(
       `sidekick: ${modelKey(engine.resolveSidekickModel())}` +
         `${engine.config.sidekick?.effort ? ` (${engine.config.sidekick.effort})` : ""}`,
       `sidekick tools: ${engine.config.sidekickTools.join(", ") || "(none)"}`,
+      `delegation: ${engine.config.delegation.mode}`,
       `routing: ${routing.enabled ? (routing.autoApply ? "auto" : "suggest-only") : "off"} · ${routing.mode}`,
       `menu shortcut: ${resolveFusionShortcut(engine.config)}`,
       `state: ${engine.config.enabled ? "enabled" : "disabled"}`,
@@ -816,6 +1077,21 @@ async function openConfigWizard(
       engine.resetSidekick();
       hooks.persist();
       ctx.ui.notify(`Sidekick tools: ${engine.config.sidekickTools.join(", ") || "(none)"}`, "info");
+      continue;
+    }
+
+    if (choice.startsWith("delegation:")) {
+      const modeChoice = await ctx.ui.select("Delegation mode", [
+        "balanced — tests/builds/installs and verbose output go to the sidekick",
+        "strict — main agent is read-only; the sidekick does all execution and edits",
+        "advisory — prompt guidance only",
+      ]);
+      if (modeChoice) {
+        engine.config.delegation = { ...engine.config.delegation, mode: modeChoice.split(" ")[0] as DelegationMode };
+        hooks.persist();
+        hooks.refreshUi(ctx);
+        ctx.ui.notify(`Delegation mode: ${engine.config.delegation.mode} (applies from your next message).`, "info");
+      }
       continue;
     }
 

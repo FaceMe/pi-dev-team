@@ -13,6 +13,8 @@ import * as path from "node:path";
 import { getAgentDir as piAgentDir } from "@earendil-works/pi-coding-agent";
 import { readJsonFile, writeJsonFile } from "./json-store.js";
 import type { EffortLevel, ModelRef } from "./models.js";
+import { DEFAULT_DELEGATION } from "../fusion/policy.js";
+import type { DelegationConfig } from "../fusion/policy.js";
 
 export function agentDir(): string {
   return piAgentDir();
@@ -127,6 +129,8 @@ export interface FusionConfig {
   sidekickTools: string[];
   routing: FusionRoutingConfig;
   limits: FusionLimits;
+  /** How strongly the main agent is steered to delegate (see src/fusion/policy.ts). */
+  delegation: DelegationConfig;
   /** Optional override for the sidekick system prompt. */
   sidekickPrompt?: string;
   /** Keyboard shortcut that opens the Fusion menu (pi keybinding syntax). */
@@ -142,6 +146,7 @@ export function defaultFusionConfig(): FusionConfig {
     sidekickTools: [...DEFAULT_SIDEKICK_TOOLS],
     routing: { enabled: true, mode: "llm", autoApply: true, onCompact: true, escalateOnFailure: true },
     limits: { maxTurns: 12, maxMessages: 40 },
+    delegation: { ...DEFAULT_DELEGATION },
     shortcut: DEFAULT_FUSION_SHORTCUT,
   };
 }
@@ -170,6 +175,7 @@ export function loadFusionConfig(): FusionConfig {
       : [...DEFAULT_SIDEKICK_TOOLS],
     routing: { ...defaults.routing, ...(stored.routing ?? {}) },
     limits: { ...defaults.limits, ...(stored.limits ?? {}) },
+    delegation: normalizeDelegation(stored.delegation),
     sidekickPrompt: typeof stored.sidekickPrompt === "string" ? stored.sidekickPrompt : undefined,
     shortcut:
       typeof stored.shortcut === "string" && stored.shortcut.trim()
@@ -177,6 +183,16 @@ export function loadFusionConfig(): FusionConfig {
         : defaults.shortcut,
   };
   return config;
+}
+
+function normalizeDelegation(raw: any): DelegationConfig {
+  const d = { ...DEFAULT_DELEGATION };
+  if (raw && typeof raw === "object") {
+    if (["advisory", "balanced", "strict"].includes(raw.mode)) d.mode = raw.mode;
+    if (Number.isFinite(raw.nudgeAfter) && raw.nudgeAfter >= 0) d.nudgeAfter = Math.floor(raw.nudgeAfter);
+    if (Number.isFinite(raw.compressOutputChars) && raw.compressOutputChars >= 0) d.compressOutputChars = Math.floor(raw.compressOutputChars);
+  }
+  return d;
 }
 
 export function saveFusionConfig(config: FusionConfig): void {
