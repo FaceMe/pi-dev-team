@@ -19,7 +19,8 @@ import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { decideDirectCall, EXECUTION_TOOLS, nudgeText } from "./policy.js";
+import { execFile } from "node:child_process";
+import { classifyCommand, decideDirectCall, EXECUTION_TOOLS, nudgeText, recordCommand } from "./policy.js";
 import type { DelegationMode, PolicyState } from "./policy.js";
 import {
   DEFAULT_FUSION_SHORTCUT,
@@ -136,7 +137,42 @@ export default function fusionExtension(pi: ExtensionAPI) {
   const waitToolName = `${toolName}_wait`;
   /** Execution tools removed from the main agent by strict mode, to restore later. */
   let strictRemoved: string[] = [];
-  const policy: PolicyState = { directStreak: 0, failedDelegations: 0 };
+  const policy: PolicyState = { directStreak: 0, failedDelegations: 0, history: new Map() };
+  /** Start times of the main agent's test/build/install commands, by tool call id. */
+  const commandStarts = new Map<string, { command: string; at: number }>();
+  /** Files the main agent has read recently (newest last), for sidekick briefs. */
+  let recentReads: string[] = [];
+
+  const noteRead = (input: Record<string, unknown>): void => {
+    const target = String(input.path ?? input.file_path ?? "").trim();
+    if (!target) return;
+    const range =
+      input.offset !== undefined || input.limit !== undefined
+        ? ` (lines ${Number(input.offset ?? 1)}–${input.limit !== undefined ? Number(input.offset ?? 1) + Number(input.limit) - 1 : "end"})`
+        : "";
+    const entry = `${target}${range}`;
+    recentReads = [...recentReads.filter((r) => r !== entry), entry].slice(-15);
+  };
+
+  const gitStatus = (cwd: string): Promise<string> =>
+    new Promise((resolve) => {
+      execFile("git", ["status", "--short", "--branch"], { cwd, timeout: 3000, maxBuffer: 256 * 1024 }, (error, stdout) => {
+        if (error) return resolve("");
+        const lines = String(stdout).split("\n").filter(Boolean);
+        resolve(lines.slice(0, 30).join("\n") + (lines.length > 30 ? `\n… ${lines.length - 30} more` : ""));
+      });
+    });
+
+  /** What the harness knows that the sidekick cannot see: the main agent's reads and the working tree. */
+  const harnessContext = async (cwd: string, files: string[] = []): Promise<string | undefined> => {
+    if (!config.delegation.briefContext) return undefined;
+    const parts: string[] = [];
+    const reads = recentReads.filter((r) => !files.some((f) => r.startsWith(f)));
+    if (reads.length) parts.push(`Files the main agent has already read:\n${reads.map((r) => `- ${r}`).join("\n")}`);
+    const status = await gitStatus(cwd);
+    if (status) parts.push(`git status:\n${status}`);
+    return parts.length ? parts.join("\n\n") : undefined;
+  };
 
   /**
    * Keep the main agent's active tools in line with fusion's state: the
@@ -236,7 +272,13 @@ export default function fusionExtension(pi: ExtensionAPI) {
       }
       activeEngine.setContext(ctx);
       policy.directStreak = 0;
-      const input = { task: params.task, context: params.context, files: params.files, expect: params.expect };
+      const input = {
+        task: params.task,
+        context: params.context,
+        files: params.files,
+        expect: params.expect,
+        harnessContext: await harnessContext(ctx.cwd, params.files),
+      };
 
       if (params.background) {
         const task = activeEngine.startBackground(input, deliverBackground);
@@ -388,14 +430,44 @@ export default function fusionExtension(pi: ExtensionAPI) {
     const activeEngine = engine;
     const name = String(event.toolName ?? "");
     if (!activeEngine || !policyActive() || name === toolName || name === waitToolName) return undefined;
+    const input = (event.input ?? {}) as Record<string, unknown>;
     activeEngine.stats.directCalls += 1;
     policy.directStreak += 1;
-    const decision = decideDirectCall(config.delegation.mode, name, (event.input ?? {}) as Record<string, unknown>, policy, true);
+
+    // Don't edit a file a background delegation is changing.
+    if (name === "edit" || name === "write") {
+      const target = String(input.path ?? input.file_path ?? "");
+      const holder = target ? activeEngine.leaseHolder(target) : undefined;
+      if (holder) {
+        activeEngine.stats.directCalls -= 1;
+        return {
+          block: true,
+          reason:
+            `Fusion: background delegation ${holder.id} is changing ${target}. Wait for it with ` +
+            `${waitToolName}({ ids: ["${holder.id}"] }), or work on other files meanwhile.`,
+        };
+      }
+    }
+
+    const decision = decideDirectCall(config.delegation.mode, name, input, policy, true, config.delegation);
     if (decision.block) {
       activeEngine.stats.redirected += 1;
       activeEngine.stats.directCalls -= 1;
       refreshUi();
       return { block: true, reason: decision.reason };
+    }
+
+    if (name === "read") noteRead(input);
+    if (name === "bash" || name === "powershell") {
+      const command = String(input.command ?? "");
+      const kind = classifyCommand(command);
+      if (kind === "verify" || kind === "install") {
+        commandStarts.set(String(event.toolCallId), { command, at: Date.now() });
+        // A default timeout so one hung test or build cannot stall the main agent.
+        if (config.delegation.commandTimeoutSec > 0 && input.timeout === undefined) {
+          event.input.timeout = config.delegation.commandTimeoutSec;
+        }
+      }
     }
     return undefined;
   });
@@ -406,6 +478,14 @@ export default function fusionExtension(pi: ExtensionAPI) {
     if (!activeEngine || !policyActive() || name === toolName || name === waitToolName) return undefined;
     let content = Array.isArray(event.content) ? [...event.content] : [];
     let changed = false;
+
+    // Learn what test/build/install commands cost, for the adaptive redirect.
+    const started = commandStarts.get(String(event.toolCallId));
+    if (started) {
+      commandStarts.delete(String(event.toolCallId));
+      const outputChars = content.reduce((sum: number, part: any) => sum + (part?.type === "text" ? String(part.text ?? "").length : 0), 0);
+      recordCommand(policy, started.command, Date.now() - started.at, outputChars);
+    }
 
     // Verbose direct shell output: condense it with the sidekick's model.
     const threshold = config.delegation.compressOutputChars;
@@ -478,6 +558,13 @@ export default function fusionExtension(pi: ExtensionAPI) {
     };
   });
 
+  pi.registerEntryRenderer("fusion-tasks", (entry: any, _options: any, theme: any) => {
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    box.addChild(new Text(theme.bold("sidekick background delegations"), 0, 0));
+    for (const line of (entry.data?.lines ?? []) as string[]) box.addChild(new Text(line, 0, 0));
+    return box;
+  });
+
   pi.registerMessageRenderer("fusion-result", (message: any, { expanded }: any, theme: any) => {
     const details = (message.details ?? {}) as { id?: string; meta?: string; isError?: boolean; trace?: TraceStep[]; task?: string };
     const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
@@ -517,6 +604,9 @@ export default function fusionExtension(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     strictRemoved = [];
+    engine?.cancel();
+    recentReads = [];
+    commandStarts.clear();
     engine?.dispose();
     engine = undefined;
   });
@@ -706,7 +796,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
         const modes = ["strict", "balanced", "advisory"].filter((m) => m.startsWith(rest)).map((m) => ({ value: `mode ${m}`, label: m }));
         return modes.length ? modes : null;
       }
-      const items = ["on", "off", "main", "sidekick", "mode", "status", "stats", "models", "route", "trace", "reset", "help"].map((value) => ({
+      const items = ["on", "off", "main", "sidekick", "mode", "tasks", "cancel", "status", "stats", "models", "route", "trace", "reset", "help"].map((value) => ({
         value,
         label: value,
       }));
@@ -774,6 +864,30 @@ export default function fusionExtension(pi: ExtensionAPI) {
           }
           refreshUi(ctx);
           ctx.ui.notify(`Fusion ${config.enabled ? "enabled" : "disabled"}.`, "info");
+          return;
+        }
+
+        case "tasks": {
+          const tasks = [...activeEngine.tasks.values()];
+          if (tasks.length === 0) {
+            ctx.ui.notify("No background delegations in this session.", "info");
+            return;
+          }
+          pi.appendEntry("fusion-tasks", {
+            lines: tasks.map((t) => {
+              const secs = Math.round((Date.now() - t.startedAt) / 1000);
+              const leases = t.leases.size ? ` · editing ${[...t.leases].map((l) => l.replace(`${ctx.cwd}/`, "")).join(", ")}` : "";
+              return `${t.id} ${t.status}${t.status === "queued" || t.status === "running" ? ` (${secs}s)` : ""} · ${t.task}${leases}`;
+            }),
+          });
+          return;
+        }
+
+        case "cancel": {
+          const ids = args.trim().split(/\s+/).slice(1).filter((id) => id && id !== "all");
+          const cancelled = activeEngine.cancel(ids);
+          refreshUi(ctx);
+          ctx.ui.notify(cancelled.length ? `Cancelled ${cancelled.join(", ")}.` : "No matching background delegation is running.", "info");
           return;
         }
 
@@ -861,7 +975,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
         }
 
         default: {
-          ctx.ui.notify("Usage: /fusion [on|off|main|sidekick|mode|status|stats|models|route|trace|reset]", "info");
+          ctx.ui.notify("Usage: /fusion [on|off|main|sidekick|mode|tasks|cancel|status|stats|models|route|trace|reset]", "info");
         }
       }
     },

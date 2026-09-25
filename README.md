@@ -201,13 +201,27 @@ Enable with `/fusion on` (on by default once configured). Open the menu with
 
    | Mode | Main agent | What goes to the sidekick |
    |---|---|---|
-   | `balanced` (default) | reads, edits, runs commands | tests, builds, linters, type checks and installs (direct calls are redirected with a ready-made `sidekick(...)` call); any direct command output over 8k chars is condensed by the sidekick's model (full log kept on disk); a nudge after 6 direct calls in a row |
+   | `balanced` (default) | reads, edits, runs commands | a test, build, lint, typecheck or install command runs directly the first time; once it has proved slow (≥ 60 s) or verbose (> 8k chars) it is redirected with a ready-made `sidekick(...)` call; any direct command output over 8k chars is condensed by the sidekick's model (full log kept on disk); a nudge after 6 direct calls in a row |
    | `strict` | read-only (`read`, `grep`, `find`, `ls`) + sidekick | everything that executes or edits — Devin's "minimal direct action" |
    | `advisory` | everything | only what the model chooses (the old behaviour) |
 
    Switch with `/fusion mode strict|balanced|advisory` or in the `/fusion` menu.
    If delegations fail twice in a row, the policy relaxes so the main agent is
    never stuck.
+
+   Guard rails in every mode, for both agents:
+   - **Commands that never exit** (dev servers, `--watch`, `tail -f`,
+     `docker compose up` without `-d`) are refused with advice to use a
+     one-shot variant or to background them with a log file.
+   - **Default timeout**: test, build and install commands without a timeout
+     get one (`commandTimeoutSec`, 600 s).
+   - **Lean results**: a sidekick result longer than `resultCapChars` (4k) is
+     cut, and the full text is saved to a file the main agent can read.
+   - **Better briefs**: each brief automatically lists the files the main
+     agent has read (with line ranges) and `git status`.
+   - **No edit collisions**: while a background delegation is changing a file
+     (named in its brief or edited so far), the main agent's edits to that
+     file are blocked until it finishes.
 
 1. **Sidekick delegation.** The main agent gets a `sidekick` tool. A prompt
    section tells it to take minimal direct action, delegate mechanical work
@@ -280,6 +294,8 @@ survives until you explicitly enable Fusion.
 | `/fusion main [model]` | Select or set the main (frontier) agent model via the Model Picker |
 | `/fusion sidekick [model]` | Select or set the sidekick (cheap) agent model via the Model Picker |
 | `/fusion mode [strict\|balanced\|advisory]` | Show or set how strongly the main agent is made to delegate |
+| `/fusion tasks` | List background delegations with status, elapsed time and the files they are editing |
+| `/fusion cancel [id…\|all]` | Cancel background delegations (queued or running) |
 | `/fusion on` | Enable Fusion: activate the sidekick tool + prompt section and switch the session model to the fusion main slot (idempotent — re-run to re-sync) |
 | `/fusion off` | Disable Fusion: remove the tool and prompt section and restore your pre-Fusion model (unless you picked a model yourself meanwhile) |
 | `/fusion stats` | Session + lifetime cost/savings report in the transcript |
@@ -362,7 +378,15 @@ roles (`frontier` → main, `small` → sidekick):
     "escalateOnFailure": true
   },
   "limits": { "maxTurns": 12, "maxMessages": 40 },
-  "delegation": { "mode": "balanced", "nudgeAfter": 6, "compressOutputChars": 8000 },
+  "delegation": {
+    "mode": "balanced",
+    "nudgeAfter": 6,
+    "compressOutputChars": 8000,
+    "slowCommandMs": 60000,
+    "commandTimeoutSec": 600,
+    "resultCapChars": 4000,
+    "briefContext": true
+  },
   "sidekickPrompt": "optional override for the sidekick system prompt"
 }
 ```

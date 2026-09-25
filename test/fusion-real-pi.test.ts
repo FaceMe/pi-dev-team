@@ -24,12 +24,18 @@ const text = (m: any) => (typeof m?.content === "string" ? m.content : JSON.stri
 function respond(messages: any[]): MockReply {
   const system = text(messages.find((m: any) => m.role === "system" || m.role === "developer"));
   const last = messages.at(-1);
+  if (system.includes("condense tool output")) return { text: "CONDENSED: 500 tests passed, 0 failed" };
   if (system.includes("You are the sidekick agent")) {
     if (last?.role === "tool") return { text: `SIDEKICK REPORT: ${text(last).slice(0, 120)}` };
     return { tool: "bash", args: { command: "echo '3 passing'" } };
   }
   // Main agent.
   const firstUser = text(messages.find((m: any) => m.role === "user"));
+  if (firstUser.includes("TIMEOUT")) {
+    const turns = messages.filter((m: any) => m.role === "assistant").length;
+    if (turns === 0) return { tool: "bash", args: { command: "npm test" } };
+    return { text: `MAIN DONE: ${text(last).slice(0, 300)}` };
+  }
   if (firstUser.includes("SETTLE")) {
     const turns = messages.filter((m: any) => m.role === "assistant").length;
     if (turns === 0) return { tool: "sidekick", args: { task: "Run npm test and report pass/fail counts.", background: true } };
@@ -43,6 +49,7 @@ function respond(messages: any[]): MockReply {
     return { text: `MAIN DONE: ${text(last).slice(0, 200)}` };
   }
   if (last?.role === "user") return { tool: "bash", args: { command: "npm test" } };
+  if (last?.role === "tool" && text(last).includes("CONDENSED")) return { tool: "bash", args: { command: "npm test" } };
   if (last?.role === "tool" && text(last).includes("Fusion:")) return { tool: "sidekick", args: { task: "Run npm test and report pass/fail counts.", expect: "evidence" } };
   return { text: `MAIN DONE: ${text(last).slice(0, 200)}` };
 }
@@ -99,24 +106,50 @@ function runPi(prompt: string, cwd: string): Promise<string> {
 }
 
 describe.skipIf(!fs.existsSync(piCli))("fusion in a real pi session", () => {
-  it("redirects a direct test run and the main agent then delegates to the sidekick", async () => {
-    const out = await runPi("Run the tests and tell me the result.", tempDir("fusion-cwd-"));
+  it("runs a noisy test command directly once (condensed), then redirects it and the main agent delegates", async () => {
+    const cwd = tempDir("fusion-cwd-");
+    fs.writeFileSync(
+      path.join(cwd, "package.json"),
+      JSON.stringify({ name: "demo", scripts: { test: "node -e \"for (let i = 0; i < 500; i++) console.log('test line ' + i + ' ok')\"" } }),
+    );
+    const out = await runPi("Run the tests and tell me the result.", cwd);
     const events = out.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
     const toolEnds = events.filter((e: any) => e.type === "tool_execution_end").map((e: any) => ({ name: e.toolName, isError: e.isError, text: JSON.stringify(e.result?.content ?? "") }));
-    // 1) main's direct `npm test` was blocked by the policy
+    // 1) first direct run: allowed, and its ~9k chars of output were condensed by the cheap model
     expect(toolEnds[0].name).toBe("bash");
-    expect(toolEnds[0].text).toContain("Fusion:");
-    // 2) main then called the sidekick, which ran its own bash and reported back
+    expect(toolEnds[0].text).toContain("condensed by the sidekick model");
+    expect(toolEnds[0].text).toContain("CONDENSED: 500 tests passed");
+    // 2) second direct run: redirected because it proved verbose
+    expect(toolEnds[1].name).toBe("bash");
+    expect(toolEnds[1].text).toContain("Fusion:");
+    // 3) the main agent then called the sidekick, which ran its own bash and reported back
     const sidekick = toolEnds.find((t: any) => t.name === "sidekick");
     expect(sidekick?.isError).toBe(false);
     expect(sidekick?.text).toContain("SIDEKICK REPORT");
-    expect(sidekick?.text).toContain("3 passing");
-    // 3) the sidekick's requests went to the cheap model with its own system prompt
-    const cheapRequests = server.requests.filter((r) => r.model === "cheap");
-    expect(cheapRequests.length).toBeGreaterThanOrEqual(2);
-    // 4) the main agent finished with the sidekick's result
+    // 4) condensing and the sidekick both used the cheap model
+    expect(server.requests.filter((r) => r.model === "cheap").length).toBeGreaterThanOrEqual(3);
     const final = events.filter((e: any) => e.type === "message_end" && e.message?.role === "assistant").at(-1);
     expect(JSON.stringify(final.message.content)).toContain("MAIN DONE");
+  }, 180_000);
+
+  it("adds a default timeout to the main agent's test commands", async () => {
+    const cwd = tempDir("fusion-timeout-");
+    fs.writeFileSync(path.join(cwd, "package.json"), JSON.stringify({ name: "demo", scripts: { test: "sleep 5" } }));
+    const configPath = path.join(agentDir, "fusion.json");
+    const original = fs.readFileSync(configPath, "utf8");
+    const withTimeout = JSON.parse(original);
+    withTimeout.delegation = { ...withTimeout.delegation, commandTimeoutSec: 1 };
+    fs.writeFileSync(configPath, JSON.stringify(withTimeout));
+    try {
+      const started = Date.now();
+      const out = await runPi("TIMEOUT: run the tests.", cwd);
+      const events = out.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      const bash = events.find((e: any) => e.type === "tool_execution_end" && e.toolName === "bash");
+      expect(JSON.stringify(bash.result.content)).toContain("timed out after 1 seconds");
+      expect(Date.now() - started).toBeLessThan(30_000);
+    } finally {
+      fs.writeFileSync(configPath, original);
+    }
   }, 180_000);
 
   it("runs a background delegation while the main agent continues, then collects it", async () => {
