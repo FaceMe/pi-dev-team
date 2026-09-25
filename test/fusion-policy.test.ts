@@ -75,6 +75,23 @@ describe("fusion extension with the policy", () => {
     return { rec, ctx, fire, core };
   }
 
+  it("does not warn about its own sidekick tool", async () => {
+    const { rec, fire, ctx } = boot("balanced");
+    const notes: string[] = [];
+    ctx.ui.notify = (message: string) => notes.push(message);
+    await fire("session_start", {});
+    expect(notes.filter((n) => n.includes("another extension registered"))).toEqual([]);
+  });
+
+  it("warns when another extension owns a tool named sidekick", async () => {
+    const { rec, fire, ctx } = boot("balanced");
+    rec.tools.set("sidekick", { name: "sidekick", description: "Someone else's sidekick" });
+    const notes: string[] = [];
+    ctx.ui.notify = (message: string) => notes.push(message);
+    await fire("session_start", {});
+    expect(notes.some((n) => n.includes("another extension registered"))).toBe(true);
+  });
+
   it("activates the sidekick tools on start", async () => {
     const { rec, fire } = boot("balanced");
     await fire("session_start", {});

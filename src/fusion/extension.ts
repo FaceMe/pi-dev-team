@@ -78,7 +78,9 @@ export default function fusionExtension(pi: ExtensionAPI) {
   // Registration methods are the only API calls allowed while the extension is
   // still loading, so tool/action lookups are deferred to session_start.
   const toolName = "sidekick";
-  const TOOL_MARKER = "Fusion sidekick agent";
+  // Embedded in the tool description below, so the collision check at
+  // session_start can recognise Fusion's own tool.
+  const TOOL_MARKER = "Fusion sidekick";
 
   const isActive = (): boolean => allowed && config.enabled;
 
@@ -197,7 +199,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
     name: toolName,
     label: "Sidekick",
     description: [
-      "Hand labour to the Fusion sidekick — a persistent, cheaper agent with its own tools and cached context.",
+      `Hand labour to the ${TOOL_MARKER} — a persistent, cheaper agent with its own tools and cached context.`,
       "Use it for running tests, builds, linters and installs; recon across many files; reproducing bugs;",
       "mechanical or multi-file edits from an exact brief; and condensing verbose output.",
       "It cannot see this conversation, so the brief must stand alone.",
