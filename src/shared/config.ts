@@ -137,6 +137,8 @@ export interface FusionCacheConfig {
   sidekickRetention: "auto" | "short" | "long" | "none";
 }
 
+export type FusionWidgetMode = "compact" | "full" | "off";
+
 export interface FusionConfig {
   enabled: boolean;
   /** Unset until chosen or seeded from roles; resolved from logged-in models otherwise. */
@@ -148,6 +150,8 @@ export interface FusionConfig {
   limits: FusionLimits;
   /** Prompt-cache settings for the sidekick. */
   cache: FusionCacheConfig;
+  /** Status widget: compact (default, one line per agent), full (details) or off. */
+  widget: FusionWidgetMode;
   /** How strongly the main agent is steered to delegate (see src/fusion/policy.ts). */
   delegation: DelegationConfig;
   /** Optional override for the sidekick system prompt. */
@@ -166,6 +170,7 @@ export function defaultFusionConfig(): FusionConfig {
     routing: { enabled: true, mode: "llm", autoApply: true, onCompact: true, escalateOnFailure: true },
     limits: { maxTurns: 12, maxMessages: 400, maxContextFraction: 0.5 },
     cache: { sidekickRetention: "auto" },
+    widget: "compact",
     delegation: { ...DEFAULT_DELEGATION },
     shortcut: DEFAULT_FUSION_SHORTCUT,
   };
@@ -195,6 +200,7 @@ export function loadFusionConfig(): FusionConfig {
       : [...DEFAULT_SIDEKICK_TOOLS],
     routing: { ...defaults.routing, ...(stored.routing ?? {}) },
     limits: normalizeLimits(stored.limits, defaults.limits),
+    widget: ["compact", "full", "off"].includes(stored.widget) ? stored.widget : defaults.widget,
     cache: {
       sidekickRetention: ["auto", "short", "long", "none"].includes(stored.cache?.sidekickRetention)
         ? stored.cache.sidekickRetention

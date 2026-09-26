@@ -277,23 +277,22 @@ What you'll see in the footer while Fusion is on:
   which case your pick wins.
 - **Extension status line:** `⚛ fusion <sidekick-model> · N% saved ($x)` — the
   sidekick lives here (it is an in-process agent, not the session model).
-- **Widget above the footer — live token meters**, updated after every model
-  response (the sidekick's after each of its turns, not only when a
-  delegation ends):
+- **Widget above the footer — live token meters**, compact and dim (the
+  theme's grey, not bright white), updated after every model response (the
+  sidekick's after each of its turns):
 
   ```text
-  main      anthropic/claude-… · 14 req · in 6.2k · out 3.1k · cache r 412k w 38k · hit 90% (last 97%) · $0.61
-  sidekick  openai/gpt-…mini  · 9 req · in 2.4k · out 1.8k · cache r 96k w 21k · hit 80% (last 92%) · $0.03
-  helpers   condense/route    · 2 req · in 7.9k · out 310 · no cache reported · $0.002
+  ⚛ fusion strict · 3 delegated · 1 running · $0.64
+    main  glm-5.3        ↑456.2k  90% cached  ↓3.1k  $0.61
+    side  glm-5.3-flash  ↑119.4k  80% cached  ↓1.8k  $0.03
   ```
 
-  `in` is uncached input, `cache r`/`cache w` are cache reads/writes, and
-  `hit` is cache reads ÷ (input + cache reads + cache writes); `last` is the
-  most recent request, so a cold cache shows up immediately. "helpers" are the
-  output condenser and the routing classifier. Below the meters: delegations,
-  failures, estimated savings, the delegation mode and the share of work that
-  went through the sidekick.
-- **Footer status:** `⚛ fusion <sidekick> · hit main 90% sk 80% · $0.64`.
+  `↑` is input (everything sent to the model, with the share served from the
+  prompt cache), `↓` is output. Before any requests it is a single line.
+  `/fusion widget full` shows the detailed view (new vs cache-read vs
+  cache-write tokens, last-request hit rate, helpers, delegation counters),
+  `/fusion widget off` hides it, `/fusion widget compact` is the default.
+- **Footer status:** `⚛ fusion <mode> · $<total>`.
 - **`/fusion stats`** adds a per-agent table: requests, input, output, cache
   read, cache write, hit rate, last hit rate and cost.
 
@@ -310,6 +309,7 @@ survives until you explicitly enable Fusion.
 | `/fusion main [model]` | Select or set the main (frontier) agent model via the Model Picker |
 | `/fusion sidekick [model]` | Select or set the sidekick (cheap) agent model via the Model Picker |
 | `/fusion mode [strict\|balanced\|advisory]` | Show or set how strongly the main agent is made to delegate |
+| `/fusion widget [compact\|full\|off]` | Compact live meters (default), the detailed view, or no widget |
 | `/fusion tasks` | List background delegations with status, elapsed time and the files they are editing |
 | `/fusion cancel [id…\|all]` | Cancel background delegations (queued or running) |
 | `/fusion on` | Enable Fusion: activate the sidekick tool + prompt section and switch the session model to the fusion main slot (idempotent — re-run to re-sync) |

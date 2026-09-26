@@ -80,13 +80,27 @@ export class UsageMeter {
 
 const pct = (value?: number) => (value === undefined ? "–" : `${Math.round(value * 100)}%`);
 
-/** One compact line: "12 req · in 3.1k · out 2.4k · cache r 180k w 12k · hit 92% (last 97%) · $0.41". */
+/**
+ * Detailed line: "14 req · ↑456k (6.2k new · 412k cache read · 38k cache write) · 90% cached (last 97%) · ↓3.1k · $0.61".
+ * ↑ is everything sent to the model (the prompt), ↓ is what it generated.
+ */
 export function formatMeter(s: MeterSnapshot): string {
   if (s.requests === 0) return "no requests yet";
-  const cache = s.cacheReported
-    ? `cache r ${formatTokens(s.cacheRead)} w ${formatTokens(s.cacheWrite)} · hit ${pct(s.hitRate)}${s.last ? ` (last ${pct(s.last.hitRate)})` : ""}`
-    : "no cache reported";
-  return `${s.requests} req · in ${formatTokens(s.input)} · out ${formatTokens(s.output)} · ${cache} · ${formatCost(s.cost)}`;
+  const up = s.cacheReported
+    ? `↑${formatTokens(s.prompt)} (${formatTokens(s.input)} new · ${formatTokens(s.cacheRead)} cache read · ${formatTokens(s.cacheWrite)} cache write)` +
+      ` · ${pct(s.hitRate)} cached${s.last ? ` (last ${pct(s.last.hitRate)})` : ""}`
+    : `↑${formatTokens(s.prompt)} (no cache reported)`;
+  return `${s.requests} req · ${up} · ↓${formatTokens(s.output)} · ${formatCost(s.cost)}`;
+}
+
+/** Compact cells for the one-line-per-agent widget: ["↑456k", "90% cached", "↓3.1k", "$0.61"]. */
+export function meterCells(s: MeterSnapshot): { up: string; cached: string; down: string; cost: string } {
+  return {
+    up: `↑${formatTokens(s.prompt)}`,
+    cached: s.cacheReported ? `${pct(s.hitRate)} cached` : "no cache",
+    down: `↓${formatTokens(s.output)}`,
+    cost: formatCost(s.cost),
+  };
 }
 
 export { pct as formatPercent };

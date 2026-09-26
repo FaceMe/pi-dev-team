@@ -112,6 +112,23 @@ describe("fusion extension with the policy", () => {
     expect(notes.some((n) => n.includes("another extension registered"))).toBe(true);
   });
 
+  it("renders the widget dim and switches between compact, full and off", async () => {
+    const { rec, fire, ctx } = boot("balanced");
+    const widgets: any[] = [];
+    ctx.ui.setWidget = (_key: string, content: any) => widgets.push(content);
+    await fire("session_start", {});
+    const theme = { fg: (color: string, text: string) => `<${color}>${text}</${color}>` };
+    const render = (content: any) => String(content(undefined, theme).render?.(200)?.join("\n") ?? content(undefined, theme).text);
+    const compact = render(widgets.at(-1));
+    expect(compact).toMatch(/^<dim>⚛ fusion balanced/);
+    expect(compact.split("\n")).toHaveLength(1);
+    await rec.commands.get("fusion").handler("widget full", ctx);
+    expect(render(widgets.at(-1)).split("\n").length).toBeGreaterThan(3);
+    expect(loadFusionConfig().widget).toBe("full");
+    await rec.commands.get("fusion").handler("widget off", ctx);
+    expect(widgets.at(-1)).toBeUndefined();
+  });
+
   it("activates the sidekick tools on start", async () => {
     const { rec, fire } = boot("balanced");
     await fire("session_start", {});

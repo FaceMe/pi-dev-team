@@ -44,7 +44,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { compressionPrompt, neverExits } from "./policy.js";
-import { formatMeter, formatPercent, UsageMeter } from "../shared/usage-meter.js";
+import { formatMeter, formatPercent, meterCells, UsageMeter } from "../shared/usage-meter.js";
 import type { MeterSnapshot } from "../shared/usage-meter.js";
 import type { DelegationMode } from "./policy.js";
 
@@ -1172,7 +1172,7 @@ export class FusionEngine {
     return { main: this.meters.main.snapshot(), sidekick: this.meters.sidekick.snapshot(), helpers: this.meters.helpers.snapshot() };
   }
 
-  /** Per-agent token lines for the widget: tokens, cache reads/writes, hit rate, cost. */
+  /** Per-agent token lines for the full widget: tokens, cache reads/writes, hit rate, cost. */
   usageLines(): string[] {
     const m = this.meterSnapshots();
     const lines = [
@@ -1181,6 +1181,50 @@ export class FusionEngine {
     ];
     if (m.helpers.requests > 0) lines.push(`helpers   condense/route · ${formatMeter(m.helpers)}`);
     return lines;
+  }
+
+  /**
+   * Compact widget: one header line, then one aligned line per agent once
+   * there is usage.
+   *
+   *   ⚛ fusion strict · 3 delegated · 1 running · $0.64
+   *     main  glm-5.3-flash  ↑456k  90% cached  ↓3.1k  $0.61
+   *     side  glm-5.3-flash  ↑119k  80% cached  ↓1.8k  $0.03
+   */
+  compactLines(): string[] {
+    const m = this.meterSnapshots();
+    const mode = this.config.delegation?.mode ?? "balanced";
+    const name = (model?: Model<any>) => (model ? model.id : "none");
+    const mainName = name(this.liveMainModel());
+    const sideName = name(this.resolveSidekickModel());
+    const pending = this.pendingTasks().length;
+    const total = m.main.cost + m.sidekick.cost + m.helpers.cost;
+    const header = [
+      `⚛ fusion ${mode}`,
+      this.stats.delegations ? `${this.stats.delegations} delegated` : "",
+      pending ? `${pending} running` : "",
+      this.stats.failures ? `${this.stats.failures} failed` : "",
+      m.main.requests + m.sidekick.requests > 0 ? formatCost(total) : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    if (m.main.requests + m.sidekick.requests === 0) return [`${header} · main ${mainName} · side ${sideName} · no requests yet`];
+
+    const rows: Array<[string, string, ReturnType<typeof meterCells> | undefined]> = [
+      ["main", mainName, m.main.requests ? meterCells(m.main) : undefined],
+      ["side", sideName, m.sidekick.requests ? meterCells(m.sidekick) : undefined],
+    ];
+    const width = (pick: (c: ReturnType<typeof meterCells>) => string) =>
+      Math.max(0, ...rows.map(([, , c]) => (c ? pick(c).length : 0)));
+    const nameWidth = Math.max(...rows.map(([, n]) => n.length));
+    const w = { up: width((c) => c.up), cached: width((c) => c.cached), down: width((c) => c.down) };
+    return [
+      header,
+      ...rows.map(([label, model, c]) =>
+        `  ${label}  ${model.padEnd(nameWidth)}  ` +
+        (c ? `${c.up.padEnd(w.up)}  ${c.cached.padEnd(w.cached)}  ${c.down.padEnd(w.down)}  ${c.cost}` : "no requests yet"),
+      ),
+    ];
   }
 
   statusLines(): string[] {
@@ -1203,16 +1247,12 @@ export class FusionEngine {
     ];
   }
 
+  /** Short footer status: mode and total cost (the widget carries the details). */
   footerStatus(): string {
-    const base = `⚛ fusion ${shortModelKey(this.resolveSidekickModel())}`;
     const m = this.meterSnapshots();
-    const hits =
-      m.main.requests + m.sidekick.requests > 0
-        ? ` · hit main ${formatPercent(m.main.hitRate)} sk ${formatPercent(m.sidekick.hitRate)}` +
-          ` · ${formatCost(m.main.cost + m.sidekick.cost + m.helpers.cost)}`
-        : "";
-    if (this.stats.delegations === 0) return `${base}${hits}`;
-    return `${base}${hits} · ${(this.savingsRatio() * 100).toFixed(0)}% saved (est.)`;
+    const total = m.main.cost + m.sidekick.cost + m.helpers.cost;
+    const mode = this.config.delegation?.mode ?? "balanced";
+    return `⚛ fusion ${mode}${m.main.requests + m.sidekick.requests > 0 ? ` · ${formatCost(total)}` : ""}`;
   }
 
   snapshot(): FusionStats & { lifetime: LifetimeStats; meters: ReturnType<FusionEngine["meterSnapshots"]> } {
