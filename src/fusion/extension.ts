@@ -141,7 +141,14 @@ export default function fusionExtension(pi: ExtensionAPI) {
     if (!engine || !target || !target.hasUI) return;
     try {
       target.ui.setStatus(EXTENSION_TAG, engine.footerStatus());
-      target.ui.setWidget(EXTENSION_TAG, engine.statusLines());
+      const mode = config.widget ?? "compact";
+      if (mode === "off") {
+        target.ui.setWidget(EXTENSION_TAG, undefined);
+      } else {
+        const lines = mode === "full" ? engine.statusLines() : engine.compactLines();
+        // Rendered in the theme's dim colour: glanceable, not bright white.
+        target.ui.setWidget(EXTENSION_TAG, (_tui, theme) => new Text(lines.map((line) => theme.fg("dim", line)).join("\n"), 0, 0));
+      }
     } catch {
       /* UI may be unavailable */
     }
@@ -838,7 +845,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
         const modes = ["strict", "balanced", "advisory"].filter((m) => m.startsWith(rest)).map((m) => ({ value: `mode ${m}`, label: m }));
         return modes.length ? modes : null;
       }
-      const items = ["on", "off", "main", "sidekick", "mode", "tasks", "cancel", "status", "stats", "models", "route", "trace", "reset", "help"].map((value) => ({
+      const items = ["on", "off", "main", "sidekick", "mode", "widget", "tasks", "cancel", "status", "stats", "models", "route", "trace", "reset", "help"].map((value) => ({
         value,
         label: value,
       }));
@@ -907,6 +914,19 @@ export default function fusionExtension(pi: ExtensionAPI) {
           }
           refreshUi(ctx);
           ctx.ui.notify(`Fusion ${config.enabled ? "enabled" : "disabled"}.`, "info");
+          return;
+        }
+
+        case "widget": {
+          const value = args.trim().split(/\s+/)[1]?.toLowerCase();
+          if (!value || !["compact", "full", "off"].includes(value)) {
+            ctx.ui.notify(`Fusion widget: ${config.widget}. Usage: /fusion widget compact|full|off (details any time: /fusion stats)`, "info");
+            return;
+          }
+          config.widget = value as typeof config.widget;
+          activeEngine.config = config;
+          persistConfig();
+          refreshUi(ctx);
           return;
         }
 
@@ -1115,21 +1135,24 @@ export default function fusionExtension(pi: ExtensionAPI) {
     box.addChild(new Text(theme.bold("fusion session"), 0, 0));
     const meters = (stats as any).meters as Record<string, MeterSnapshot> | undefined;
     if (meters) {
-      box.addChild(new Text(theme.fg("dim", "agent      requests  input    output   cache read  cache write  hit    last   cost"), 0, 0));
+      box.addChild(new Text(theme.fg("muted", "agent      req       ↑ input  ↓ output  cache read  cache write  cached  last    cost"), 0, 0));
       for (const [name, m] of Object.entries(meters)) {
         if (!m || (name === "helpers" && m.requests === 0)) continue;
         const cell = (v: string, w: number) => v.padEnd(w);
         box.addChild(
           new Text(
-            cell(name, 11) +
-              cell(String(m.requests), 10) +
-              cell(formatTokens(m.input), 9) +
-              cell(formatTokens(m.output), 9) +
-              cell(m.cacheReported ? formatTokens(m.cacheRead) : "–", 12) +
-              cell(m.cacheReported ? formatTokens(m.cacheWrite) : "–", 13) +
-              cell(m.cacheReported ? formatPercent(m.hitRate) : "–", 7) +
-              cell(m.cacheReported ? formatPercent(m.last?.hitRate) : "–", 7) +
-              formatCost(m.cost),
+            theme.fg(
+              "dim",
+              cell(name, 11) +
+                cell(String(m.requests), 10) +
+                cell(formatTokens(m.prompt), 9) +
+                cell(formatTokens(m.output), 10) +
+                cell(m.cacheReported ? formatTokens(m.cacheRead) : "–", 12) +
+                cell(m.cacheReported ? formatTokens(m.cacheWrite) : "–", 13) +
+                cell(m.cacheReported ? formatPercent(m.hitRate) : "–", 8) +
+                cell(m.cacheReported ? formatPercent(m.last?.hitRate) : "–", 8) +
+                formatCost(m.cost),
+            ),
             0,
             0,
           ),

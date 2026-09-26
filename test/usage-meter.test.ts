@@ -30,7 +30,7 @@ describe("usage meter", () => {
     expect(s.hitRate).toBeCloseTo(9000 / 20000);
     expect(s.last?.hitRate).toBeCloseTo(9000 / 10000);
     expect(s.cost).toBeCloseTo(0.06);
-    expect(formatMeter(s)).toMatch(/2 req · in 1\.5k · out 500 · cache r 9\.0k w 9\.5k · hit 45% \(last 90%\) · \$0\.06/);
+    expect(formatMeter(s)).toBe("2 req · ↑20.0k (1.5k new · 9.0k cache read · 9.5k cache write) · 45% cached (last 90%) · ↓500 · $0.06");
   });
 
   it("ignores empty usage and says when the provider reports no cache data", () => {
@@ -41,7 +41,7 @@ describe("usage meter", () => {
     expect(formatMeter(meter.snapshot())).toBe("no requests yet");
     meter.add(usage(800, 100, 0, 0));
     expect(meter.snapshot().cacheReported).toBe(false);
-    expect(formatMeter(meter.snapshot())).toContain("no cache reported");
+    expect(formatMeter(meter.snapshot())).toBe("1 req · ↑800 (no cache reported) · ↓100 · $0.00");
     expect(hitRate({ input: 0, cacheRead: 0, cacheWrite: 0 })).toBeUndefined();
   });
 });
@@ -87,9 +87,37 @@ describe("real-time meters in the Fusion engine", () => {
     engine.recordMainUsage(usage(2000, 400, 30_000, 1000, 0.12));
     expect(ticks).toBe(1);
     const lines = engine.statusLines();
-    expect(lines[0]).toMatch(/^main .* 1 req · in 2\.0k · out 400 · cache r 30\.0k w 1\.0k · hit 91%/);
+    expect(lines[0]).toMatch(/^main .* 1 req · ↑33\.0k \(2\.0k new · 30\.0k cache read · 1\.0k cache write\) · 91% cached/);
     expect(lines[1]).toMatch(/^sidekick .* no requests yet/);
-    expect(engine.footerStatus()).toMatch(/hit main 91% sk –/);
+    expect(engine.footerStatus()).toBe("⚛ fusion balanced · $0.12");
     expect(engine.snapshot().meters.main.requests).toBe(1);
+  });
+});
+
+describe("compact widget", () => {
+  function engineWith(models: any[]) {
+    const core = createFauxCore({ provider: "faux", models });
+    const [side, main] = core.models;
+    const config = { ...defaultFusionConfig(), main: { provider: main.provider, modelId: main.id }, sidekick: { provider: side.provider, modelId: side.id } };
+    const engine = new FusionEngine(recordingPi().api, fakeRegistry(core.models, core.models), tempDir(), config);
+    engine.setContext({ model: main } as any);
+    return engine;
+  }
+
+  it("is a single line before any requests", () => {
+    const engine = engineWith([{ id: "glm-5.3-flash" }, { id: "glm-5.3" }]);
+    expect(engine.compactLines()).toEqual(["⚛ fusion balanced · main glm-5.3 · side glm-5.3-flash · no requests yet"]);
+  });
+
+  it("shows ↑ input with the cached share, ↓ output and cost, one aligned line per agent", () => {
+    const engine = engineWith([{ id: "glm-5.3-flash" }, { id: "glm-5.3" }]);
+    engine.recordMainUsage(usage(6_200, 3_100, 412_000, 38_000, 0.61));
+    engine.meters.sidekick.add(usage(2_400, 1_800, 96_000, 21_000, 0.03));
+    engine.stats.delegations = 3;
+    expect(engine.compactLines()).toEqual([
+      "⚛ fusion balanced · 3 delegated · $0.64",
+      "  main  glm-5.3        ↑456.2k  90% cached  ↓3.1k  $0.61",
+      "  side  glm-5.3-flash  ↑119.4k  80% cached  ↓1.8k  $0.03",
+    ]);
   });
 });
