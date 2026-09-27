@@ -20,7 +20,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
-import { classifyCommand, decideDirectCall, EXECUTION_TOOLS, nudgeText, recordCommand } from "./policy.js";
+import { classifyCommand, decideDirectCall, editNudgeText, nudgeText, recordCommand, STRICT_REMOVED_TOOLS } from "./policy.js";
+import { changeSummary, formatChanges } from "./checks.js";
 import type { DelegationMode, PolicyState } from "./policy.js";
 import {
   DEFAULT_FUSION_SHORTCUT,
@@ -183,6 +184,49 @@ export default function fusionExtension(pi: ExtensionAPI) {
   const commandStarts = new Map<string, { command: string; at: number }>();
   /** Files the main agent has read recently (newest last), for sidekick briefs. */
   let recentReads: string[] = [];
+  /**
+   * Per-run review state: files the sidekick changed that the main agent has
+   * not looked at since, whether the review reminder was already sent, and the
+   * files the main agent edited directly (for the balanced edit nudge).
+   */
+  const run = { unreviewed: new Set<string>(), reviewAsked: false, directEdits: new Set<string>(), editNudged: false };
+  const resetRun = (): void => {
+    run.unreviewed.clear();
+    run.reviewAsked = false;
+    run.directEdits.clear();
+    run.editNudged = false;
+  };
+  const markReviewed = (cwd: string, target?: string): void => {
+    if (!target) return run.unreviewed.clear();
+    run.unreviewed.delete(path.resolve(cwd, target));
+  };
+
+  /**
+   * Account for a finished delegation: failures (errors, or a FAILED verdict)
+   * drive the escape hatch, and the files it changed await the main agent's review.
+   * A note for the main agent is queued when strict mode was just relaxed;
+   * whichever path hands the result over (tool, wait, delivery) takes it.
+   */
+  let relaxNote: string | undefined;
+  const takeRelaxNote = (): string | undefined => {
+    const note = relaxNote;
+    relaxNote = undefined;
+    return note;
+  };
+  const onDelegationResult = (outcome: DelegationOutcome): void => {
+    const failed = outcome.isError || outcome.verdict === "failed";
+    if (failed) policy.failedDelegations += 1;
+    else policy.failedDelegations = 0;
+    for (const file of outcome.editedFiles ?? []) run.unreviewed.add(file);
+    if (failed && policy.failedDelegations >= 2 && !policy.relaxed && epochMode() === "strict") {
+      policy.relaxed = true;
+      setSidekickToolActive(true);
+      relaxNote = (
+        `[${EXTENSION_TAG}] ${policy.failedDelegations} delegations in a row failed, so strict mode is relaxed: ` +
+        "bash, edit and write are available to you now. Finish this piece yourself; strict mode returns after the next delegation succeeds and the user sends a new prompt."
+      );
+    }
+  };
 
   const noteRead = (input: Record<string, unknown>): void => {
     const target = String(input.path ?? input.file_path ?? "").trim();
@@ -227,11 +271,11 @@ export default function fusionExtension(pi: ExtensionAPI) {
     } else {
       next = next.filter((name) => !ours.includes(name));
     }
-    const strict = active && epochMode() === "strict";
+    const strict = active && epochMode() === "strict" && !policy.relaxed;
     if (strict) {
-      const removing = next.filter((name) => EXECUTION_TOOLS.includes(name));
+      const removing = next.filter((name) => STRICT_REMOVED_TOOLS.includes(name));
       strictRemoved = [...new Set([...strictRemoved, ...removing])];
-      next = next.filter((name) => !EXECUTION_TOOLS.includes(name));
+      next = next.filter((name) => !STRICT_REMOVED_TOOLS.includes(name));
     } else if (strictRemoved.length) {
       for (const name of strictRemoved) if (!next.includes(name)) next = [...next, name];
       strictRemoved = [];
@@ -244,8 +288,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
   const deliverBackground = (task: BackgroundTask): void => {
     const outcome = task.outcome;
     if (!outcome) return;
-    if (outcome.isError) policy.failedDelegations += 1;
-    else policy.failedDelegations = 0;
+    onDelegationResult(outcome);
     // Already handed to the main agent through sidekick_wait: don't deliver it twice.
     if (task.collected) {
       refreshUi();
@@ -258,9 +301,15 @@ export default function fusionExtension(pi: ExtensionAPI) {
       pi.sendMessage(
         {
           customType: "fusion-result",
-          content: outcome.isError ? header : `${header}\n\n${outcome.text}`,
+          content: [outcome.isError ? header : `${header}\n\n${outcome.text}`, takeRelaxNote()].filter(Boolean).join("\n\n"),
           display: true,
-          details: { id: task.id, task: task.task, meta: outcome.meta, isError: outcome.isError, trace: outcome.trace },
+          details: {
+            id: task.id,
+            task: task.task,
+            meta: outcome.meta,
+            isError: outcome.isError || outcome.verdict === "failed",
+            trace: outcome.trace,
+          },
         },
         { deliverAs: "steer", triggerTurn: true },
       );
@@ -280,12 +329,15 @@ export default function fusionExtension(pi: ExtensionAPI) {
       "Use it for running tests, builds, linters and installs; recon across many files; reproducing bugs;",
       "mechanical or multi-file edits from an exact brief; and condensing verbose output.",
       "It cannot see this conversation, so the brief must stand alone.",
+      "Put done-conditions in `acceptance` and proving commands in `verify`: the harness runs those itself",
+      "after the sidekick finishes and prefixes the result with a PASSED/FAILED verdict.",
       "Set background: true to keep working while it runs; the result is delivered to you when done.",
     ].join(" "),
     promptSnippet: "Delegate labour (tests, builds, recon, mechanical edits) to the cheaper Fusion sidekick agent",
     promptGuidelines: [
       `Use ${toolName} by default for labour — tests/builds/linters, multi-file recon, mechanical edits, verbose output — and keep the plan, ambiguity and final review for yourself.`,
-      `Every ${toolName} brief must be self-contained: exact paths, exact acceptance criteria, and the exact output you want back.`,
+      `Every ${toolName} brief must be self-contained: exact paths, the exact change, \`acceptance\` criteria, \`verify\` commands, and the output you want back.`,
+      `Review what ${toolName} changed (\`git diff -- <files>\`) against the user's intent before you report success.`,
       `Use background: true for slow work and continue with something else; call ${toolName}_wait before you report completion.`,
     ],
     parameters: Type.Object({
@@ -299,6 +351,16 @@ export default function fusionExtension(pi: ExtensionAPI) {
       expect: Type.Optional(
         StringEnum(["summary", "diff", "evidence", "raw"] as const, {
           description: "Shape of the answer you want back. Default: summary.",
+        }),
+      ),
+      acceptance: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Done-conditions, one per item (e.g. \"parseDate returns null for empty input\"). The sidekick must answer each one; the harness tallies them.",
+        }),
+      ),
+      verify: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Up to 5 commands the harness runs itself after the sidekick finishes (e.g. \"npm test -- parser\", \"npx tsc --noEmit\"). Their real exit codes decide the verdict.",
         }),
       ),
       background: Type.Optional(
@@ -318,6 +380,8 @@ export default function fusionExtension(pi: ExtensionAPI) {
         context: params.context,
         files: params.files,
         expect: params.expect,
+        acceptance: params.acceptance,
+        verify: params.verify,
         harnessContext: await harnessContext(ctx.cwd, params.files),
       };
 
@@ -357,9 +421,9 @@ export default function fusionExtension(pi: ExtensionAPI) {
       }
 
       const meta = outcome.meta;
+      onDelegationResult(outcome);
+      const relaxNote = takeRelaxNote();
       refreshUi(ctx);
-      if (outcome.isError) policy.failedDelegations += 1;
-      else policy.failedDelegations = 0;
 
       if (outcome.isError) {
         await activeEngine.maybeEscalate();
@@ -380,13 +444,16 @@ export default function fusionExtension(pi: ExtensionAPI) {
           `Sidekick delegation failed: ${outcome.errorMessage ?? "unknown error"}\n${meta}` +
             (tail ? `\nlast steps:\n${tail}` : "") +
             (authProblem ? "\n(hint: the sidekick provider may have no credentials — /fusion models)" : "") +
-            `\n(${EXTENSION_TAG} trace shows the full delegation log)`,
+            `\n(${EXTENSION_TAG} trace shows the full delegation log)` +
+            (relaxNote ? `\n${relaxNote}` : ""),
         );
       }
 
+      if (outcome.verdict === "failed") await activeEngine.maybeEscalate();
       return {
-        content: [{ type: "text", text: outcome.text }],
+        content: [{ type: "text", text: relaxNote ? `${outcome.text}\n\n${relaxNote}` : outcome.text }],
         details: {
+          verdict: outcome.verdict,
           model: outcome.model,
           turns: outcome.turns,
           usage: outcome.usage,
@@ -410,9 +477,14 @@ export default function fusionExtension(pi: ExtensionAPI) {
       if (isPartial) {
         return new Text(theme.fg("warning", "… sidekick working"), 0, 0);
       }
-      const details = (result.details ?? {}) as { meta?: string; trace?: TraceStep[]; background?: boolean; id?: string };
+      const details = (result.details ?? {}) as { meta?: string; trace?: TraceStep[]; background?: boolean; id?: string; verdict?: string };
       if (details.background) return new Text(theme.fg("accent", `⇢ sidekick ${details.id ?? ""} running in the background`), 0, 0);
-      const head = theme.fg("success", "✓ sidekick");
+      const head =
+        details.verdict === "failed"
+          ? theme.fg("error", "✗ sidekick (verdict: failed)")
+          : details.verdict === "passed"
+            ? theme.fg("success", "✓ sidekick (verified)")
+            : theme.fg("success", "✓ sidekick");
       const meta = theme.fg("dim", ` ${details.meta ?? ""}`);
       const preview = truncate(
         (result.content ?? []).map((part: any) => part.text ?? "").join(" "),
@@ -450,6 +522,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
       activeEngine.setContext(ctx);
       const tasks = await activeEngine.waitFor(params.ids);
       refreshUi(ctx);
+      const notes = [takeRelaxNote()].filter(Boolean);
       if (tasks.length === 0) return { content: [{ type: "text", text: "No background delegations are outstanding." }], details: undefined };
       const text = tasks
         .map((t) => {
@@ -458,7 +531,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
           return o.isError ? `${t.id} FAILED: ${o.errorMessage} (${o.meta})` : `${t.id} (${o.meta}):\n${o.text}`;
         })
         .join("\n\n");
-      return { content: [{ type: "text", text }], details: { ids: tasks.map((t) => t.id) } };
+      return { content: [{ type: "text", text: [text, ...notes].join("\n\n") }], details: { ids: tasks.map((t) => t.id) } };
     },
   });
 
@@ -467,7 +540,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
   const policyActive = (): boolean =>
     Boolean(engine && allowed && config.enabled && engine.resolveSidekickModel());
 
-  pi.on("tool_call", async (event: any) => {
+  pi.on("tool_call", async (event: any, ctx: any) => {
     const activeEngine = engine;
     const name = String(event.toolName ?? "");
     if (!activeEngine || !policyActive() || name === toolName || name === waitToolName) return undefined;
@@ -498,9 +571,22 @@ export default function fusionExtension(pi: ExtensionAPI) {
       return { block: true, reason: decision.reason };
     }
 
-    if (name === "read") noteRead(input);
+    const cwd = String(ctx?.cwd ?? process.cwd());
+    if (name === "read") {
+      noteRead(input);
+      markReviewed(cwd, String(input.path ?? input.file_path ?? "") || undefined);
+    }
+    if (name === "edit" || name === "write") {
+      const target = String(input.path ?? input.file_path ?? "");
+      if (target) {
+        // Editing a file the sidekick changed means the main agent looked at it.
+        markReviewed(cwd, target);
+        run.directEdits.add(path.resolve(cwd, target));
+      }
+    }
     if (name === "bash" || name === "powershell") {
       const command = String(input.command ?? "");
+      if (/\bgit\s+(?:-C\s+\S+\s+|--no-pager\s+)*(diff|show)\b/.test(command)) markReviewed(cwd);
       const kind = classifyCommand(command);
       if (kind === "verify" || kind === "install") {
         commandStarts.set(String(event.toolCallId), { command, at: Date.now() });
@@ -560,6 +646,20 @@ export default function fusionExtension(pi: ExtensionAPI) {
       }
     }
 
+    // Balanced: many direct edits in one run — the rest may be sidekick labour.
+    const editLimit = config.delegation.editNudgeFiles;
+    if (
+      (name === "edit" || name === "write") &&
+      config.delegation.mode === "balanced" &&
+      editLimit > 0 &&
+      !run.editNudged &&
+      run.directEdits.size >= editLimit
+    ) {
+      run.editNudged = true;
+      content = [...content, { type: "text", text: `\n${editNudgeText(run.directEdits.size)}` }];
+      changed = true;
+    }
+
     // Long runs of direct actions: remind the main agent to delegate.
     const every = config.delegation.nudgeAfter;
     if (every > 0 && config.delegation.mode !== "strict" && policy.directStreak >= every && policy.directStreak % every === 0) {
@@ -575,7 +675,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
     const activeEngine = engine;
     if (!activeEngine || event.outcome !== "completed") return undefined;
     const pending = activeEngine.pendingTasks().filter((t) => !t.collected);
-    if (pending.length === 0) return undefined;
+    if (pending.length === 0) return reviewGate(activeEngine);
     const tasks = await activeEngine.waitFor(pending.map((t) => t.id));
     refreshUi();
     const body = tasks
@@ -590,7 +690,12 @@ export default function fusionExtension(pi: ExtensionAPI) {
         {
           type: "custom_message",
           customType: "fusion-result",
-          content: `[fusion] Background delegations finished before you wrapped up. Review them and update your answer if needed.\n\n${body}`,
+          content: [
+            `[fusion] Background delegations finished before you wrapped up. Review them and update your answer if needed.\n\n${body}`,
+            takeRelaxNote(),
+          ]
+            .filter(Boolean)
+            .join("\n\n"),
           display: true,
           details: { id: tasks.map((t) => t.id).join(", "), meta: `${tasks.length} background result(s)`, isError: tasks.some((t) => t.outcome?.isError) },
         },
@@ -598,6 +703,36 @@ export default function fusionExtension(pi: ExtensionAPI) {
       continue: true,
     };
   });
+
+  /**
+   * The main agent owns the final review: if the sidekick changed files this
+   * run that the main agent has not read or diffed since, hold the run once
+   * and ask for that review. At most one extra turn per run.
+   */
+  const reviewGate = async (activeEngine: FusionEngine): Promise<any> => {
+    if (!config.delegation.reviewGate || config.delegation.mode === "advisory") return undefined;
+    if (run.reviewAsked || run.unreviewed.size === 0) return undefined;
+    run.reviewAsked = true;
+    const cwd = activeEngine.latestCtx?.cwd ?? process.cwd();
+    const files = [...run.unreviewed];
+    const changes = await changeSummary(files, cwd);
+    const rel = changes.map((c) => c.file);
+    return {
+      entries: [
+        {
+          type: "custom_message",
+          customType: "fusion-result",
+          content:
+            `[fusion] Review before you finish: the sidekick changed ${files.length} file(s) this run that you have not looked at since — ` +
+            `${formatChanges(changes)}.\n\nCheck the change against the user's request (\`git diff -- ${rel.join(" ")}\`), ` +
+            "fix or re-delegate anything wrong, then give your final answer. If you are confident it is right, say so in one line.",
+          display: true,
+          details: { id: "review", meta: `${files.length} file(s) to review`, isError: false },
+        },
+      ],
+      continue: true,
+    };
+  };
 
   pi.registerEntryRenderer("fusion-tasks", (entry: any, _options: any, theme: any) => {
     const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
@@ -651,6 +786,10 @@ export default function fusionExtension(pi: ExtensionAPI) {
     strictRemoved = [];
     engine?.cancel();
     recentReads = [];
+    resetRun();
+    policy.relaxed = false;
+    policy.failedDelegations = 0;
+    relaxNote = undefined;
     commandStarts.clear();
     engine?.dispose();
     engine = undefined;
@@ -672,8 +811,11 @@ export default function fusionExtension(pi: ExtensionAPI) {
     const sidekickModel = activeEngine.resolveSidekickModel();
     const shouldEnable = activeEngine.config.enabled && sidekickModel !== undefined;
 
+    // A new user prompt: strict mode returns once a delegation has succeeded.
+    if (policy.relaxed && policy.failedDelegations === 0) policy.relaxed = false;
     setSidekickToolActive(shouldEnable);
     policy.directStreak = 0;
+    resetRun();
     if (!options.sections) return;
     if (!shouldEnable) {
       // Removing the key makes pi emit a section patch that drops it.

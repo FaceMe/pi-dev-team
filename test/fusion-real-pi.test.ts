@@ -36,6 +36,11 @@ function respond(messages: any[]): MockReply {
     if (turns === 0) return { tool: "bash", args: { command: "npm test" } };
     return { text: `MAIN DONE: ${text(last).slice(0, 300)}` };
   }
+  if (firstUser.includes("VERIFY")) {
+    const turns = messages.filter((m: any) => m.role === "assistant").length;
+    if (turns === 0) return { tool: "sidekick", args: { task: "Run the tests.", acceptance: ["tests pass"], verify: ["echo checked-ok", "echo broken >&2; exit 1"] } };
+    return { text: `MAIN DONE: ${text(last).slice(0, 400)}` };
+  }
   if (firstUser.includes("SETTLE")) {
     const turns = messages.filter((m: any) => m.role === "assistant").length;
     if (turns === 0) return { tool: "sidekick", args: { task: "Run npm test and report pass/fail counts.", background: true } };
@@ -181,6 +186,18 @@ describe.skipIf(!fs.existsSync(piCli))("fusion in a real pi session", () => {
     expect(JSON.stringify(final.message.content)).toContain("MAIN DONE");
     // Collected with sidekick_wait, so it is not delivered again as a steer message.
     expect(events.filter((e: any) => e.type === "message_end" && e.message?.customType === "fusion-result")).toHaveLength(0);
+  }, 180_000);
+
+  it("runs the brief's verify commands itself and leads the result with the verdict", async () => {
+    const out = await runPi("VERIFY: fix and check.", tempDir("fusion-verify-"));
+    const events = out.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const result = events.find((e: any) => e.type === "tool_execution_end" && e.toolName === "sidekick");
+    const body = String(result.result.content[0].text);
+    expect(body).toMatch(/^\[fusion\] verdict: FAILED \(checks 1\/2 passed · acceptance 0\/1 met\)/);
+    expect(body).toContain("3 passing");
+    expect(body).toMatch(/✓ `echo checked-ok` — exit 0/);
+    expect(body).toMatch(/✗ `echo broken >&2; exit 1` — exit 1[\s\S]*broken/);
+    expect(body).toContain("? 1. tests pass — not answered");
   }, 180_000);
 
   it("does not settle while a background delegation is outstanding", async () => {

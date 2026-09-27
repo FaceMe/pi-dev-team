@@ -12,7 +12,12 @@
  *              condensed by the cheap model; long runs of direct actions get
  *              a nudge. The main agent still reads and edits directly.
  *   strict   — "minimal direct action": the main agent keeps read-only tools
- *              plus the sidekick; all execution and editing is delegated.
+ *              (bash only for read-only inspection such as `git diff`) plus
+ *              the sidekick; all execution and editing is delegated.
+ *
+ * In every non-advisory mode the main agent keeps the judgement: it plans,
+ * writes the spec (acceptance criteria, checks the harness runs) and reviews
+ * what the sidekick changed before it finishes.
  */
 
 export type DelegationMode = "advisory" | "balanced" | "strict";
@@ -31,6 +36,13 @@ export interface DelegationConfig {
   resultCapChars: number;
   /** Attach the files the main agent has read and `git status` to every brief. */
   briefContext: boolean;
+  /**
+   * Before a run ends, ask the main agent to review files the sidekick changed
+   * that it has not looked at since (one extra turn at most per run).
+   */
+  reviewGate: boolean;
+  /** Balanced: remind the main agent to delegate after it has directly edited this many files in one run (0 = never). */
+  editNudgeFiles: number;
 }
 
 export const DEFAULT_DELEGATION: DelegationConfig = {
@@ -41,10 +53,19 @@ export const DEFAULT_DELEGATION: DelegationConfig = {
   commandTimeoutSec: 600,
   resultCapChars: 4000,
   briefContext: true,
+  reviewGate: true,
+  editNudgeFiles: 4,
 };
 
-/** Tools the main agent loses in strict mode (the sidekick gets them instead). */
+/** Tools that execute or change things. */
 export const EXECUTION_TOOLS = ["bash", "powershell", "edit", "write"];
+
+/**
+ * Tools the main agent loses in strict mode. bash stays, limited to read-only
+ * inspection, so the main agent can check the sidekick's work itself
+ * (`git diff`, `git log`, `git status`).
+ */
+export const STRICT_REMOVED_TOOLS = ["powershell", "edit", "write"];
 
 export type CommandKind = "verify" | "install" | "recon" | "other";
 
@@ -117,6 +138,28 @@ export function neverExits(command: string): string | undefined {
   return undefined;
 }
 
+const INSPECT_GIT = /^git\s+(?:-C\s+\S+\s+|--no-pager\s+)*(diff|status|log|show|blame|shortlog|describe|rev-parse|ls-files|ls-tree|grep|cat-file|reflog\s+show|stash\s+(list|show)|remote\s+-v|tag\s+(-l|--list)|branch(\s+(-a|-r|-v|-vv|--list|--show-current|--contains\s+\S+))*\s*$)\b/;
+const INSPECT_TOOLS = /^(head|tail|wc|cat|grep|egrep|rg|cut|nl|ls|pwd|diff|stat|file|jq|du|which|echo|true)\b|^sort(\s+-[a-zA-Z]*[^o\s]*)*$|^uniq(\s+-\S+)*$/;
+
+/**
+ * True when a shell command only inspects the repository: git read commands
+ * and read-only text tools, optionally piped together. No writes, no
+ * redirects into files, no command substitution.
+ */
+export function isReadOnlyInspection(command: string): boolean {
+  const cmd = command.trim();
+  if (!cmd || cmd.length > 2000) return false;
+  if (/`|\$\(|<\(|>\(/.test(cmd)) return false;
+  // Any redirect other than stderr to stdout or /dev/null could write a file.
+  const withoutSafeRedirects = cmd.replace(/\d?>&\d|\d?>\s*\/dev\/null/g, "");
+  if (/[<>]/.test(withoutSafeRedirects)) return false;
+  // Flags that write files or run other programs.
+  if (/\s(--output|--pre|--open-files-in-pager|-O)(=|\s|$)/.test(cmd)) return false;
+  if (/\btail\s+-[a-zA-Z]*f/.test(cmd)) return false;
+  const segments = withoutSafeRedirects.split(/&&|\|\||[|;&\n]/).map((s) => s.trim()).filter(Boolean);
+  return segments.length > 0 && segments.every((s) => INSPECT_GIT.test(s) || INSPECT_TOOLS.test(s));
+}
+
 /** Normalised key for remembering a command's runtime and output size. */
 export function commandKey(command: string): string {
   return command.trim().replace(/\s+/g, " ").slice(0, 200);
@@ -135,6 +178,11 @@ export interface PolicyState {
   failedDelegations: number;
   /** What each test/build/install command cost last time it ran directly, by commandKey. */
   history?: Map<string, CommandRecord>;
+  /**
+   * Strict mode was relaxed after repeated failed delegations: the main agent
+   * has its execution tools back until the next user prompt after a success.
+   */
+  relaxed?: boolean;
 }
 
 export interface BlockDecision {
@@ -173,14 +221,17 @@ export function decideDirectCall(
   }
   if (mode === "advisory" || !sidekickAvailable) return { block: false };
   // Escape hatch: if delegations keep failing, let the main agent act.
-  if (state.failedDelegations >= 2) return { block: false };
+  if (state.failedDelegations >= 2 || state.relaxed) return { block: false };
 
   if (mode === "strict" && EXECUTION_TOOLS.includes(toolName)) {
+    if (toolName === "bash" && isReadOnlyInspection(command)) return { block: false };
+    const what = toolName === "bash" ? "command" : `${toolName} work`;
     return {
       block: true,
       reason:
-        `Fusion (strict): the main agent takes minimal direct action. Delegate this ${toolName} work to the sidekick ` +
-        "with the `sidekick` tool — give it a self-contained brief with exact paths and acceptance criteria — then verify its result.",
+        `Fusion (strict): the main agent takes minimal direct action. Delegate this ${what} to the sidekick ` +
+        "with the `sidekick` tool — a self-contained brief with exact paths, `acceptance` criteria and `verify` commands the harness runs afterwards. " +
+        (toolName === "bash" ? "bash is limited to read-only inspection here (git diff/status/log/show, head, wc, grep)." : ""),
     };
   }
   if (mode === "balanced" && isShell) {
@@ -210,6 +261,13 @@ export function nudgeText(streak: number): string {
   return (
     `[fusion] ${streak} direct tool calls in a row without delegating. You own the plan and the review; ` +
     "hand well-scoped recon, mechanical edits and verification to the sidekick (background: true lets you keep working)."
+  );
+}
+
+export function editNudgeText(files: number): string {
+  return (
+    `[fusion] You have edited ${files} files directly in this run. If the remaining edits are mechanical, brief the sidekick ` +
+    "with the exact change, `acceptance` criteria and `verify` commands, and keep the review for yourself."
   );
 }
 

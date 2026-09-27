@@ -201,13 +201,32 @@ Enable with `/fusion on` (on by default once configured). Open the menu with
 
    | Mode | Main agent | What goes to the sidekick |
    |---|---|---|
-   | `balanced` (default) | reads, edits, runs commands | a test, build, lint, typecheck or install command runs directly the first time; once it has proved slow (≥ 60 s) or verbose (> 8k chars) it is redirected with a ready-made `sidekick(...)` call; any direct command output over 8k chars is condensed by the sidekick's model (full log kept on disk); a nudge after 6 direct calls in a row |
-   | `strict` | read-only (`read`, `grep`, `find`, `ls`) + sidekick | everything that executes or edits — Devin's "minimal direct action" |
+   | `balanced` (default) | reads, edits, runs commands | a test, build, lint, typecheck or install command runs directly the first time; once it has proved slow (≥ 60 s) or verbose (> 8k chars) it is redirected with a ready-made `sidekick(...)` call; any direct command output over 8k chars is condensed by the sidekick's model (full log kept on disk); a nudge after 6 direct calls in a row, and one after direct edits to 4 files in a run |
+   | `strict` | read-only (`read`, `grep`, `find`, `ls`, and `bash` limited to inspection such as `git diff/status/log/show`, `head`, `wc`, `grep`) + sidekick | everything that executes or edits — Devin's "minimal direct action" |
    | `advisory` | everything | only what the model chooses (the old behaviour) |
 
    Switch with `/fusion mode strict|balanced|advisory` or in the `/fusion` menu.
-   If delegations fail twice in a row, the policy relaxes so the main agent is
-   never stuck.
+   If delegations fail twice in a row (an error, or a FAILED verdict), the
+   policy relaxes so the main agent is never stuck — in strict mode its
+   `bash`/`edit`/`write` come back, and strict returns with the next user
+   prompt after a delegation succeeds.
+
+   **The main agent owns planning, the spec and verification** (balanced and
+   strict):
+   - **Plan first**: for anything beyond a one-step change it writes a short
+     numbered plan, each step marked *(you)* or *(sidekick)*.
+   - **Spec as data**: a delegation carries `acceptance` criteria (the
+     sidekick must answer each one in a checklist) and `verify` commands.
+   - **Evidence, not claims**: after the sidekick finishes, the harness runs
+     the `verify` commands itself and puts a verdict first in the result —
+     `PASSED (checks 2/2 passed · acceptance 3/3 met)` or `FAILED (…)` — with
+     real exit codes and output tails, the acceptance tally, and the files the
+     sidekick changed (`+12 −3` from git). A FAILED verdict counts as a failed
+     delegation (for the relax rule and sidekick escalation).
+   - **Review gate**: if the sidekick changed files that the main agent has
+     not read or diffed since, the run is held once before it ends and the
+     main agent is asked to review them against the user's request
+     (`delegation.reviewGate`, on by default; at most one extra turn per run).
 
    Guard rails in every mode, for both agents:
    - **Commands that never exit** (dev servers, `--watch`, `tail -f`,
@@ -333,6 +352,8 @@ search, so it is left alone). Rebind it with `"shortcut"` in
 | `context` | Extra context the sidekick needs but cannot discover itself |
 | `files` | Files the sidekick should focus on |
 | `expect` | `summary` \| `diff` \| `evidence` \| `raw` — shape of the answer |
+| `acceptance` | Done-conditions, one per item; the sidekick answers each one and the harness tallies them |
+| `verify` | Up to 5 commands the harness runs itself after the sidekick finishes (e.g. `npm test -- parser`, `npx tsc --noEmit`); their exit codes decide the verdict |
 | `background` | `true` runs the delegation in parallel with the main agent; the result is delivered into the conversation when it finishes |
 
 `sidekick_wait` collects background results (all outstanding, or by id). A run
@@ -402,7 +423,9 @@ roles (`frontier` → main, `small` → sidekick):
     "slowCommandMs": 60000,
     "commandTimeoutSec": 600,
     "resultCapChars": 4000,
-    "briefContext": true
+    "briefContext": true,
+    "reviewGate": true,
+    "editNudgeFiles": 4
   },
   "sidekickPrompt": "optional override for the sidekick system prompt"
 }

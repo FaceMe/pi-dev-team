@@ -154,13 +154,13 @@ describe("main agent prompt stability", () => {
     expect(await section()).toContain("Mode: BALANCED");
     await rec.commands.get("fusion").handler("mode strict", ctx);
     // enforcement: live
-    expect((await fire("tool_call", { toolName: "bash", toolCallId: "1", input: { command: "ls" } })).block).toBe(true);
+    expect((await fire("tool_call", { toolName: "bash", toolCallId: "1", input: { command: "npm install x" } })).block).toBe(true);
     // prompt and tools: unchanged until compaction
     expect(await section()).toContain("Mode: BALANCED");
-    expect(rec.activeTools).toContain("bash");
+    expect(rec.activeTools).toContain("edit");
     await fire("session_compact", {});
     expect(await section()).toContain("Mode: STRICT");
-    expect(rec.activeTools).not.toContain("bash");
+    expect(rec.activeTools).not.toContain("edit");
   });
 
   it("applies a mode change to the prompt at once before the conversation starts", async () => {
@@ -168,7 +168,7 @@ describe("main agent prompt stability", () => {
     await fire("session_start", {});
     await rec.commands.get("fusion").handler("mode strict", ctx);
     expect(await section()).toContain("Mode: STRICT");
-    expect(rec.activeTools).not.toContain("bash");
+    expect(rec.activeTools).not.toContain("write");
   });
 });
 

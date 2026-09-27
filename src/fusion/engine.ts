@@ -44,6 +44,17 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { compressionPrompt, neverExits } from "./policy.js";
+import {
+  acceptanceInstructions,
+  changeSummary,
+  formatAcceptance,
+  formatChanges,
+  formatChecks,
+  MAX_CHECKS,
+  parseAcceptance,
+  runChecks,
+} from "./checks.js";
+import type { AcceptanceReport, CheckResult, FileChange } from "./checks.js";
 import { formatMeter, formatPercent, meterCells, UsageMeter } from "../shared/usage-meter.js";
 import type { MeterSnapshot } from "../shared/usage-meter.js";
 import type { DelegationMode } from "./policy.js";
@@ -85,6 +96,11 @@ export interface FusionStats {
   charsKeptOut: number;
   /** Times the sidekick's history was compacted (each costs one cold request). */
   sidekickCompactions: number;
+  /** Harness checks run after delegations, and how many failed. */
+  checksRun: number;
+  checksFailed: number;
+  /** Delegations whose verdict was "failed" (a check failed or a criterion was not met). */
+  rejected: number;
 }
 
 export interface BackgroundTask {
@@ -121,9 +137,20 @@ export interface DelegationInput {
   context?: string;
   files?: string[];
   expect?: "summary" | "diff" | "evidence" | "raw";
+  /** Criteria the result must meet; the sidekick answers each one and the harness tallies them. */
+  acceptance?: string[];
+  /** Commands the harness runs itself after the sidekick finishes (tests, typecheck, lint). */
+  verify?: string[];
   /** Context gathered by the harness (files the main agent read, git status). */
   harnessContext?: string;
 }
+
+/**
+ * The harness's view of a delegation: "passed" when every check passed and
+ * every criterion was reported met, "failed" when a check failed or a
+ * criterion was reported unmet, otherwise "unverified".
+ */
+export type DelegationVerdict = "passed" | "failed" | "unverified";
 
 export interface DelegationOutcome {
   text: string;
@@ -138,6 +165,14 @@ export interface DelegationOutcome {
   trace: TraceStep[];
   /** Where the full result was saved when it was longer than the cap. */
   fullTextPath?: string;
+  /** Files the sidekick edited or wrote (absolute paths). */
+  editedFiles?: string[];
+  /** Line counts for those files, from git. */
+  changes?: FileChange[];
+  /** Harness checks run after the sidekick finished. */
+  checks?: CheckResult[];
+  acceptance?: AcceptanceReport;
+  verdict?: DelegationVerdict;
 }
 
 const EXPECT_GUIDANCE: Record<NonNullable<DelegationInput["expect"]>, string> = {
@@ -337,8 +372,9 @@ export function buildMainGuidance(
 ): string {
   const modeRules: Record<DelegationMode, string[]> = {
     strict: [
-      "Mode: STRICT. You have read-only tools (read, grep, find, ls) plus the sidekick. Every command,",
-      "edit and file write goes through the sidekick; direct bash/edit/write calls are blocked.",
+      "Mode: STRICT. You have read, grep, find, ls, and bash for read-only inspection only (git diff/status/",
+      "log/show, head, wc, grep) plus the sidekick. Every other command, edit and file write goes through the",
+      "sidekick. If delegations fail twice in a row, your execution tools come back so you can finish.",
     ],
     balanced: [
       "Mode: BALANCED. You may run a test, build, lint or install command directly once; if it proves",
@@ -358,23 +394,34 @@ export function buildMainGuidance(
     `- Delegate with \`${toolName}\`; collect background results with \`${toolName}_wait\`.`,
     ...modeRules[mode].map((line) => `- ${line}`),
     "",
-    "Decision rule — before each action ask: is this judgement or labour?",
-    "- Judgement stays with you: the plan, interpreting ambiguous requirements, design choices,",
-    "  and the final review of the sidekick's work against the user's intent.",
-    "- Labour goes to the sidekick: running tests/builds/linters, reproducing a bug, recon across",
-    "  many files (\"find every caller of X\"), mechanical or multi-file edits from an exact brief,",
-    "  collecting and condensing verbose output, repetitive checks.",
-    "- Read directly only what you need to decide (a few targeted files or ranges).",
-    "",
-    "How to delegate well:",
-    "1. Briefs are self-contained: exact paths, the exact change or command, acceptance criteria and",
-    "   the shape of the answer you want. The sidekick cannot see this conversation.",
-    "2. Use background: true for anything slow (test suites, builds, broad recon) and keep working",
-    "   on something else; the result is delivered to you when it finishes. Do not duplicate it.",
-    `3. Before you report completion, call \`${toolName}_wait\` so no background work is outstanding.`,
-    "4. Verify what the sidekick reports (diffs, test output) before relying on it. If a delegation",
-    "   fails twice, do that piece yourself.",
+    "You own the judgement; the sidekick does the labour.",
+    "1. Plan. For anything beyond a one-step change, first write a short numbered plan: each step marked",
+    "   (you) or (sidekick), with how you will know it is done. Resolve ambiguity with the user before",
+    "   delegating; interpreting requirements and design choices stay with you.",
+    "2. Specify. A brief is self-contained (the sidekick cannot see this conversation): exact paths, the",
+    "   exact change or command, and the answer shape. Put the done-conditions in `acceptance` (the",
+    "   sidekick must answer each one) and the commands that prove it in `verify` (the harness runs them",
+    "   itself afterwards and shows you the real exit codes).",
+    "3. Delegate labour: tests/builds/linters, reproducing a bug, recon across many files, mechanical or",
+    "   multi-file edits from an exact brief, condensing verbose output. Read directly only what you need",
+    "   to decide. Use background: true for slow work and keep working; do not duplicate it.",
+    "4. Verify. Treat the sidekick's report as a claim. A result starts with a verdict line: FAILED means",
+    "   fix it or re-delegate with the failure evidence; PASSED still needs your review of the change",
+    "   (`git diff -- <files>`) against the user's intent. Never report success you have not seen evidence for.",
+    `5. Before you finish, call \`${toolName}_wait\` so no background work is outstanding.`,
   ].join("\n");
+}
+
+function cleanList(items?: string[]): string[] {
+  return (items ?? []).map((item) => String(item ?? "").trim()).filter(Boolean);
+}
+
+function safeRead(file: string): string | undefined {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return undefined;
+  }
 }
 
 function loadLifetime(): LifetimeStats {
@@ -402,6 +449,9 @@ function freshStats(): FusionStats {
     compressed: 0,
     charsKeptOut: 0,
     sidekickCompactions: 0,
+    checksRun: 0,
+    checksFailed: 0,
+    rejected: 0,
   };
 }
 
@@ -645,6 +695,16 @@ export class FusionEngine {
     if (input.context?.trim()) parts.push(`## Context from the main agent\n${input.context.trim()}`);
     if (input.files?.length) parts.push(`## Focus files\n${input.files.map((file) => `- ${file}`).join("\n")}`);
     if (input.expect) parts.push(`## Expected response\n${EXPECT_GUIDANCE[input.expect]}`);
+    const acceptance = cleanList(input.acceptance);
+    if (acceptance.length) parts.push(`## Acceptance criteria\n${acceptanceInstructions(acceptance)}`);
+    const verify = cleanList(input.verify).slice(0, MAX_CHECKS);
+    if (verify.length) {
+      parts.push(
+        "## Checks the harness will run after you finish\n" +
+          verify.map((c) => `- \`${c}\``).join("\n") +
+          "\nRun them yourself before you report and make them pass. Their real results are shown to the main agent next to your report.",
+      );
+    }
     if (input.harnessContext?.trim()) parts.push(`## Context gathered by the harness\n${input.harnessContext.trim()}`);
     parts.push(
       "Work autonomously with your own tools and report back when done. " +
@@ -660,10 +720,11 @@ export class FusionEngine {
     onStart?: () => void,
     onTool?: (toolName: string, args: Record<string, unknown>) => void,
   ): Promise<DelegationOutcome> {
-    const run = this.queue.then(() => {
+    const run = this.queue.then(async () => {
       if (signal?.aborted) return this.cancelledOutcome();
       onStart?.();
-      return this.runDelegation(input, signal, onTool);
+      const outcome = await this.runDelegation(input, signal, onTool);
+      return this.addEvidence(outcome, input, signal);
     });
     this.queue = run.catch(() => undefined);
     return run;
@@ -832,6 +893,7 @@ export class FusionEngine {
 
     this.activity = [];
     this.turnCounter = 0;
+    const edited = new Set<string>();
     const startIndex = agent.state.messages.length;
     const usage = emptyUsage();
 
@@ -845,6 +907,10 @@ export class FusionEngine {
       } else if (event.type === "tool_execution_start") {
         this.activity.push(describeActivity(event.toolName, event.args));
         if (this.activity.length > 12) this.activity.shift();
+        if (event.toolName === "edit" || event.toolName === "write") {
+          const target = String((event.args as any)?.path ?? (event.args as any)?.file_path ?? "");
+          if (target) edited.add(path.resolve(this.cwd, target));
+        }
         onTool?.(event.toolName, (event.args ?? {}) as Record<string, unknown>);
       }
     });
@@ -944,7 +1010,71 @@ export class FusionEngine {
       meta,
       trace,
       fullTextPath: capped.path,
+      editedFiles: [...edited],
     };
+  }
+
+  /**
+   * Evidence the sidekick cannot shape: what it changed (git), the checks the
+   * main agent asked for (run by the harness), and the tally of its answers to
+   * the acceptance criteria. Added after the result cap so it is never cut,
+   * with a one-line verdict first.
+   */
+  async addEvidence(outcome: DelegationOutcome, input: DelegationInput, signal?: AbortSignal): Promise<DelegationOutcome> {
+    if (outcome.isError || signal?.aborted) return outcome;
+    const acceptance = cleanList(input.acceptance);
+    const verify = cleanList(input.verify);
+    const sections: string[] = [];
+
+    if (outcome.editedFiles?.length) {
+      outcome.changes = await changeSummary(outcome.editedFiles, this.cwd);
+      const rel = outcome.changes.map((c) => c.file);
+      sections.push(`## Files the sidekick changed\n${formatChanges(outcome.changes)}\nReview: \`git diff -- ${rel.join(" ")}\``);
+    }
+    if (verify.length) {
+      const timeout = this.config.delegation?.commandTimeoutSec ?? 600;
+      outcome.checks = await runChecks(verify, this.cwd, timeout, signal);
+      this.stats.checksRun += outcome.checks.length;
+      this.stats.checksFailed += outcome.checks.filter((c) => !c.passed).length;
+      sections.push(formatChecks(outcome.checks));
+    }
+    if (acceptance.length) {
+      // Parse the full text: the cap may have cut the checklist at the end.
+      const full = outcome.fullTextPath ? safeRead(outcome.fullTextPath) ?? outcome.text : outcome.text;
+      outcome.acceptance = parseAcceptance(full, acceptance);
+      sections.push(formatAcceptance(outcome.acceptance));
+    }
+    if (!verify.length && !acceptance.length) {
+      outcome.verdict = "unverified";
+      if (sections.length) outcome.text = `${outcome.text}\n\n${sections.join("\n\n")}`;
+      return outcome;
+    }
+
+    const checksFailed = outcome.checks?.filter((c) => !c.passed).length ?? 0;
+    const unmet = outcome.acceptance?.criteria.filter((c) => c.state === "unmet").length ?? 0;
+    const unreported = outcome.acceptance?.criteria.filter((c) => c.state === "unreported").length ?? 0;
+    outcome.verdict = checksFailed > 0 || unmet > 0 ? "failed" : unreported > 0 ? "unverified" : "passed";
+
+    const summary = [
+      outcome.checks?.length ? `checks ${outcome.checks.length - checksFailed}/${outcome.checks.length} passed` : "",
+      outcome.acceptance ? `acceptance ${outcome.acceptance.met}/${outcome.acceptance.total} met` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    const headline =
+      outcome.verdict === "passed"
+        ? `[${EXTENSION_TAG}] verdict: PASSED (${summary}). Still review the change against the user's intent.`
+        : outcome.verdict === "failed"
+          ? `[${EXTENSION_TAG}] verdict: FAILED (${summary}). Do not rely on this result: fix it, re-delegate with the failure evidence, or report the blocker.`
+          : `[${EXTENSION_TAG}] verdict: UNVERIFIED (${summary}; some criteria were not answered). Check them yourself.`;
+    outcome.text = `${headline}\n\n${outcome.text}\n\n${sections.join("\n\n")}`;
+    outcome.meta = `${outcome.meta} · ${summary}`;
+    if (outcome.verdict === "failed") {
+      this.stats.rejected += 1;
+      // A delegation that did not meet its spec counts towards escalation.
+      this.consecutiveFailures += 1;
+    }
+    return outcome;
   }
 
   /**
@@ -1204,6 +1334,7 @@ export class FusionEngine {
       this.stats.delegations ? `${this.stats.delegations} delegated` : "",
       pending ? `${pending} running` : "",
       this.stats.failures ? `${this.stats.failures} failed` : "",
+      this.stats.rejected ? `${this.stats.rejected} rejected` : "",
       m.main.requests + m.sidekick.requests > 0 ? formatCost(total) : "",
     ]
       .filter(Boolean)
@@ -1244,6 +1375,9 @@ export class FusionEngine {
       `mode ${this.config.delegation?.mode ?? "balanced"}  ·  delegated ${(this.delegationRate() * 100).toFixed(0)}% of work  ·  ` +
         `redirected ${this.stats.redirected}  ·  compressed ${this.stats.compressed}` +
         `${pending ? `  ·  ${pending} running in background` : ""}`,
+      ...(this.stats.checksRun || this.stats.rejected
+        ? [`harness checks ${this.stats.checksRun - this.stats.checksFailed}/${this.stats.checksRun} passed  ·  ${this.stats.rejected} delegation(s) rejected`]
+        : []),
     ];
   }
 
@@ -1271,6 +1405,9 @@ export class FusionEngine {
       compressed: this.stats.compressed,
       charsKeptOut: this.stats.charsKeptOut,
       sidekickCompactions: this.stats.sidekickCompactions,
+      checksRun: this.stats.checksRun,
+      checksFailed: this.stats.checksFailed,
+      rejected: this.stats.rejected,
       lifetime: { ...this.lifetime },
     };
   }
