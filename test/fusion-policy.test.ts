@@ -58,8 +58,14 @@ describe("direct-call decisions", () => {
     }
   });
 
-  it("strict blocks every execution tool; advisory blocks nothing", () => {
-    for (const tool of ["bash", "edit", "write"]) expect(decideDirectCall("strict", tool, { command: "ls" }, fresh(), true).block).toBe(true);
+  it("strict blocks every execution tool except read-only inspection; advisory blocks nothing", () => {
+    for (const tool of ["bash", "edit", "write"]) expect(decideDirectCall("strict", tool, { command: "npm run build" }, fresh(), true).block).toBe(true);
+    for (const command of ["git diff -- src/a.ts", "git status --short", "git log --oneline -5 | head -3"]) {
+      expect(decideDirectCall("strict", "bash", { command }, fresh(), true).block, command).toBe(false);
+    }
+    for (const command of ["git diff > x.patch", "git status & rm -rf x", "git checkout .", "rm -rf dist"]) {
+      expect(decideDirectCall("strict", "bash", { command }, fresh(), true).block, command).toBe(true);
+    }
     expect(decideDirectCall("strict", "read", { path: "a" }, fresh(), true).block).toBe(false);
     expect(decideDirectCall("advisory", "bash", { command: "npm test" }, fresh(), true).block).toBe(false);
   });
@@ -135,10 +141,10 @@ describe("fusion extension with the policy", () => {
     expect(rec.activeTools).toEqual(expect.arrayContaining(["bash", "sidekick", "sidekick_wait"]));
   });
 
-  it("strict mode removes execution tools from the main agent and restores them when switched off", async () => {
+  it("strict mode removes editing tools from the main agent (bash stays for inspection) and restores them when switched off", async () => {
     const { rec, fire, ctx } = boot("strict");
     await fire("session_start", {});
-    expect(rec.activeTools.sort()).toEqual(["read", "sidekick", "sidekick_wait"]);
+    expect(rec.activeTools.sort()).toEqual(["bash", "read", "sidekick", "sidekick_wait"]);
     await rec.commands.get("fusion").handler("mode balanced", ctx);
     expect(rec.activeTools).toEqual(expect.arrayContaining(["bash", "edit", "write", "sidekick"]));
     expect(loadFusionConfig().delegation.mode).toBe("balanced");
@@ -293,7 +299,10 @@ describe("fusion extension with the policy", () => {
     const options: any = { sections: {} };
     await fire("before_agent_start", { systemPromptOptions: options });
     expect(options.sections.fusion).toContain("Mode: STRICT");
-    expect(options.sections.fusion).toContain("judgement or labour");
+    expect(options.sections.fusion).toContain("You own the judgement");
+    expect(options.sections.fusion).toContain("read-only inspection");
+    expect(options.sections.fusion).toMatch(/1\. Plan\./);
+    expect(options.sections.fusion).toContain("`verify`");
     expect(options.sections.fusion).toContain("sidekick_wait");
   });
 });

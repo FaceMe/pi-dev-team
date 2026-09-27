@@ -233,10 +233,11 @@ function normalizeDelegation(raw: any): DelegationConfig {
     if (["advisory", "balanced", "strict"].includes(raw.mode)) d.mode = raw.mode;
     if (Number.isFinite(raw.nudgeAfter) && raw.nudgeAfter >= 0) d.nudgeAfter = Math.floor(raw.nudgeAfter);
     if (Number.isFinite(raw.compressOutputChars) && raw.compressOutputChars >= 0) d.compressOutputChars = Math.floor(raw.compressOutputChars);
-    for (const key of ["slowCommandMs", "commandTimeoutSec", "resultCapChars"] as const) {
+    for (const key of ["slowCommandMs", "commandTimeoutSec", "resultCapChars", "editNudgeFiles"] as const) {
       if (Number.isFinite(raw[key]) && raw[key] >= 0) d[key] = Math.floor(raw[key]);
     }
     if (typeof raw.briefContext === "boolean") d.briefContext = raw.briefContext;
+    if (typeof raw.reviewGate === "boolean") d.reviewGate = raw.reviewGate;
   }
   return d;
 }
