@@ -55,6 +55,13 @@ import {
   runChecks,
 } from "./checks.js";
 import type { AcceptanceReport, CheckResult, FileChange } from "./checks.js";
+import {
+  TASK_HISTORY_ENTRY,
+  TASK_HISTORY_SCHEMA_VERSION,
+  isTerminalStatus,
+  parseTaskHistoryRecord,
+} from "./history.js";
+import type { TaskCheckEvidence, TaskHistoryRecord, TaskHistorySessionManager, TaskStatus } from "./history.js";
 import { formatMeter, formatPercent, meterCells, UsageMeter } from "../shared/usage-meter.js";
 import type { MeterSnapshot } from "../shared/usage-meter.js";
 import type { DelegationMode } from "./policy.js";
@@ -143,6 +150,8 @@ export interface DelegationInput {
   verify?: string[];
   /** Context gathered by the harness (files the main agent read, git status). */
   harnessContext?: string;
+  /** Extension tool-call id of this delegation, for task-history correlation. */
+  toolCallId?: string;
 }
 
 /**
@@ -154,6 +163,8 @@ export type DelegationVerdict = "passed" | "failed" | "unverified";
 
 export interface DelegationOutcome {
   text: string;
+  /** Full uncapped result text, archived in the task history. */
+  fullText?: string;
   usage: Usage;
   turns: number;
   isError: boolean;
@@ -483,6 +494,10 @@ export class FusionEngine {
   private consecutiveFailures = 0;
   private queue: Promise<unknown> = Promise.resolve();
   private taskCounter = 0;
+  /** Prevent late background completions from writing into a replacement session. */
+  private disposed = false;
+  /** Archived delegations of this session by id. Kept independently of background tasks and stats; survives resets. */
+  private taskHistory = new Map<string, TaskHistoryRecord>();
   /** Background delegations of this session, by id. */
   readonly tasks = new Map<string, BackgroundTask>();
   /** Stable id so cache-aware providers keep the sidekick's prefix warm across delegations. */
@@ -665,6 +680,7 @@ export class FusionEngine {
     if (options.record) this.pi.appendEntry("fusion-sidekick", { ...this.config.sidekick });
   }
 
+  /** Drop the sidekick agent and its cached context; the task history is preserved. */
   resetSidekick(): void {
     const agent = this.agent;
     this.agent = undefined;
@@ -679,12 +695,158 @@ export class FusionEngine {
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.onUsage = undefined;
     const agent = this.agent;
     this.agent = undefined;
     try {
       agent?.abort();
     } catch {
       /* ignore */
+    }
+  }
+
+  // -- task history --------------------------------------------------------
+
+  private nextDelegationId(): string {
+    this.taskCounter += 1;
+    return `D${this.taskCounter}`;
+  }
+
+  /** Begin a history record for a delegation and persist its snapshot. */
+  private beginHistory(
+    input: DelegationInput,
+    options: { id?: string; status?: TaskStatus; background?: boolean } = {},
+  ): TaskHistoryRecord {
+    const model = this.resolveSidekickModel();
+    const record: TaskHistoryRecord = {
+      schema: TASK_HISTORY_SCHEMA_VERSION,
+      id: options.id ?? this.nextDelegationId(),
+      agent: "sidekick",
+      task: input.task,
+      status: options.status ?? "queued",
+      startedAt: Date.now(),
+      model: model ? modelKey(model) : undefined,
+      background: options.background,
+      toolCallId: input.toolCallId,
+      context: input.context,
+      files: input.files ? [...input.files] : undefined,
+      acceptance: input.acceptance ? [...input.acceptance] : undefined,
+      verify: input.verify ? [...input.verify] : undefined,
+    };
+    this.archiveTask(record);
+    return record;
+  }
+
+  /** Archive a record: stored as a custom entry (never in the LLM context); latest snapshot per id wins. */
+  private archiveTask(record: TaskHistoryRecord): void {
+    this.taskHistory.set(record.id, record);
+    if (this.disposed) return;
+    try {
+      // Deep immutable snapshot: stored entries never alias the live record.
+      this.pi.appendEntry(TASK_HISTORY_ENTRY, structuredClone(record));
+    } catch (error) {
+      console.error(`[${EXTENSION_TAG}] failed to archive task history for ${record.id}:`, error);
+    }
+  }
+
+  private markHistory(record: TaskHistoryRecord, status: TaskStatus, patch: Partial<TaskHistoryRecord> = {}): void {
+    // Terminal states can only be enriched (same status), never flipped.
+    if (isTerminalStatus(record.status) && record.status !== status) return;
+    Object.assign(record, patch, { status });
+    if (isTerminalStatus(status)) record.endedAt = patch.endedAt ?? record.endedAt ?? Date.now();
+    this.archiveTask(record);
+  }
+
+  /** Terminal state for one delegation, derived from its outcome. */
+  private finishHistory(record: TaskHistoryRecord, outcome: DelegationOutcome, signal?: AbortSignal): void {
+    const cancelled = record.status === "cancelled" || signal?.aborted;
+    if (isTerminalStatus(record.status) && !cancelled) return;
+    // A queued cancellation has no work to add; a running cancellation may
+    // still have partial output and a trace worth preserving.
+    if (record.status === "cancelled" && !outcome.fullText && !outcome.text && !outcome.trace?.length) return;
+    const failed = outcome.isError || outcome.verdict === "failed";
+    const status: TaskStatus = cancelled ? "cancelled" : failed ? "failed" : "done";
+    const evidence: TaskCheckEvidence = {
+      checksRun: outcome.checks?.length,
+      checksFailed: outcome.checks?.filter((c) => !c.passed).length,
+      acceptanceMet: outcome.acceptance?.met,
+      acceptanceTotal: outcome.acceptance?.total,
+      verdict: outcome.verdict,
+    };
+    Object.assign(record, {
+      status,
+      endedAt: record.endedAt ?? Date.now(),
+      model: outcome.model ?? record.model,
+      meta: outcome.meta,
+      result: outcome.fullText ?? (outcome.text || record.result),
+      error: outcome.isError ? outcome.errorMessage ?? record.error ?? "delegation failed" : cancelled ? record.error : undefined,
+      evidence,
+      trace: outcome.trace ?? record.trace ?? [],
+    });
+    this.archiveTask(record);
+  }
+
+  /** Live sidekick task history for this session, oldest first. */
+  get taskRecords(): TaskHistoryRecord[] {
+    return [...this.taskHistory.values()].sort(
+      (a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id, "en", { numeric: true }),
+    );
+  }
+
+  /**
+   * Restore archived delegations of this session. Only records on the current
+   * branch are restored; every history id in the session file (including
+   * abandoned branches) raises the id counter so new delegations stay unique
+   * after branching. Previously unfinished records are marked interrupted —
+   * nothing is restarted and Fusion is not re-enabled by this.
+   */
+  restoreTaskHistory(ctx: { sessionManager?: TaskHistorySessionManager }): void {
+    const session = ctx.sessionManager ?? {};
+    const branch = session.getBranch?.() ?? session.getEntries?.() ?? [];
+    const all = session.getEntries?.() ?? branch;
+    // Reserve every delegation id in the session file — history snapshots,
+    // legacy background launches and deliveries — so new work never collides.
+    let maxSeq = this.taskCounter;
+    const reserve = (raw: unknown): void => {
+      const match = String(raw ?? "").match(/^D?(\d+)$/);
+      const seq = match ? Number(match[1]) : 0;
+      if (Number.isSafeInteger(seq) && seq > maxSeq) maxSeq = seq;
+    };
+    for (const entry of all) {
+      const data = (entry?.data ?? {}) as any;
+      const message = entry?.message;
+      const details = (entry?.details ?? message?.details ?? data.details ?? {}) as any;
+      if (entry?.type === "custom" && entry?.customType === TASK_HISTORY_ENTRY) reserve(data?.id);
+      if (entry?.customType === "fusion-result" || message?.customType === "fusion-result") {
+        for (const part of String(details?.id ?? "").split(",")) reserve(part.trim());
+      }
+      if (message?.toolName === "sidekick" && details.background) reserve(details.id);
+      if (message?.toolName === "sidekick_wait" && Array.isArray(details.ids)) {
+        for (const id of details.ids) reserve(id);
+      }
+      const raw = message?.content ?? entry?.content ?? data.content;
+      const text = typeof raw === "string" ? raw : Array.isArray(raw) ? raw.map((b: any) => String(b?.text ?? "")).join("\n") : "";
+      const launch = text.match(/Started background delegation D(\d+)/);
+      if (launch) reserve(launch[1]);
+    }
+    // Restore only the latest valid snapshots on the current branch, into a
+    // fresh map (stale live records from an earlier restore are dropped).
+    const restored = new Map<string, TaskHistoryRecord>();
+    for (const entry of branch) {
+      if (!entry || entry.type !== "custom" || entry.customType !== TASK_HISTORY_ENTRY) continue;
+      const record = parseTaskHistoryRecord(entry.data);
+      if (!record || record.agent !== "sidekick") continue;
+      restored.set(record.id, record); // latest wins
+    }
+    this.taskHistory = restored;
+    this.taskCounter = Math.max(this.taskCounter, maxSeq);
+    for (const record of this.taskRecords) {
+      if (record.status === "queued" || record.status === "running") {
+        this.markHistory(record, "interrupted", {
+          meta: record.meta ?? "interrupted: the session ended before this delegation finished",
+        });
+      }
     }
   }
 
@@ -713,18 +875,36 @@ export class FusionEngine {
     return parts.join("\n\n");
   }
 
-  /** Serialized so parallel tool calls from the main agent queue up safely. */
+  /**
+   * Serialized so parallel tool calls from the main agent queue up safely.
+   * `history.record` continues a record begun by startBackground, so a
+   * background delegation gets exactly one id and one archived record.
+   */
   delegate(
     input: DelegationInput,
     signal?: AbortSignal,
     onStart?: () => void,
     onTool?: (toolName: string, args: Record<string, unknown>) => void,
+    history?: { record?: TaskHistoryRecord },
   ): Promise<DelegationOutcome> {
+    const record = history?.record ?? this.beginHistory(input);
     const run = this.queue.then(async () => {
-      if (signal?.aborted) return this.cancelledOutcome();
-      onStart?.();
-      const outcome = await this.runDelegation(input, signal, onTool);
-      return this.addEvidence(outcome, input, signal);
+      try {
+        if (signal?.aborted) {
+          this.markHistory(record, "cancelled", { error: "cancelled before the delegation started" });
+          return this.cancelledOutcome();
+        }
+        this.markHistory(record, "running");
+        onStart?.();
+        const outcome = await this.runDelegation(input, signal, onTool);
+        const result = await this.addEvidence(outcome, input, signal);
+        this.finishHistory(record, result, signal);
+        return result;
+      } catch (error) {
+        // Unexpected harness errors must still close the record.
+        this.markHistory(record, signal?.aborted ? "cancelled" : "failed", { error: error instanceof Error ? error.message : String(error) });
+        throw error;
+      }
     });
     this.queue = run.catch(() => undefined);
     return run;
@@ -735,9 +915,10 @@ export class FusionEngine {
    * the sidekick runs. `onDone` fires when it finishes (to deliver the result).
    */
   startBackground(input: DelegationInput, onDone?: (task: BackgroundTask) => void): BackgroundTask {
-    this.taskCounter += 1;
-    const id = `D${this.taskCounter}`;
+    const id = this.nextDelegationId();
     const controller = new AbortController();
+    // One record per delegation: queued -> running -> done/failed/cancelled.
+    const record = this.beginHistory(input, { id, status: "queued", background: true });
     const task: BackgroundTask = {
       id,
       task: truncate(input.task, 200),
@@ -747,12 +928,21 @@ export class FusionEngine {
       leases: new Set(),
       promise: Promise.resolve(undefined as unknown as DelegationOutcome),
     };
+    const notifyDone = (): void => {
+      try { onDone?.(task); }
+      catch (error) {
+        // Delivery/UI failures are not delegation failures. Keep the terminal
+        // outcome intact and never invoke the completion callback twice.
+        console.error(`[${EXTENSION_TAG}] failed to deliver ${id}:`, error);
+      }
+    };
     // Files named in the brief are leased up front when the sidekick can edit.
     if (this.canEdit()) for (const file of input.files ?? []) task.leases.add(path.resolve(this.cwd, file));
     task.promise = this.delegate(
       input,
       controller.signal,
       () => {
+        // delegate() archives the running snapshot; this only tracks the task.
         if (task.status === "queued") task.status = "running";
       },
       (toolName, args) => {
@@ -760,13 +950,24 @@ export class FusionEngine {
         const target = String(args.path ?? args.file_path ?? "");
         if (target) task.leases.add(path.resolve(this.cwd, target));
       },
+      { record },
     ).then((outcome) => {
       task.outcome = outcome;
-      if (task.status !== "cancelled") {
-        task.status = outcome.isError ? "failed" : "done";
-        onDone?.(task);
-      }
       task.leases.clear();
+      if (task.status !== "cancelled") {
+        task.status = outcome.isError || outcome.verdict === "failed" ? "failed" : "done";
+        notifyDone();
+      }
+      return outcome;
+    }).catch((error) => {
+      task.leases.clear();
+      const message = error instanceof Error ? error.message : String(error);
+      const cancelled = task.status === "cancelled" || controller.signal.aborted;
+      task.status = cancelled ? "cancelled" : "failed";
+      this.markHistory(record, task.status, { error: message });
+      const outcome: DelegationOutcome = { ...this.cancelledOutcome(), errorMessage: message, meta: task.status };
+      task.outcome = outcome;
+      if (!cancelled) notifyDone();
       return outcome;
     });
     this.tasks.set(id, task);
@@ -805,6 +1006,8 @@ export class FusionEngine {
       task.collected = true;
       task.leases.clear();
       task.controller.abort();
+      const record = this.taskHistory.get(task.id);
+      if (record) this.markHistory(record, "cancelled", { error: "cancelled" });
       cancelled.push(task.id);
     }
     return cancelled;
@@ -957,6 +1160,9 @@ export class FusionEngine {
         `\n\n[${EXTENSION_TAG}] sidekick hit its ${this.config.limits.maxTurns}-turn cap; ` +
         "the result above may be incomplete.";
     }
+    // Archive the full result before the tool cap: the task history must not
+    // depend on the temporary fullTextPath file still existing later.
+    const fullText = text;
     const capped = this.capResult(text);
     text = capped.text;
     // Compact rarely: only when the last prompt filled a good part of the
@@ -1009,6 +1215,7 @@ export class FusionEngine {
       hitTurnCap,
       meta,
       trace,
+      fullText,
       fullTextPath: capped.path,
       editedFiles: [...edited],
     };
@@ -1040,13 +1247,17 @@ export class FusionEngine {
     }
     if (acceptance.length) {
       // Parse the full text: the cap may have cut the checklist at the end.
-      const full = outcome.fullTextPath ? safeRead(outcome.fullTextPath) ?? outcome.text : outcome.text;
+      // Prefer the archived full text over the temporary full-text file.
+      const full = outcome.fullText ?? (outcome.fullTextPath ? safeRead(outcome.fullTextPath) : undefined) ?? outcome.text;
       outcome.acceptance = parseAcceptance(full, acceptance);
       sections.push(formatAcceptance(outcome.acceptance));
     }
     if (!verify.length && !acceptance.length) {
       outcome.verdict = "unverified";
-      if (sections.length) outcome.text = `${outcome.text}\n\n${sections.join("\n\n")}`;
+      if (sections.length) {
+        outcome.text = `${outcome.text}\n\n${sections.join("\n\n")}`;
+        if (outcome.fullText !== undefined) outcome.fullText = `${outcome.fullText}\n\n${sections.join("\n\n")}`;
+      }
       return outcome;
     }
 
@@ -1068,6 +1279,7 @@ export class FusionEngine {
           ? `[${EXTENSION_TAG}] verdict: FAILED (${summary}). Do not rely on this result: fix it, re-delegate with the failure evidence, or report the blocker.`
           : `[${EXTENSION_TAG}] verdict: UNVERIFIED (${summary}; some criteria were not answered). Check them yourself.`;
     outcome.text = `${headline}\n\n${outcome.text}\n\n${sections.join("\n\n")}`;
+    if (outcome.fullText !== undefined) outcome.fullText = `${headline}\n\n${outcome.fullText}\n\n${sections.join("\n\n")}`;
     outcome.meta = `${outcome.meta} · ${summary}`;
     if (outcome.verdict === "failed") {
       this.stats.rejected += 1;
@@ -1412,6 +1624,7 @@ export class FusionEngine {
     };
   }
 
+  /** Reset counters and meters; the task history archive is preserved. */
   resetSessionStats(): void {
     this.stats = freshStats();
     this.meters.main.reset();

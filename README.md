@@ -190,8 +190,10 @@ session) delegates well-scoped work to a cheaper **sidekick** agent that keeps
 its own transcript and its own tools — so the expensive prefix is not re-sent on
 every call the way a stateless "ask another model" tool would.
 
-Enable with `/fusion on` (on by default once configured). Open the menu with
-`/fusion` or `Ctrl+Shift+D`.
+Fusion starts **off** whenever pi loads (including `/reload` and resumed
+sessions), even if it was enabled before. Enable it explicitly with `/fusion on`.
+The live stats widget and footer status are hidden while Fusion is off. Open the
+menu with `/fusion` or `Ctrl+Shift+D`.
 
 ### How it works
 
@@ -324,19 +326,20 @@ survives until you explicitly enable Fusion.
 
 | Command | Action |
 |---|---|
-| `/fusion` | Interactive menu: main/sidekick models, sidekick tools, routing, state, stats |
+| `/fusion` | Interactive menu: main/sidekick models, sidekick tools, routing, state, stats, task history |
 | `/fusion main [model]` | Select or set the main (frontier) agent model via the Model Picker |
 | `/fusion sidekick [model]` | Select or set the sidekick (cheap) agent model via the Model Picker |
 | `/fusion mode [strict\|balanced\|advisory]` | Show or set how strongly the main agent is made to delegate |
 | `/fusion widget [compact\|full\|off]` | Compact live meters (default), the detailed view, or no widget |
 | `/fusion tasks` | List background delegations with status, elapsed time and the files they are editing |
+| `/fusion history [all\|main\|sidekick]` | View all task history in the current session's active branch, with full requests/results on expansion (also available while Fusion is off) |
 | `/fusion cancel [id…\|all]` | Cancel background delegations (queued or running) |
 | `/fusion on` | Enable Fusion: activate the sidekick tool + prompt section and switch the session model to the fusion main slot (idempotent — re-run to re-sync) |
 | `/fusion off` | Disable Fusion: remove the tool and prompt section and restore your pre-Fusion model (unless you picked a model yourself meanwhile) |
 | `/fusion stats` | Session + lifetime cost/savings report in the transcript |
 | `/fusion trace` | Dump the latest delegation's log (thinking, tool calls, outputs) into the transcript as an expandable entry |
 | `/fusion route` | Classify the current task now and apply the routing decision |
-| `/fusion reset` | Drop the sidekick's context and reset session stats |
+| `/fusion reset` | Drop the sidekick's context and reset session stats, keeping task history |
 | `Ctrl+Shift+D` | Open the Fusion menu |
 
 The menu shortcut is `Ctrl+Shift+D` (`ctrl+shift+f` is pi's built-in alt-screen
@@ -385,6 +388,23 @@ It is hidden by default — three ways to see it on demand:
 - **Failed delegations** embed a compact tail of the last steps in the error
   itself, so the failure context is visible without any extra step.
 
+### Current-session task history
+
+Run `/fusion history` (or select **session task history** in the Fusion menu)
+to list every main-agent request and foreground/background sidekick delegation
+on the current session's active branch, including tasks from before compaction.
+Use `/fusion history main` or `/fusion history sidekick` to filter by agent.
+Expand the history entry with pi's tool-expand key to see full requests, results,
+errors, brief inputs, verification commands and recorded delegation traces.
+
+History is available while Fusion is **off** and survives `/fusion reset`,
+`/reload`, and resuming that same session. It is stored in pi's session, not in a
+cross-session history file, and is never added to model context. New sidekick
+results are archived before output capping, so their full text remains available
+even if the temporary result file is removed. Older delegations are reconstructed
+from saved messages; omitted content cannot be recovered. Traces retain their
+existing bounded excerpts. Use `/tree` to view a different branch's history.
+
 ### Cost accounting
 
 Each delegation is priced twice: once at the sidekick's real rates, and once at
@@ -403,7 +423,7 @@ roles (`frontier` → main, `small` → sidekick):
 
 ```json
 {
-  "enabled": true,
+  "enabled": false,
   "main": { "provider": "openai-codex", "modelId": "gpt-6-astra", "effort": "high" },
   "sidekick": { "provider": "antigravity", "modelId": "gemini-3.8-flash", "effort": "low" },
   "sidekickTools": ["read", "grep", "find", "ls", "bash"],
@@ -430,6 +450,10 @@ roles (`frontier` → main, `small` → sidekick):
   "sidekickPrompt": "optional override for the sidekick system prompt"
 }
 ```
+
+`enabled` is a live session toggle, not an auto-start preference: ordinary pi
+sessions always start off, even if an older config saved `enabled: true`.
+Factory workers explicitly configured to use a sidekick remain opted in.
 
 `routing.mode` selects the classifier: `llm` (a cheap model scores the task and
 falls back to the heuristic on any failure), `heuristic` (keyword/regex signals

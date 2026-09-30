@@ -89,12 +89,20 @@ afterAll(async () => {
   await server?.close();
 });
 
-function runPi(prompt: string | string[], cwd: string): Promise<string> {
+function runPi(prompt: string | string[], cwd: string, options: { fusionOn?: boolean } = {}): Promise<string> {
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(process.env)) if (!/^(AWS_|ANTHROPIC_|OPENAI_|GEMINI_|GOOGLE_|AZURE_)/.test(k)) env[k] = v;
   Object.assign(env, { PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" });
   return new Promise((resolve, reject) => {
-    const prompts = Array.isArray(prompt) ? prompt : [prompt];
+    // Fusion defaults to off every session; tests that exercise enabled
+    // behaviour opt in explicitly with /fusion on (the default-off regression
+    // passes fusionOn: false).
+    const prompts =
+      options.fusionOn === false
+        ? Array.isArray(prompt)
+          ? prompt
+          : [prompt]
+        : ["/fusion on", ...(Array.isArray(prompt) ? prompt : [prompt])];
     const child = spawn(process.execPath, [piCli, "--mode", "json", "-p", "--no-session", "--model", "mock/main", ...prompts], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     let err = "";
@@ -206,5 +214,32 @@ describe.skipIf(!fs.existsSync(piCli))("fusion in a real pi session", () => {
     const assistants = events.filter((e: any) => e.type === "message_end" && e.message?.role === "assistant").map((e: any) => JSON.stringify(e.message.content));
     expect(assistants.at(-1)).toContain("MAIN REVIEWED");
     expect(assistants.at(-1)).toContain("3 passing");
+  }, 180_000);
+
+  it("keeps fusion off on startup despite a saved enabled:true until /fusion on", async () => {
+    const before = server.requests.length;
+    const out = await runPi("Run the tests and tell me the result.", tempDir("fusion-default-off-"), { fusionOn: false });
+    const events = out.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    // The tools are registered, but remain inactive and are never called.
+    expect(events.find((e: any) => e.type === "tool_execution_end" && (e.toolName === "sidekick" || e.toolName === "sidekick_wait"))).toBeUndefined();
+    // And the sidekick model was never used (no delegation, condensing or routing).
+    const requests = server.requests.slice(before);
+    expect(requests.filter((r) => r.model === "cheap")).toHaveLength(0);
+    expect(requests.every((r) => !r.tools.includes("sidekick") && !r.tools.includes("sidekick_wait"))).toBe(true);
+    const final = events.filter((e: any) => e.type === "message_end" && e.message?.role === "assistant").at(-1);
+    expect(JSON.stringify(final.message.content)).toContain("MAIN DONE");
+  }, 180_000);
+
+  it("shows complete current-session task history while off and keeps it after reset", async () => {
+    const out = await runPi(["BACKGROUND: run the tests.", "/fusion off", "/fusion reset", "/fusion history"], tempDir("fusion-history-"));
+    const events = out.split("\n").filter(Boolean).map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+    const history = events.filter((event: any) => event.type === "entry_appended" && event.entry?.customType === "fusion-history").at(-1)?.entry.data;
+    expect(history).toBeDefined();
+    expect(history.tasks.filter((task: any) => task.agent === "main")).toHaveLength(1);
+    const sidekick = history.tasks.filter((task: any) => task.agent === "sidekick");
+    expect(sidekick).toHaveLength(1);
+    expect(sidekick[0]).toMatchObject({ id: "D1", status: "done", model: "mock/cheap" });
+    expect(sidekick[0].result).toContain("3 passing");
+    expect(sidekick[0].toolCallId).toBeDefined();
   }, 180_000);
 });

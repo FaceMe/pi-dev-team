@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   agentDir,
+  defaultFusionConfig,
   loadFusionConfig,
   loadRolesState,
   rolesPath,
@@ -55,6 +56,11 @@ describe("config", () => {
     const config = loadFusionConfig();
     expect(config.main).toBeUndefined();
     expect(config.sidekick).toBeUndefined();
+  });
+
+  it("fusion defaults to disabled on every load", () => {
+    expect(defaultFusionConfig().enabled).toBe(false);
+    expect(loadFusionConfig().enabled).toBe(false);
   });
 });
 

@@ -73,10 +73,12 @@ describe.skipIf(!fs.existsSync(piCli))("factory with real pi workers", () => {
     // Only the mock provider: hide ambient cloud credentials from the child.
     const env: NodeJS.ProcessEnv = {};
     for (const [key, value] of Object.entries(process.env)) {
-      if (!/^(AWS_|ANTHROPIC_|OPENAI_|GEMINI_|GOOGLE_|AZURE_)/.test(key)) env[key] = value;
+      if (!/^(AWS_|ANTHROPIC_|OPENAI_|GEMINI_|GOOGLE_|AZURE_)/.test(key) && !/_(API_KEY|AUTH_TOKEN|ACCESS_TOKEN)$/.test(key)) env[key] = value;
     }
     Object.assign(env, { PI_CODING_AGENT_DIR: agentDir, PI_FACTORY_PI_BIN: piCli, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" });
-    fs.writeFileSync(path.join(agentDir, "factory.json"), JSON.stringify({ research: "off", autonomy: "auto" }));
+    // Keep role selection hermetic even if the host has other providers logged in.
+    const pins = Object.fromEntries([...loadRoles().keys()].map((role) => [role, { provider: "mock", modelId: "mock-model" }]));
+    fs.writeFileSync(path.join(agentDir, "factory.json"), JSON.stringify({ research: "off", autonomy: "auto", pins }));
     const out = await new Promise<string>((resolve, reject) => {
       const child = spawn(process.execPath, [piCli, "--mode", "json", "-p", "--no-session", "--model", "mock/mock-model", "/factory new an add() function"], {
         cwd,

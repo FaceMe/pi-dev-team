@@ -165,7 +165,9 @@ export const DEFAULT_FUSION_SHORTCUT = "ctrl+shift+d";
 
 export function defaultFusionConfig(): FusionConfig {
   return {
-    enabled: true,
+    // Fusion starts OFF every session; /fusion on enables it for that session.
+    // session_start enforces this even when fusion.json has a stale enabled:true.
+    enabled: false,
     sidekickTools: [...DEFAULT_SIDEKICK_TOOLS],
     routing: { enabled: true, mode: "llm", autoApply: true, onCompact: true, escalateOnFailure: true },
     limits: { maxTurns: 12, maxMessages: 400, maxContextFraction: 0.5 },
@@ -255,3 +257,6 @@ export function updateFusionConfig(patch: Partial<FusionConfig>): FusionConfig {
 
 /** Event name used to tell a running Fusion extension that fusion.json changed. */
 export const FUSION_CONFIG_EVENT = "fusion_config_updated";
+
+/** Synchronous runtime-state query; payload is a callback receiving the live enabled flag. */
+export const FUSION_STATE_QUERY_EVENT = "fusion_state_query";

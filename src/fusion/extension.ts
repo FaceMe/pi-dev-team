@@ -26,6 +26,7 @@ import type { DelegationMode, PolicyState } from "./policy.js";
 import {
   DEFAULT_FUSION_SHORTCUT,
   FUSION_CONFIG_EVENT,
+  FUSION_STATE_QUERY_EVENT,
   fusionConfigPath,
   loadFusionConfig,
   saveFusionConfig,
@@ -48,6 +49,9 @@ import {
   restoreRoutedSidekick,
 } from "./engine.js";
 import type { BackgroundTask, DelegationOutcome, FusionStats, LifetimeStats, RouteRecord } from "./engine.js";
+import { collectTaskHistory } from "./history.js";
+import { HISTORY_VIEW_ENTRY, renderTaskHistory } from "./history-view.js";
+import type { HistoryFilter, HistoryViewData } from "./history-view.js";
 
 /** Effective Fusion menu shortcut. Falls back to the default when unset or blank. */
 export function resolveFusionShortcut(config: FusionConfig): string {
@@ -86,7 +90,13 @@ export default function fusionExtension(pi: ExtensionAPI) {
   // session_start can recognise Fusion's own tool.
   const TOOL_MARKER = "Fusion sidekick";
 
-  const isActive = (): boolean => allowed && config.enabled;
+  const isActive = (): boolean => Boolean(engine && allowed && config.enabled);
+
+  // Config keeps slot preferences, but enabled is session-scoped. Let the
+  // picker query the live flag rather than show a stale saved "ON" badge.
+  pi.events?.on(FUSION_STATE_QUERY_EVENT, (reply: unknown) => {
+    if (typeof reply === "function") reply(isActive());
+  });
 
   const persistConfig = (): void => {
     saveFusionConfig(config);
@@ -137,10 +147,28 @@ export default function fusionExtension(pi: ExtensionAPI) {
     refreshTimer.unref?.();
   };
 
+  /** Remove every Fusion UI surface (footer status + widget), ignoring UI errors. */
+  const clearFusionUi = (ctx?: ExtensionContext): void => {
+    const target = ctx ?? engine?.latestCtx;
+    if (!target || !target.hasUI) return;
+    try {
+      target.ui.setStatus(EXTENSION_TAG, undefined);
+      target.ui.setWidget(EXTENSION_TAG, undefined);
+    } catch {
+      /* UI may be unavailable */
+    }
+  };
+
   const refreshUi = (ctx?: ExtensionContext): void => {
     const target = ctx ?? engine?.latestCtx;
     if (!engine || !target || !target.hasUI) return;
     try {
+      if (!isActive()) {
+        // Fusion is off: no stats on any surface, whatever triggered the refresh
+        // (usage ticks, background completions, config/widget edits).
+        clearFusionUi(target);
+        return;
+      }
       target.ui.setStatus(EXTENSION_TAG, engine.footerStatus());
       const mode = config.widget ?? "compact";
       if (mode === "off") {
@@ -370,12 +398,13 @@ export default function fusionExtension(pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const activeEngine = engine;
-      if (!activeEngine) {
-        throw new Error("Fusion is not active in this session.");
+      if (!activeEngine || !isActive()) {
+        throw new Error("Fusion is not active in this session. Enable it with /fusion on.");
       }
       activeEngine.setContext(ctx);
       policy.directStreak = 0;
       const input = {
+        toolCallId: _toolCallId,
         task: params.task,
         context: params.context,
         files: params.files,
@@ -758,10 +787,18 @@ export default function fusionExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     config = loadFusionConfig();
-    if (!allowed) config.enabled = false;
+    // Fusion starts OFF every session: /fusion on is an explicit, per-session
+    // action (also after /reload), and a stale enabled:true saved by an earlier
+    // session must not re-enable it. The one exception is a factory worker whose
+    // role asked for its own sidekick — the environment is that explicit opt-in.
+    const factorySidekick = process.env.PI_FACTORY_WORKER === "1" && process.env.PI_FACTORY_SIDEKICK === "1";
+    config.enabled = allowed && factorySidekick;
+    // Never restore a main-slot model captured in a previous session.
+    preFusionModel = undefined;
     restoreRoutedSidekick(config, ctx);
     engine = new FusionEngine(pi, ctx.modelRegistry, ctx.cwd, config);
     engine.setContext(ctx);
+    engine.restoreTaskHistory(ctx);
     engine.onUsage = scheduleRefresh;
     userPickedModel = false;
 
@@ -783,6 +820,9 @@ export default function fusionExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     if (refreshTimer) clearTimeout(refreshTimer);
     refreshTimer = undefined;
+    // Restore tools before dropping strict-mode state, so a reload that starts
+    // Fusion off does not inherit the previous runtime's removed edit tools.
+    setSidekickToolActive(false);
     strictRemoved = [];
     engine?.cancel();
     recentReads = [];
@@ -791,8 +831,10 @@ export default function fusionExtension(pi: ExtensionAPI) {
     policy.failedDelegations = 0;
     relaxNote = undefined;
     commandStarts.clear();
+    clearFusionUi(); // no Fusion stats left on screen after shutdown
     engine?.dispose();
     engine = undefined;
+    preFusionModel = undefined;
   });
 
   pi.on("model_select", (event) => {
@@ -809,7 +851,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
     if (!options) return;
 
     const sidekickModel = activeEngine.resolveSidekickModel();
-    const shouldEnable = activeEngine.config.enabled && sidekickModel !== undefined;
+    const shouldEnable = isActive() && sidekickModel !== undefined;
 
     // A new user prompt: strict mode returns once a delegation has succeeded.
     if (policy.relaxed && policy.failedDelegations === 0) policy.relaxed = false;
@@ -965,29 +1007,52 @@ export default function fusionExtension(pi: ExtensionAPI) {
     refreshUi(ctx);
   };
 
+  /** Explicit, display-only history; available even while Fusion is off. */
+  const appendHistory = (ctx: ExtensionContext, filter: HistoryFilter = "all"): void => {
+    const tasks = collectTaskHistory(ctx.sessionManager.getBranch())
+      .filter((task) => filter === "all" || task.agent === filter);
+    if (!tasks.length) {
+      ctx.ui.notify(`No ${filter === "all" ? "" : `${filter} `}tasks recorded in the current session.`, "info");
+      return;
+    }
+    pi.appendEntry(HISTORY_VIEW_ENTRY, { filter, tasks } satisfies HistoryViewData);
+  };
+
   const wizardHooks = (): WizardHooks => ({
     persist: persistConfig,
     assignMain,
     assignSidekick,
     appendStats: (activeEngine) => pi.appendEntry("fusion-stats", activeEngine.snapshot()),
+    appendHistory,
     refreshUi,
     setEnableState: async (wizardCtx, enabled) => {
+      // Same semantics as /fusion on|off: prompt epoch, active tools, model
+      // sync and an immediate UI refresh.
+      startPromptEpoch();
+      setSidekickToolActive(enabled);
       if (enabled) await applyFusionMainSlot(wizardCtx);
       else await restorePreFusionModel(wizardCtx);
+      refreshUi(wizardCtx);
     },
   });
 
   // -- commands ------------------------------------------------------------
 
   pi.registerCommand("fusion", {
-    description: "Fusion hybrid harness: status, model configuration, routing and stats",
+    description: "Fusion hybrid harness: models, routing, stats and current-session task history",
     getArgumentCompletions: (prefix: string) => {
       if (prefix.startsWith("mode ")) {
         const rest = prefix.slice(5);
         const modes = ["strict", "balanced", "advisory"].filter((m) => m.startsWith(rest)).map((m) => ({ value: `mode ${m}`, label: m }));
         return modes.length ? modes : null;
       }
-      const items = ["on", "off", "main", "sidekick", "mode", "widget", "tasks", "cancel", "status", "stats", "models", "route", "trace", "reset", "help"].map((value) => ({
+      if (prefix.startsWith("history ")) {
+        const rest = prefix.slice(8);
+        const items = ["all", "main", "sidekick"].filter((value) => value.startsWith(rest))
+          .map((value) => ({ value: `history ${value}`, label: value }));
+        return items.length ? items : null;
+      }
+      const items = ["on", "off", "main", "sidekick", "mode", "widget", "tasks", "history", "cancel", "status", "stats", "models", "route", "trace", "reset", "help"].map((value) => ({
         value,
         label: value,
       }));
@@ -1085,6 +1150,17 @@ export default function fusionExtension(pi: ExtensionAPI) {
               return `${t.id} ${t.status}${t.status === "queued" || t.status === "running" ? ` (${secs}s)` : ""} · ${t.task}${leases}`;
             }),
           });
+          return;
+        }
+
+        case "history": {
+          const values = args.trim().split(/\s+/).slice(1);
+          const filter = (values[0]?.toLowerCase() || "all") as HistoryFilter;
+          if (values.length > 1 || !["all", "main", "sidekick"].includes(filter)) {
+            ctx.ui.notify("Usage: /fusion history [all|main|sidekick]", "info");
+            return;
+          }
+          appendHistory(ctx, filter);
           return;
         }
 
@@ -1190,7 +1266,7 @@ export default function fusionExtension(pi: ExtensionAPI) {
         }
 
         default: {
-          ctx.ui.notify("Usage: /fusion [on|off|main|sidekick|mode|tasks|cancel|status|stats|models|route|trace|reset]", "info");
+          ctx.ui.notify("Usage: /fusion [on|off|main|sidekick|mode|widget|tasks|history [all|main|sidekick]|cancel|status|stats|models|route|trace|reset]", "info");
         }
       }
     },
@@ -1206,6 +1282,10 @@ export default function fusionExtension(pi: ExtensionAPI) {
   });
 
   // -- transcript rendering ------------------------------------------------
+
+  pi.registerEntryRenderer(HISTORY_VIEW_ENTRY, (entry, { expanded }, theme) =>
+    renderTaskHistory((entry.data ?? { filter: "all", tasks: [] }) as HistoryViewData, expanded, theme),
+  );
 
   pi.registerEntryRenderer("fusion-trace", (entry, { expanded }, theme) => {
     const trace = (entry.data ?? {}) as DelegationTrace;
@@ -1373,8 +1453,9 @@ interface WizardHooks {
   assignMain: (ctx: ExtensionContext, model: Model<any>, effort: EffortLevel | undefined) => Promise<void>;
   assignSidekick: (ctx: ExtensionContext, model: Model<any>, effort: EffortLevel | undefined) => void;
   appendStats: (engine: FusionEngine) => void;
+  appendHistory: (ctx: ExtensionContext, filter?: HistoryFilter) => void;
   refreshUi: (ctx?: ExtensionContext) => void;
-  /** Sync the session model with the main slot when fusion is toggled. */
+  /** Apply /fusion on|off semantics: prompt epoch, active tools, model sync, UI refresh. */
   setEnableState: (ctx: ExtensionContext, enabled: boolean) => Promise<void>;
 }
 
@@ -1397,6 +1478,7 @@ async function openConfigWizard(
       `menu shortcut: ${resolveFusionShortcut(engine.config)}`,
       `state: ${engine.config.enabled ? "enabled" : "disabled"}`,
       "session stats",
+      "session task history",
       "last delegation trace",
       "route now",
       "reset sidekick context",
@@ -1487,6 +1569,11 @@ async function openConfigWizard(
 
     if (choice === "session stats") {
       hooks.appendStats(engine);
+      continue;
+    }
+
+    if (choice === "session task history") {
+      hooks.appendHistory(ctx);
       continue;
     }
 

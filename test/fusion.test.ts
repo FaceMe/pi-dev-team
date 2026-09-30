@@ -194,6 +194,8 @@ describe("extension wiring", () => {
   it("B3: fusion's own main-slot switches do not disable compaction routing", async () => {
     const { rec, ctx } = boot(true);
     await start(rec, ctx);
+    // Fusion now starts every session off, even with saved enabled:true.
+    await rec.commands.get("fusion").handler("on", ctx);
     await rec.commands.get("fusion").handler("main c/frontier", ctx);
     expect(rec.setModelCalls.at(-1)?.id).toBe("frontier");
     ctx.model = frontier;

@@ -132,6 +132,9 @@ describe("main agent prompt stability", () => {
     const fire = async (event: string, payload: any) => {
       let result: any;
       for (const handler of rec.handlers.get(event) ?? []) result = (await handler(payload, ctx)) ?? result;
+      // Fusion starts every session off: tests that exercise enabled behaviour
+      // opt in explicitly, exactly like a user typing /fusion on.
+      if (event === "session_start") await rec.commands.get("fusion").handler("on", ctx);
       return result;
     };
     const section = async () => {

@@ -82,6 +82,7 @@ import {
   agentDir,
   fusionConfigPath,
   FUSION_CONFIG_EVENT,
+  FUSION_STATE_QUERY_EVENT,
   getModelThinkingLevel,
   loadFusionConfig,
   loadRolesState,
@@ -106,6 +107,14 @@ export {
   saveRolesState,
 };
 export type { ModelRolesState, RoleConfig };
+
+/** Fusion's saved enabled flag is not a startup preference; ask the live harness. */
+export function fusionEnabledInSession(pi: Pick<ExtensionAPI, "events">): boolean {
+  let enabled = false;
+  pi.events?.emit(FUSION_STATE_QUERY_EVENT, (active: boolean) => { enabled = active === true; });
+  return enabled;
+}
+
 /** @deprecated use FusionSlot from src/shared/config */
 export type FusionSlotConfig = FusionSlot;
 /** @deprecated use FusionConfig from src/shared/config */
@@ -1187,7 +1196,7 @@ export class SplitModelPickerComponent {
     const fConfig = this.fusionConfig;
     const fMainStr = fConfig.main ? `${fConfig.main.modelId} (${fConfig.main.effort || "high"})` : "not set";
     const fSideStr = fConfig.sidekick ? `${fConfig.sidekick.modelId} (${fConfig.sidekick.effort || "low"})` : "not set";
-    const fusionStateStr = fConfig.enabled !== false ? this.theme.fg("success", "● ON") : this.theme.fg("dim", "○ OFF");
+    const fusionStateStr = fusionEnabledInSession(this.pi) ? this.theme.fg("success", "● ON") : this.theme.fg("dim", "○ OFF");
 
     const fusionRibbon = ` ${this.theme.fg("muted", "Fusion:")} ${fusionStateStr}  ${this.theme.fg("warning", "[m/4: 🔮 Main]")} ${fMainStr}  ${this.theme.fg("accent", "[k/5: ⚡ Sidekick]")} ${fSideStr}`;
     lines.push("│" + pad(fusionRibbon, innerWidth) + "│");
