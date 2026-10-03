@@ -11,7 +11,7 @@ It builds on the ideas in Cognition's
 [Devin Fusion](https://cognition.com/blog/devin-fusion) post, which the existing
 `fusion` extension already implements in part.
 
-- Status: **M0–M2 implemented** (see [Implementation status](#implementation-status)); M3–M7 planned
+- Status: **M0–M3 implemented** (see [Implementation status](#implementation-status)); M4–M7 planned
 - Scope: this repository (pi extension package)
 - Last updated: 2026-10-03
 
@@ -24,11 +24,31 @@ It builds on the ideas in Cognition's
 | M0 hygiene | Done | Code split into `extensions/*/index.ts` + `src/`; one config module (`src/shared/config.ts`); bugs B1–B9 fixed plus B10 (the sidekick turn cap never worked: `shouldStopAfterTurn` is not an `Agent` option; now `finishTurn`); tsconfig, vitest, CI; v2.0.0 |
 | M1 quick-start slice | Done | `/factory` with quick setup, automatic team from any provider, interview, spec, architecture, plan, skeleton, test-first build with gates and cross-family review, escalation, docs, merge, report, budget breaker, pause/resume, doctor, demo, headless mode |
 | M2 resume, board and cost | Done | Run state moved to `.factory/factory.lock.json` (M1's `state.json` is migrated on first load) with normalization of damaged state, an archived-runs folder (`runs/`), and a run-scoped settings snapshot applied on resume (the team still follows current logins). Session start offers to resume. Live board widget, `/factory board`, `/factory trace [ticket\|role]`, `/factory roles` (picker Factory tab), `/factory cost` per phase/role/ticket/model with an estimated all-frontier savings line. Ledger entries carry `runId`, input/output token split and bounded traces; skeleton phase resumes without re-prompting a worker when the gates already pass |
-| M3–M7 | Planned | Parallel tickets, deeper discovery (brainstorm fan-out, readiness scoring), profile templates, QA role, deploy hardening, benchmarks |
+| M3 discovery depth | Done | Readiness checklist scoring (§9.3) ends the interview when no topic is unknown; `spec/readiness.md` and pipeline-derived `spec/assumptions.md`; `factory_brainstorm`-style multi-model fan-out (analyst-triggered, ≤2 per run, distinct families, divergent/critical/pragmatic stances + synthesis into `research/brainstorm-<n>.md`); spec validator (§9.4) fed back into the analyst at the spec gate |
+| M4–M7 | Planned | Profile templates, QA role, parallel tickets (planning exists; parallel build arrives in M5), deploy hardening, benchmarks |
 
-Verification: 222 tests across 17 files, including the whole pipeline with
+Verification: 248 tests across 19 files, including the whole pipeline with
 **real `pi` worker processes** against a mock OpenAI-compatible model, and the
 real `/factory new` command run headless in a pi session.
+
+M3 decisions (discovery depth):
+
+- **Readiness is data, not prose.** The analyst returns the §9.3 checklist as
+  JSON each round (`src/factory/readiness.ts` normalizes it); the interview ends
+  as soon as no topic is unknown — the analyst no longer judges readiness alone.
+  The checklist persists on the run state and lands in
+  `.factory/spec/readiness.md`; unresolved topics become bullets in
+  `spec/assumptions.md` (which is now pipeline-derived, so the analyst no longer
+  writes it).
+- **Brainstorm is analyst-triggered and capped.** When the analyst flags one
+  contested question, up to 3 tier models from distinct families answer in
+  parallel with divergent/critical/pragmatic stances, the synthesising call
+  writes `research/brainstorm-<n>.md`, and a digest feeds the next round. At
+  most 2 brainstorms per run; with a single model family it is skipped.
+- **The spec gate is mechanical.** `validateSpec` (§9.4: FR↔Given/When/Then,
+  measurable NFRs, traceability) runs after each analyst attempt and its issues
+  are fed back as feedback; a persistently failing spec continues to the
+  approval gate with a warning rather than killing the run.
 
 Decisions made while building M2:
 

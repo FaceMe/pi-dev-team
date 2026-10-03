@@ -1,0 +1,310 @@
+# The software factory — a guide
+
+How to use `/factory` day to day: starting runs, watching them, pausing and
+resuming, reading cost reports and traces, and assigning models to roles. For
+the quick start see the [README](../README.md); for the design and roadmap see
+the [plan](software-factory-plan.md).
+
+## What a run looks like
+
+`/factory new <idea>` walks the project through eight phases, persisting to
+`.factory/` between each step:
+
+1. **discovery** — the analyst interviews you (at most 4 questions per round,
+   each with a recommended answer and a "use your defaults" option; small
+   ideas get one round), then the researcher adds notes if web research is on.
+2. **spec** — the analyst writes `.factory/spec/spec.md` (FR/NFR IDs with
+   Given/When/Then); you approve it or request changes.
+3. **architecture** — the architect writes an ADR and a stack profile
+   (`.factory/profile.json`) with the gate commands (install, build,
+   typecheck, lint, test).
+4. **planning** — the planner produces a dependency-ordered ticket list
+   (`.factory/tickets.json`).
+5. **skeleton** — a git worktree on branch `factory/<run>`, where the devops
+   role builds a walking skeleton that must pass the gates.
+6. **build** — each ticket is built test-first by its role's worker; the
+   factory (not the agent) runs the gates, reverts out-of-scope changes, and
+   a reviewer from a different model family approves each ticket. Failures
+   retry with feedback, then escalate up the role's model ladder, then ask
+   you.
+7. **docs** — README, architecture notes, `AGENTS.md`, CHANGELOG.
+8. **release** — final gates, merge into your branch when they pass (an
+   optional deploy always asks first), and the report in
+   `.factory/report.md`.
+
+**Autonomy presets** decide how often the factory stops to ask you
+(`/factory autonomy <preset>`, switchable at any time — even mid-run):
+
+| Preset | You approve |
+|---|---|
+| `auto` | The spec. Everything else runs through to release. |
+| `balanced` (default) | The spec, then one build-plan screen (stack, tickets, budget). |
+| `careful` | Every gate: spec, architecture, build plan, each ticket commit, and the merge. |
+
+In every preset the budget breaker and genuine blockers still stop and ask
+you, and `/factory pause` works at any time.
+
+## Commands
+
+| Command | Action |
+|---|---|
+| `/factory new [idea]` | Quick setup, then run the whole flow |
+| `/factory status` | Where the run is: phase, tickets, spend, last stop |
+| `/factory board` | The ticket board (the same lines as the live widget) |
+| `/factory cost` | Spend by phase, role, model and ticket, with estimated savings vs an all-frontier team |
+| `/factory trace [ticket\|role]` | Expandable trace of the last worker run (filtered by ticket or role) |
+| `/factory pause` | Pause after the current step |
+| `/factory resume` | Continue the paused/interrupted run in this folder |
+| `/factory doctor [probe]` | Check git, pi, models, team, pi-web-access, toolchains and deploy CLIs, with fixes; `probe` sends one tool call to each distinct team model |
+| `/factory team [balanced\|cheap\|best\|refresh]` | Show the team, switch preset, or re-derive it from the models you are logged in to now |
+| `/factory roles` | Assign a model to any role with the picker's Factory tab |
+| `/factory autonomy auto\|balanced\|careful` | Switch at any time, even mid-run |
+| `/factory settings` | Change the quick-setup answers for this folder |
+| `/factory run <role> <brief>` | Run one role once, read-only (try a model, ask the architect) |
+| `/factory demo` | Build a tiny to-do CLI in a temp folder on `auto` |
+| `/factory help` (or bare `/factory`) | Menu when a run exists (resume, pause, status, doctor, new); otherwise prompts for an idea |
+
+Tab completion covers subcommands, `autonomy`/`team` values, ticket ids and
+role names for `trace`.
+
+## Resuming
+
+Every phase transition, ticket status change and spend update is written to
+the run lock, `.factory/factory.lock.json`, before the factory moves on. The
+lock carries the phase, status, interview answers, tickets (with attempts and
+commits), spend, the budget (including any raise you approved), the
+branch/worktree pointers, and a **settings snapshot** of the run-scoped
+answers (autonomy, project mode, stack, research, deploy).
+
+**Reopening the project.** When you start pi in a folder with an unfinished
+run, the footer shows `🏭 <phase> (interrupted)` (or the paused/failed/waiting
+status) and pi offers a menu: *Resume the run now*, *Show status*, *Not
+now*. `/factory resume` does the same on demand; `/factory pause` aborts
+after the current step. Closing pi aborts an in-flight run cleanly — the
+lock keeps whatever had persisted, and you resume from there.
+
+**What resume keeps vs. re-derives.** The snapshot wins over today's
+defaults, so a resumed run reproduces its own setup. The one thing resume
+does *not* replay is the team: the preset and pins are deliberately not
+snapshotted, so the team is rebuilt from the models you are logged in to
+*now* — a role pinned with the picker keeps its pin.
+
+**Fast paths and stop points.**
+
+- A resumed **skeleton** phase checks whether the worktree already exists; if
+  it does, the gates run first, and passing gates count as the skeleton done
+  — no rebuild.
+- The **budget breaker** fires at 80% of the dollar (or token) budget and
+  asks: raise it by 50% or pause. A raised budget is written to the lock.
+- A **blocked ticket** (every model on the role's escalation ladder tried)
+  asks you: retry with the strongest model, skip the ticket, or pause.
+- A failed worker or crash sets the run to `failed` with the error in the
+  lock; fix the cause and `/factory resume`. Approval gates set the status to
+  `waiting` until you answer.
+
+**Archives and migration.** Starting `/factory new` while an unfinished run
+exists asks for confirmation; the old lock then moves to
+`.factory/runs/<runId>.json`, and a finished run is archived there the same
+way when you start the next one. Locks from the earlier milestone named
+`state.json` are migrated to `factory.lock.json` automatically on first load
+(the old file is removed). A lock that is corrupt or missing its run id/idea
+is treated as "no run here" rather than crashing.
+
+## Watching a run
+
+While a run is active you get three live views:
+
+- **The board widget** above the footer, refreshed as workers report
+  activity:
+
+  ```text
+  🏭 factory · build · 3/7 tickets · $1.24/$5.00
+    ▶ T-004 backend — persist habits to SQLite (attempt 2)
+    · T-007 todo — weekly streak view
+    ✓ 3 done
+    backend: edit src/db/habits.ts
+    backend: $ npm test -- habits
+  ```
+
+  The header is `phase · done/total tickets · spend/budget` (with the status
+  in parentheses when the run is not running). Up to four open tickets are
+  listed — in progress first (`▶`, attempt count when > 1), then blocked
+  (`✗`), then todo (`·`) — done/skipped collapse to a tally, and the last
+  two worker activity lines trail. The widget disappears when the run ends.
+
+- **The footer status line**: `🏭 build · 3/7 tickets · $1.24/$5.00`, or
+  `waiting for your approval` at a gate.
+- **Transcript entries** for phase changes, gate results, finished tickets,
+  approvals and the final report — each collapsed to one line, expandable
+  with pi's expand key.
+
+`/factory status` prints the durable summary (works when nothing is running
+too):
+
+```text
+run run-20260921-093000 · build · paused
+idea: a habit tracker with a web UI and a REST API
+spent: $1.24 of $5.00 · 412.3k tokens
+tickets: 3/7 done
+  ✓ T-001 repo and tooling
+  … T-004 persist habits to SQLite
+  · T-007 weekly streak view
+branch: factory/run-20260921-093000
+last stop: Factory paused. Run /factory resume to continue.
+```
+
+`/factory board` re-prints the board lines on demand.
+
+## Cost and traces
+
+Every worker run appends a line to `.factory/ledger.jsonl` — role, model,
+ticket, phase, turns, tokens in/out, cost, and a bounded trace. Gate results
+are logged too. `/factory cost` reports over that ledger, scoped to the
+current (or last) run in the folder:
+
+```text
+cost for run run-20260921-093000
+total $1.24 · 412.3k tokens · 19 worker run(s)
+savings vs all-frontier: $2.10 (62.9%, estimate)
+by phase:
+  build: 10 run(s) · 240.5k tok · $0.73
+  discovery: 4 run(s) · 58.9k tok · $0.20
+  skeleton: 2 run(s) · 61.2k tok · $0.19
+  spec: 2 run(s) · 33.4k tok · $0.08
+  architecture: 1 run(s) · 18.3k tok · $0.04
+by role:
+  backend: 6 run(s) · 180.2k tok · $0.58
+  analyst: 5 run(s) · 67.7k tok · $0.24
+  devops: 2 run(s) · 61.2k tok · $0.19
+  reviewer: 4 run(s) · 60.3k tok · $0.15
+  researcher: 1 run(s) · 24.6k tok · $0.04
+  architect: 1 run(s) · 18.3k tok · $0.04
+by model:
+  acme/era-2-flash: 14 run(s) · 327.4k tok · $1.05
+  orion/sol-2: 5 run(s) · 84.9k tok · $0.19
+by ticket:
+  (no ticket): 9 run(s) · 171.8k tok · $0.51
+  T-004: 5 run(s) · 142.8k tok · $0.44
+  T-005: 5 run(s) · 97.7k tok · $0.29
+```
+
+Sections with fewer than two rows are omitted (ticket rows always show), rows
+are sorted by cost, and long lists are capped with an `… and N more` line.
+Worker runs from *other* runs in the same folder (and pre-M2 ledger lines
+with no run id) are excluded and counted for you at the bottom.
+
+**The savings line is an estimate.** Each worker's tokens are re-priced at
+the current team's frontier model: input tokens at its input rate plus
+output tokens at its output rate; when a ledger line has no in/out split,
+its total tokens are priced at the model's blended rate. The savings are the
+difference between that counterfactual "all-frontier team" cost and what the
+mixed team actually cost. The line is omitted when the team has no model on
+the frontier tier; a frontier model without known prices shows up as no
+savings.
+
+**Traces.** `/factory trace [ticket|role]` appends the latest worker run's
+trace for that ticket or role (no argument: the latest traced worker run) as
+an expandable entry — `role · model · ticket · time`, collapsed to "N trace
+steps". Expanded, a trace shows the worker's thinking blocks, every tool
+call with a described command or target, capped output excerpts, and errors:
+
+```text
+⋯ turn 4 thinking
+  The habit test fails on the date boundary — the model stores UTC but…
+• bash $ npm test -- habits
+  3 passing
+  1 failing
+• edit src/habits/date.ts
+✗ turn 6 aborted — stopped early
+```
+
+Traces are bounded (the last 80 steps, thinking truncated, outputs excerpted)
+and ride along in the ledger, so they survive restarts. Worker entries in the
+transcript expand the same way.
+
+## Picking models per role
+
+`/factory roles` opens the model picker on its **Factory tab**: the right
+panel lists the roles (name and description) under `ASSIGN MODELS TO FACTORY
+ROLES`. Pick a role with `↑`/`↓` and `Enter`, and the panel becomes the
+normal model list titled `MODEL FOR THE <ROLE> ROLE` — search, effort picker
+(`e`), badges and all. `Esc` backs out to the role list; `Esc` again leaves
+the picker. Choosing a model pins it to that role. During quick setup, the
+Team line's "pin any role" action opens the same picker focused on one role.
+
+The pin is saved at user level (`~/.pi/agent/factory.json`, so it applies to
+every project) and mirrored into `.factory/project.json` for this project
+when one exists.
+
+Pins, presets and role files combine like this:
+
+- A **pin** (from the picker) wins outright for that role — the preset no
+  longer affects it.
+- Otherwise the role's **tier** maps through the preset: `balanced` uses each
+  role's natural tier, `cheap` shifts one tier down (judgement roles never
+  go below `daily`), `best` puts everything on `frontier`. `/factory team
+  <preset>` switches; `refresh` re-derives the team from the models you are
+  logged in to now.
+- A role Markdown file (`~/.pi/agent/factory/roles/<role>.md`) can pin a
+  model directly and override tier, effort, tools, escalation ladder or the
+  whole prompt; later sources replace built-ins by name.
+- A running build keeps its team; preset and pin changes apply to the next
+  run or resume.
+
+## What lands in `.factory/`
+
+```text
+.factory/
+├── factory.lock.json    # the run lock: phase, status, tickets, spend, budget, settings snapshot
+├── runs/<runId>.json    # archived runs, moved here when you start the next one
+├── project.json         # this folder's quick-setup answers (pins mirrored here)
+├── brief.md             # your idea, verbatim
+├── spec/                # spec.md, decisions.md (interview), assumptions.md
+├── research/            # notes.md from the researcher
+├── adr/                 # 0001-architecture.md
+├── profile.json         # stack, gate commands, dependency manifests
+├── tickets.json         # the plan, dependency-ordered
+├── reviews/             # reviewer verdicts per ticket attempt
+├── report.md            # final report: tickets, cost by role, notes
+├── ledger.jsonl         # append-only worker/gate log (usage, cost, traces)
+├── sessions/            # worker pi sessions               — git-ignored
+├── worktrees/           # the build worktree               — git-ignored
+└── .gitignore           # written by the factory: sessions/, worktrees/, *.tmp
+```
+
+Everything except `sessions/`, `worktrees/` and `*.tmp` is meant to be
+committed with your project — spec, tickets, reviews, ledger and report are
+part of the run's history. Remembered *answers* live outside the repo:
+team preset, pins, autonomy and research in `~/.pi/agent/factory.json` (every
+project), the rest per folder in `project.json`.
+
+## Guard rails
+
+Workers are real `pi` subprocesses with their own sessions, and every tool
+call they make passes the factory's guard:
+
+- **Write scopes.** `edit`/`write` outside the ticket's write scope are
+  blocked (an empty scope means read-only — researcher, reviewer, planner
+  and `/factory run` never write). Scopes are relative to the worker's
+  working directory (the worktree during build), so nothing outside it is
+  writable, and `.git/` is never writable. If a change slips through anyway,
+  the harness diffs the worktree after every attempt and reverts anything
+  out of scope before the gates run.
+- **Blocked commands.** `git push`/`commit` and history rewrites, `sudo`,
+  package publishing, `rm -rf` outside the project, fork bombs, piping
+  remote scripts into a shell, and deploy CLIs (`fly deploy`,
+  `vercel --prod`, `netlify deploy`, `wrangler deploy`, `railway up`,
+  `kubectl apply`, `terraform apply`, `docker push`, …) — deploy commands
+  unlock only for the one deploy worker, after you approved the deploy.
+- **Gates are run by the factory** (`install`/`build`/`typecheck`/`lint`/
+  `test` from the stack profile), never claimed by an agent; "done" requires
+  passing gates plus a reviewer approval.
+- **Secrets.** The factory stores nothing: deploy CLIs reuse their own
+  logins, and the deploy worker writes `.env.example` — never your `.env`.
+  The reviewer is instructed to flag secrets in code.
+- **The merge is yours.** Release merges only when the final gates pass, you
+  are on the branch you started on, and your tree is clean (in `careful`,
+  only after you approve).
+
+See the [plan's safety section](software-factory-plan.md#15-safety-cost-and-failure-handling)
+for the design, and the [README](../README.md) for the quick start.

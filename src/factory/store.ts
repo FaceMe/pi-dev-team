@@ -20,6 +20,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { appendJsonLine, readJsonFile, writeJsonFile, writeTextFile } from "../shared/json-store.js";
+import { normalizeReadiness } from "./readiness.js";
 import { PHASE_ORDER } from "./types.js";
 import type { FactoryState, Profile, SetupAnswers } from "./types.js";
 
@@ -52,6 +53,7 @@ export function normalizeState(raw: unknown): FactoryState | null {
     worktree: typeof s.worktree === "string" ? s.worktree : undefined,
     answers: Array.isArray(s.answers) ? s.answers : [],
     interviewRounds: Number.isFinite(s.interviewRounds) ? s.interviewRounds : 0,
+    readiness: normalizeReadiness(s.readiness) ?? undefined,
     tickets: Array.isArray(s.tickets) ? s.tickets : [],
     spentUsd: Number.isFinite(s.spentUsd) ? s.spentUsd : 0,
     spentTokens: Number.isFinite(s.spentTokens) ? s.spentTokens : 0,
