@@ -131,7 +131,7 @@ describe("/factory command", () => {
   it("offers completions", () => {
     const { rec } = setup(tempDir());
     const complete = rec.commands.get("factory").getArgumentCompletions;
-    expect(complete("re").map((i: any) => i.value)).toEqual(["resume"]);
+    expect(complete("re").map((i: any) => i.value)).toEqual(["resume", "retro"]);
     expect(complete("autonomy c").map((i: any) => i.label)).toEqual(["careful"]);
   });
 
@@ -188,6 +188,31 @@ describe("/factory command", () => {
     const fresh = setup(empty);
     await fresh.rec.commands.get("factory").handler("cost", fresh.ctx);
     expect(fresh.notes.at(-1)?.message).toBe("Nothing spent yet in this folder.");
+  });
+
+  it("shows exploratory QA reports by round, the contributor check and the retrospective", async () => {
+    const cwd = tempDir("factory-qa-cmd-");
+    const { rec, ctx, notes } = setup(cwd);
+    await rec.commands.get("factory").handler("qa", ctx);
+    expect(notes.at(-1)?.message).toMatch(/No exploratory QA/);
+    await rec.commands.get("factory").handler("retro", ctx);
+    expect(notes.at(-1)?.message).toMatch(/No retrospective yet/);
+
+    const store = new FactoryStore(cwd);
+    store.write("qa/round-1.md", "# Exploratory QA — round 1\n\n- **major** bug A → B-001\n");
+    store.write("qa/round-2.md", "# Exploratory QA — round 2\n\nNone found.\n");
+    store.write("contributor.md", "# New-contributor check\n\n## Round 1: PASSED\n");
+    store.write("retro.md", "# Retrospective — run-a\n\n## Outcome\n");
+    await rec.commands.get("factory").handler("qa", ctx);
+    let lines = lastEntry(rec, "status").lines as string[];
+    expect(lines[0]).toBe("# Exploratory QA — round 2");
+    expect(lines).toContain("## Round 1: PASSED");
+    expect(lines.at(-1)).toBe("2 rounds: /factory qa <n> shows an earlier one");
+    await rec.commands.get("factory").handler("qa 1", ctx);
+    lines = lastEntry(rec, "status").lines as string[];
+    expect(lines).toContain("- **major** bug A → B-001");
+    await rec.commands.get("factory").handler("retro", ctx);
+    expect((lastEntry(rec, "status").lines as string[])[0]).toBe("# Retrospective — run-a");
   });
 
   it("shows the last traced worker run for a ticket or role, and notifies on no match", async () => {

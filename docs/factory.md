@@ -7,7 +7,7 @@ the [plan](software-factory-plan.md).
 
 ## What a run looks like
 
-`/factory new <idea>` walks the project through eight phases, persisting to
+`/factory new <idea>` walks the project through nine phases, persisting to
 `.factory/` between each step:
 
 1. **discovery** — the analyst interviews you (at most 4 questions per round,
@@ -42,10 +42,20 @@ the [plan](software-factory-plan.md).
    integration branch, where every gate runs again. Failures retry with
    feedback, then escalate up the role's model ladder, then ask you. See
    [The build loop](#the-build-loop).
-7. **docs** — README, architecture notes, `AGENTS.md`, CHANGELOG.
-8. **release** — final gates, merge into your branch when they pass (an
-   optional deploy always asks first), and the report in
-   `.factory/report.md`.
+7. **verify** — every gate on the integrated build with a fresh install, then
+   **exploratory QA**: a QA worker runs the software like a user (each
+   requirement's acceptance criteria end to end, then invalid input, missing
+   configuration and error paths) and reports bugs with reproduction steps.
+   Bugs at or above the threshold (default `major`) become bug tickets
+   (`B-001`, …) and the run goes back to the build, at most twice; see
+   [Verification and release](#verification-and-release).
+8. **docs** — README, architecture notes, `AGENTS.md`, CHANGELOG, then the
+   **new-contributor check**: a fresh agent clones the build and must set it
+   up, run the tests and extend it using only the docs.
+9. **release** — final gates, merge into your branch when they pass (an
+   optional deploy always asks first), a local version tag, release notes,
+   the report in `.factory/report.md` and a retrospective in
+   `.factory/retro.md`.
 
 **Autonomy presets** decide how often the factory stops to ask you
 (`/factory autonomy <preset>`, switchable at any time — even mid-run):
@@ -302,6 +312,81 @@ history of T-002 — $0.06 · 9.1k tok
 10:02:41  ✓ done after 1 attempt(s)
 ```
 
+## Verification and release
+
+After the last ticket merges, the factory checks the integrated build the way
+a user and a new teammate would, not just the way the tests do.
+
+**Integration gates.** Every gate runs on the integration branch with a fresh
+install. A red integrated build becomes a critical bug ticket on its own.
+
+**Exploratory QA.** A QA worker (read-only: it may run anything but change no
+tracked file) tries the software itself — the CLI with real arguments, the API
+with real requests, the UI build — walks each requirement's acceptance
+criteria, then goes off the happy path. It replies with a structured report:
+
+```text
+# Exploratory QA — round 1
+
+The CLI concatenates numbers given as strings.
+
+## Requirements tried
+- ✗ FR-001 — add('1','2') → '12'
+
+## Bugs (2)
+- **major** Numbers from the command line are concatenated (FR-001) → B-001
+  - steps: add('1', '2')
+  - expected: 3; actual: '12'
+- **minor** No --help text (below threshold: follow-up)
+```
+
+**The bug loop.** Each finding at or above `bugSeverity` becomes a bug ticket
+that inherits the role and write scope of the tickets that delivered its
+requirement, so the scheduler keeps it clear of unrelated work. Bug tickets go
+through the same build loop as features — QA first writes a failing regression
+test, the builder fixes the root cause, gates, secret scan, review, integration
+merge — and the next QA round checks the fixes. After `qaRounds` fix rounds
+(default 2) with bugs still open, `auto` releases with them listed as known
+issues; `balanced` and `careful` ask whether to release, run another round or
+pause. Findings below the threshold become follow-ups in the retrospective.
+
+**The new-contributor check** (the M6 exit test). After the docs step, a fresh
+`contributor` agent clones the factory branch into a temporary folder and,
+with only README.md, AGENTS.md and docs/ to go on, sets the project up, runs
+its tests and makes one small extension with a test. The factory then re-runs
+the documented test commands and every gate in that clone. The check passes
+only on evidence: documented commands succeed, gates pass with the extension,
+a real change was made, and no blocking documentation gap was reported. On a
+failure the docs worker gets the gaps for one fix round and the check runs
+again. The clone (and the contributor's extension) is thrown away;
+`.factory/contributor.md` keeps the result.
+
+**Release.** With green gates and a clean secret scan the build merges into
+your branch and is tagged `v<version>` locally (from `package.json`,
+`pyproject.toml` or `Cargo.toml`; `0.1.0` otherwise — never pushed, never
+moved). `.factory/release-notes.md` lists what was delivered, the bugs fixed
+during verification, known issues and the verification results.
+
+**Retrospective.** `.factory/retro.md` closes the run: outcome, cost by phase,
+escalations (with the model ladder each ticket climbed), every failed attempt,
+and suggested follow-up tickets — skipped tickets, open and minor bugs,
+requirements QA could not test, and documentation gaps.
+
+Tuning lives under `build` in `~/.pi/agent/factory.json` or
+`.factory/project.json`:
+
+```json
+{
+  "build": {
+    "exploratoryQa": true,
+    "qaRounds": 2,
+    "bugSeverity": "major",
+    "contributorCheck": true,
+    "tagRelease": true
+  }
+}
+```
+
 ## Commands
 
 | Command | Action |
@@ -312,6 +397,8 @@ history of T-002 — $0.06 · 9.1k tok
 | `/factory cost` | Spend by phase, role, model and ticket, with estimated savings vs an all-frontier team |
 | `/factory trace [ticket\|role]` | Expandable trace of the last worker run (filtered by ticket or role) |
 | `/factory history [ticket]` | Every ticket's attempts, outcomes and cost; with an id, that ticket's full history (QA, worker runs, gates with parsed failures, review, merges) |
+| `/factory qa [round]` | The latest exploratory QA report (or round n) and the new-contributor check |
+| `/factory retro` | The retrospective of the last release |
 | `/factory pause` | Pause after the current step |
 | `/factory resume` | Continue the paused/interrupted run in this folder |
 | `/factory doctor [probe]` | Check git, pi, models, team, pi-web-access, toolchains and deploy CLIs, with fixes; `probe` sends one tool call to each distinct team model |
@@ -526,7 +613,11 @@ Pins, presets and role files combine like this:
 ├── tickets.json         # the plan, dependency-ordered
 ├── traceability.json    # requirement → tickets matrix, written at planning
 ├── reviews/             # reviewer verdicts per ticket attempt
+├── qa/                  # round-<n>.md/.json exploratory QA reports, open-bugs.json
+├── contributor.md       # new-contributor check (and contributor.json)
+├── release-notes.md     # delivered, fixed during verification, known issues
 ├── report.md            # final report: tickets, cost by role, notes
+├── retro.md             # retrospective: cost by phase, escalations, failures, follow-ups
 ├── ledger.jsonl         # append-only log: worker runs (usage, cost, traces), gates, ticket events
 ├── sessions/            # worker pi sessions               — git-ignored
 ├── worktrees/           # integration + per-ticket worktrees — git-ignored

@@ -51,6 +51,21 @@ export function script(system: string, prompt: string): Action[] {
     ];
   }
   if (system.includes("code reviewer")) return [{ text: fence({ verdict: "approve", findings: [] }) }];
+  if (system.includes("QA engineer") && prompt.includes("Exploratory QA")) {
+    return [
+      { tool: "bash", args: { command: "node -e \"import('./src/add.js').then((m) => console.log(m.add(1, 2)))\"" } },
+      { text: fence({ summary: "add(1, 2) prints 3.", checks: [{ requirement: "FR-001", result: "pass", evidence: "node -e … → 3" }], bugs: [] }) },
+    ];
+  }
+  if (system.includes("never seen this codebase")) {
+    return [
+      { tool: "read", args: { path: "README.md" } },
+      { tool: "write", args: { path: "src/double.js", content: "export const double = (n) => n * 2;\n" } },
+      { tool: "write", args: { path: "test/double.test.js", content: "import test from 'node:test';\nimport assert from 'node:assert';\nimport { double } from '../src/double.js';\ntest('double', () => assert.equal(double(2), 4));\n" } },
+      { tool: "bash", args: { command: "node --test" } },
+      { text: fence({ setup: [], test: ["node --test"], run: [], extension: { description: "double()", files: ["src/double.js", "test/double.test.js"] }, gaps: [], ok: true }) },
+    ];
+  }
   if (system.includes("technical writer")) {
     return [
       { tool: "write", args: { path: "README.md", content: "# Demo\n\n`node --test`\n" } },

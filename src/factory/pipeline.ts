@@ -1,7 +1,10 @@
 /**
  * The factory pipeline: a resumable phase machine that drives role workers.
  *
- *   discovery → spec → architecture → planning → skeleton → build → docs → release → done
+ *   discovery → spec → architecture → planning → skeleton → build → verify → docs → release → done
+ *
+ * verify can loop back to build: bugs found by exploratory QA (or a red
+ * integration) become bug tickets, up to the configured number of fix rounds.
  *
  * Every step persists to .factory/ before moving on, so a run can pause (user
  * choice, budget breaker, blocker, abort) and resume later from the same phase.
@@ -11,6 +14,7 @@
 
 import type { Model } from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { clampEffort, modelFamily } from "../shared/models.js";
 import { truncate } from "../shared/text.js";
@@ -18,7 +22,8 @@ import type { Tier } from "../shared/tiers.js";
 import { formatCost, formatTokens } from "../shared/usage.js";
 import { boardLines } from "./board.js";
 import { outOfScope } from "./guard.js";
-import { describeGateFailure, gatesPassed, normalizeProfile, runGates, summarizeGates } from "./gates.js";
+import { describeGateFailure, gatesPassed, normalizeProfile, runCommand, runGates, summarizeGates } from "./gates.js";
+import { blockedCommand } from "./guard.js";
 import {
   changedFiles,
   changedSince,
@@ -36,7 +41,9 @@ import {
   mergeInto,
   removeWorktree,
   resetTo,
+  restoreAfter,
   revertToBase,
+  untrackedFiles,
   workingDiff,
 } from "./git.js";
 import { Mutex } from "./mutex.js";
@@ -74,6 +81,19 @@ import type {
 } from "./types.js";
 import { PHASE_ORDER, buildSettings } from "./types.js";
 import { orderTickets } from "./order.js";
+import {
+  bugTickets,
+  contributorMarkdown,
+  integrationBugTicket,
+  judgeContributor,
+  normalizeContributorReport,
+  normalizeQaReport,
+  projectVersion,
+  qaReportMarkdown,
+  releaseNotes,
+  retrospective,
+} from "./verify.js";
+import type { ContributorOutcome, QaBug, QaReport } from "./verify.js";
 
 export { orderTickets };
 
@@ -237,6 +257,8 @@ export class FactoryRun {
         return this.skeleton();
       case "build":
         return this.build();
+      case "verify":
+        return this.verify();
       case "docs":
         return this.docs();
       case "release":
@@ -444,19 +466,39 @@ Work only inside the current working directory.`;
     options: { prompt: string; cwd: string; session: string; writeScope: string[] },
     validate: (value: any) => { value?: T; error?: string },
   ): Promise<T> {
+    const outcome = await this.jsonWorker(roleName, options, validate);
+    if ("value" in outcome) return outcome.value;
+    throw new StopRun("failed", outcome.failure);
+  }
+
+  /** Like workJson, but a worker that never returns usable JSON yields undefined (for optional checks). */
+  async tryWorkJson<T>(
+    roleName: string,
+    options: { prompt: string; cwd: string; session: string; writeScope: string[] },
+    validate: (value: any) => { value?: T; error?: string },
+  ): Promise<T | undefined> {
+    const outcome = await this.jsonWorker(roleName, options, validate);
+    return "value" in outcome ? outcome.value : undefined;
+  }
+
+  private async jsonWorker<T>(
+    roleName: string,
+    options: { prompt: string; cwd: string; session: string; writeScope: string[] },
+    validate: (value: any) => { value?: T; error?: string },
+  ): Promise<{ value: T } | { failure: string }> {
     let prompt = options.prompt;
     for (let attempt = 0; attempt < 3; attempt++) {
       const result = await this.work(roleName, { ...options, prompt });
       if (result.isError) {
         if (attempt < 2) continue;
-        throw new StopRun("failed", `The ${roleName} worker failed: ${result.errorMessage}`);
+        return { failure: `The ${roleName} worker failed: ${result.errorMessage}` };
       }
       const parsed = extractJson(result.text);
       const checked = parsed.error ? { error: parsed.error } : validate(parsed.value);
-      if (checked.value !== undefined && !checked.error) return checked.value;
+      if (checked.value !== undefined && !checked.error) return { value: checked.value };
       prompt = `Your reply could not be used: ${checked.error}\nReply again with only the corrected fenced json block.`;
     }
-    throw new StopRun("failed", `The ${roleName} worker did not return usable JSON after 3 attempts.`);
+    return { failure: `The ${roleName} worker did not return usable JSON after 3 attempts.` };
   }
 
   private approve(title: string, summary: string, extraOptions: string[] = []): Promise<string> {
@@ -1472,29 +1514,209 @@ Work only inside the current working directory.`;
     return { verdict, text };
   }
 
+  // -- verification (plan §8 phase 7) ------------------------------------------
+
+  /** Verification rounds started so far (persisted as hidden "verify:<n>" notes). */
+  private verifyRounds(): number {
+    return this.state.notes.filter((n) => /^verify:\d+$/.test(n)).length;
+  }
+
+  private hasWorker(role: string): boolean {
+    return this.deps.roles.has(role) && Boolean(this.deps.team.members[role]);
+  }
+
+  /**
+   * Integration and verification: every gate on the integrated build with a
+   * fresh install, then a QA worker tries the software like a user. Bugs at or
+   * above the severity threshold become bug tickets and the run goes back to
+   * the build, at most qaRounds times; after that you decide (auto: release
+   * with the bugs listed as known issues).
+   */
+  private async verify(): Promise<void> {
+    const { deps, state } = this;
+    const settings = this.settings;
+    const worktree = await this.ensureWorkspace();
+    const profile = this.profile();
+    const round = this.verifyRounds() + 1;
+    state.notes.push(`verify:${round}`);
+    this.save();
+
+    const opened: Ticket[] = [];
+    const gates = await this.gates(worktree, { where: "integration" });
+    if (!gates.ok) opened.push(integrationBugTicket(describeGateFailure(gates.results), state.tickets, round));
+
+    // A red build is the bug; exploratory QA runs on a green one.
+    let report: QaReport | undefined;
+    if (gates.ok && settings.exploratoryQa && this.hasWorker("qa")) {
+      const fixed = state.tickets.filter((t) => t.kind === "bug" && t.status === "done" && t.foundInRound === round - 1);
+      const untrackedBefore = new Set(await untrackedFiles(worktree));
+      report = await this.tryWorkJson(
+        "qa",
+        {
+          prompt: prompts.exploratoryQaPrompt({ profile, tickets: state.tickets, requirements: this.requirementIdsFromSpec(), round, fixed }),
+          cwd: worktree,
+          session: `verify-${round}`,
+          writeScope: [],
+        },
+        normalizeQaReport,
+      );
+      // QA must leave the integration tree as it found it.
+      const leftovers = await restoreAfter(worktree, untrackedBefore);
+      if (leftovers.length) deps.store.ledger({ kind: "verify-cleanup", runId: state.runId, round, removed: leftovers.slice(0, 50) });
+      if (report) {
+        const created = bugTickets(report, [...state.tickets, ...opened], settings.bugSeverity, round);
+        opened.push(...created);
+        deps.store.write(`qa/round-${round}.json`, JSON.stringify(report, null, 2));
+        deps.store.write(`qa/round-${round}.md`, qaReportMarkdown(report, round, settings.bugSeverity, created));
+        deps.ui.log("qa", { round, summary: report.summary, bugs: report.bugs.length, opened: created.map((t) => t.id) });
+      } else {
+        state.notes.push(`exploratory QA round ${round} returned no usable report`);
+      }
+    }
+    deps.store.ledger({
+      kind: "verify",
+      runId: state.runId,
+      round,
+      gatesOk: gates.ok,
+      bugs: report?.bugs.length,
+      opened: opened.map((t) => t.id),
+    });
+    for (const t of opened) this.ticketEvent(t, "opened", { severity: t.severity, round });
+    if (opened.length === 0) {
+      deps.store.write("qa/open-bugs.json", "[]");
+      this.save();
+      return;
+    }
+
+    const list = opened.map((t) => `- ${t.severity}: ${t.title.replace(/^Fix: /, "")}`).join("\n");
+    const loopBack = () => {
+      state.tickets.push(...opened);
+      state.phase = "build";
+      this.save();
+      deps.ui.notify(`Verification round ${round}: ${opened.length} bug ticket(s) (${opened.map((t) => t.id).join(", ")}); back to the build.`, "info");
+    };
+    if (round <= settings.qaRounds) return loopBack();
+
+    let release = this.autonomy === "auto";
+    if (!release) {
+      const choice = await this.ask(
+        `Verification still finds ${opened.length} bug(s) after ${round - 1} fix round(s):\n\n${list}`,
+        ["Release with these as known issues", "Run another fix round", "Pause the factory"],
+      );
+      if (choice === "Run another fix round") return loopBack();
+      if (choice !== "Release with these as known issues") throw new StopRun("paused", "Factory paused at verification. Run /factory resume to continue.");
+      release = true;
+    }
+    const open: QaBug[] = opened.map((t) => ({ title: t.title.replace(/^Fix: /, ""), severity: t.severity ?? "major", steps: [], expected: "", actual: "" }));
+    deps.store.write("qa/open-bugs.json", JSON.stringify(open, null, 2));
+    state.notes.push(`released with ${open.length} known bug(s) after ${round - 1} fix round(s)`);
+    this.save();
+  }
+
+  /** Requirement ids from the spec (for QA prompts and coverage). */
+  private requirementIdsFromSpec(): string[] {
+    return requirementIds(this.deps.store.read("spec/spec.md") ?? "");
+  }
+
   private async docs(): Promise<void> {
     const { deps, state } = this;
     const worktree = await this.ensureWorkspace();
     const profile = this.profile();
+    const ok = await this.writeDocs(worktree, prompts.docsPrompt({ settings: deps.answers, profile, tickets: state.tickets }), "docs: README, architecture, AGENTS.md and changelog");
+    if (!ok) state.notes.push("docs step did not pass the gates; documentation left as generated by the skeleton");
+    await this.contributorCheck(worktree, profile);
+  }
+
+  /** One documentation pass by the docs worker: docs files only, gates must still pass. */
+  private async writeDocs(worktree: string, prompt: string, message: string): Promise<boolean> {
+    const scope = ["README.md", "AGENTS.md", "CHANGELOG.md", "docs/**", "*.md"];
     for (let attempt = 0; attempt < 2; attempt++) {
       const result = await this.work("docs", {
-        prompt: attempt === 0 ? prompts.docsPrompt({ settings: deps.answers, profile, tickets: state.tickets }) : "The gates failed after your documentation change. Revert anything that is not documentation and make sure the gates pass.",
+        prompt: attempt === 0 ? prompt : "The gates failed after your documentation change. Revert anything that is not documentation and make sure the gates pass.",
         cwd: worktree,
         session: "docs",
-        writeScope: ["README.md", "AGENTS.md", "CHANGELOG.md", "docs/**", "*.md"],
+        writeScope: scope,
       });
       if (result.isError) break;
       const changed = await changedFiles(worktree);
-      const outside = outOfScope(changed, ["README.md", "AGENTS.md", "CHANGELOG.md", "docs/**", "*.md"]);
+      const outside = outOfScope(changed, scope);
       if (outside.length) await this.revertOutOfScope(worktree, outside);
       const gates = await this.gates(worktree, { skipInstall: true });
       if (gates.ok) {
-        await commitAll(worktree, "docs: README, architecture, AGENTS.md and changelog");
-        return;
+        await commitAll(worktree, message);
+        return true;
       }
     }
     await git(worktree, ["reset", "--hard", "HEAD"]);
-    state.notes.push("docs step did not pass the gates; documentation left as generated by the skeleton");
+    return false;
+  }
+
+  /**
+   * The M6 exit check: a fresh agent clones the build and, using only its
+   * docs, sets it up, runs the tests and makes a small extension. The harness
+   * re-runs the documented test commands and every gate in that clone. Gaps go
+   * to the docs worker for one fix round, then the check runs once more. The
+   * clone is thrown away; the result is reported, never fatal.
+   */
+  private async contributorCheck(worktree: string, profile: Profile): Promise<void> {
+    const { deps, state } = this;
+    if (!this.settings.contributorCheck) return;
+    if (!this.hasWorker("contributor")) {
+      state.notes.push("new-contributor check skipped: no contributor role or model");
+      return;
+    }
+    const outcomes: ContributorOutcome[] = [];
+    for (let round = 1; round <= 2; round++) {
+      const clone = fs.mkdtempSync(path.join(os.tmpdir(), "factory-contributor-"));
+      try {
+        const cloned = await git(deps.cwd, ["clone", "--quiet", "--no-hardlinks", "--branch", state.branch!, deps.cwd, clone], 300_000);
+        if (!cloned.ok) {
+          state.notes.push(`new-contributor check skipped: git clone failed (${truncate(cloned.stderr.trim(), 200)})`);
+          return;
+        }
+        this.showStatus(`new-contributor check · round ${round}`);
+        const report = await this.tryWorkJson(
+          "contributor",
+          { prompt: prompts.contributorPrompt({ idea: state.idea }), cwd: clone, session: `contributor-${round}`, writeScope: ["**"] },
+          normalizeContributorReport,
+        );
+        const timeout = deps.gateTimeoutMs ?? 10 * 60_000;
+        const docCommands: ContributorOutcome["docCommands"] = [];
+        for (const command of (report?.test ?? []).slice(0, 3)) {
+          const blocked = blockedCommand(command, { cwd: clone });
+          if (blocked) {
+            docCommands.push({ command, ok: false, output: `not run: ${blocked}` });
+            continue;
+          }
+          const run = await runCommand(command, clone, timeout);
+          docCommands.push({ command, ok: run.code === 0, output: truncate(run.output, 600) });
+        }
+        const gates = await runGates(profile, clone, { timeoutMs: deps.gateTimeoutMs });
+        const outcome = judgeContributor({
+          round,
+          report,
+          docCommands,
+          gatesOk: gatesPassed(gates, profile),
+          gatesSummary: summarizeGates(gates),
+          changedFiles: await changedFiles(clone),
+        });
+        outcomes.push(outcome);
+        deps.store.ledger({ kind: "contributor", runId: state.runId, round, passed: outcome.passed, reasons: outcome.reasons });
+      } finally {
+        fs.rmSync(clone, { recursive: true, force: true });
+      }
+      deps.store.write("contributor.md", contributorMarkdown(outcomes));
+      deps.store.write("contributor.json", JSON.stringify(outcomes.at(-1), null, 2));
+      const last = outcomes.at(-1)!;
+      deps.ui.log("contributor", { round, passed: last.passed, reasons: last.reasons });
+      if (last.passed || round === 2 || !last.report) break;
+      const fixed = await this.writeDocs(
+        worktree,
+        prompts.docsGapPrompt({ reasons: last.reasons, gaps: last.report.gaps }),
+        "docs: fix gaps found by the new-contributor check",
+      );
+      if (!fixed) break;
+    }
   }
 
   private async release(): Promise<void> {
@@ -1509,12 +1731,17 @@ Work only inside the current working directory.`;
     }
     const done = state.tickets.filter((t) => t.status === "done").length;
     const skipped = state.tickets.filter((t) => t.status === "skipped").map((t) => t.id);
+    const version = projectVersion(worktree);
+    const verification = this.verificationResults();
+    const fixedBugs = state.tickets.filter((t) => t.kind === "bug" && t.status === "done").length;
     const summary = [
       `${done}/${state.tickets.length} tickets delivered${skipped.length ? ` (skipped: ${skipped.join(", ")})` : ""}.`,
       `Gates on the final build: ${summarizeGates(final.results)}`,
+      `Exploratory QA: ${verification.rounds} round(s), ${fixedBugs} bug(s) fixed, ${verification.openBugs.length} known issue(s)`,
+      `New-contributor check: ${verification.contributor ? (verification.contributor.passed ? "passed" : `failed (${verification.contributor.reasons.join("; ")})`) : "not run"}`,
       `Secret scan: ${secrets.length ? `${secrets.length} finding(s)` : "clean"}`,
       `Spent: ${this.budgetLine()}.`,
-      `Branch: ${state.branch}${state.baseBranch ? ` → merge into ${state.baseBranch}` : ""}`,
+      `Version: ${version} · Branch: ${state.branch}${state.baseBranch ? ` → merge into ${state.baseBranch}` : ""}`,
     ].join("\n");
 
     let merged = false;
@@ -1547,16 +1774,77 @@ Work only inside the current working directory.`;
       }
     }
 
+    // Release notes, a local version tag, then the retrospective (plan §8 phases 8–9).
+    deps.store.write(
+      "release-notes.md",
+      releaseNotes({ state, version, gatesSummary: summarizeGates(final.results), qaRounds: verification.rounds, openBugs: verification.openBugs, contributor: verification.contributor }),
+    );
+    let tag: string | undefined;
+    if (this.settings.tagRelease && final.ok && secrets.length === 0) {
+      tag = await this.tagRelease(merged ? deps.cwd : worktree, `v${version}`);
+    }
     if (merged) await removeWorktree(deps.cwd, worktree);
-    const report = this.report(summary, merged, final.ok);
+    const report = this.report(`${summary}${tag ? `\nTag: ${tag}` : ""}`, merged, final.ok);
     deps.store.write("report.md", report);
+    deps.store.write(
+      "retro.md",
+      retrospective({
+        state,
+        ledger: deps.store.readLedger(),
+        merged,
+        gatesOk: final.ok,
+        qaRounds: verification.rounds,
+        openBugs: verification.openBugs,
+        minorBugs: verification.minorBugs,
+        untested: verification.untested,
+        contributor: verification.contributor,
+      }),
+    );
     deps.ui.log("report", { text: report });
     deps.ui.notify(
-      merged
-        ? `Factory done: merged into ${state.baseBranch}. Report: .factory/report.md`
-        : `Factory done. The build is on branch ${state.branch}. Report: .factory/report.md`,
+      `${merged ? `Factory done: merged into ${state.baseBranch}` : `Factory done. The build is on branch ${state.branch}`}${tag ? `, tagged ${tag}` : ""}. ` +
+        "Report: .factory/report.md · Release notes: .factory/release-notes.md · Retrospective: .factory/retro.md",
       "info",
     );
+  }
+
+  /** Results of verification and the new-contributor check, read back from .factory/. */
+  private verificationResults(): { rounds: number; openBugs: QaBug[]; minorBugs: QaBug[]; untested: string[]; contributor?: ContributorOutcome } {
+    const { store } = this.deps;
+    const parse = <T>(rel: string): T | undefined => {
+      try {
+        const raw = store.read(rel);
+        return raw ? (JSON.parse(raw) as T) : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const rounds = this.verifyRounds();
+    const last = rounds > 0 ? parse<QaReport>(`qa/round-${rounds}.json`) : undefined;
+    const threshold = this.settings.bugSeverity;
+    const below = (b: QaBug) => b.severity === "minor" && threshold !== "minor";
+    return {
+      rounds,
+      openBugs: parse<QaBug[]>("qa/open-bugs.json") ?? [],
+      minorBugs: (last?.bugs ?? []).filter(below),
+      untested: (last?.checks ?? []).filter((c) => c.result === "untested").map((c) => c.requirement),
+      contributor: parse<ContributorOutcome>("contributor.json"),
+    };
+  }
+
+  /** Lightweight local tag; never moves an existing tag and never pushes. */
+  private async tagRelease(repo: string, name: string): Promise<string | undefined> {
+    const exists = await git(repo, ["rev-parse", "--verify", "--quiet", `refs/tags/${name}`]);
+    if (exists.ok) {
+      this.state.notes.push(`not tagged: ${name} already exists`);
+      return undefined;
+    }
+    const res = await git(repo, ["tag", name, "HEAD"]);
+    if (!res.ok) {
+      this.state.notes.push(`not tagged: ${truncate(res.stderr.trim(), 200)}`);
+      return undefined;
+    }
+    return name;
   }
 
   report(summary: string, merged: boolean, gatesOk: boolean): string {
@@ -1580,7 +1868,10 @@ Work only inside the current working directory.`;
       "",
       "## Tickets",
       "",
-      ...this.state.tickets.map((t) => `- ${t.status === "done" ? "✓" : t.status === "skipped" ? "–" : "✗"} ${t.id} ${t.title} (${t.attempts.length} attempt${t.attempts.length === 1 ? "" : "s"})`),
+      ...this.state.tickets.map(
+        (t) =>
+          `- ${t.status === "done" ? "✓" : t.status === "skipped" ? "–" : "✗"} ${t.id} ${t.title}${t.kind === "bug" ? ` [${t.severity ?? "bug"}, QA round ${t.foundInRound ?? "?"}]` : ""} (${t.attempts.length} attempt${t.attempts.length === 1 ? "" : "s"})`,
+      ),
       "",
       "## Cost by role",
       "",
@@ -1588,10 +1879,16 @@ Work only inside the current working directory.`;
       "|---|---|---|---|---|",
       ...[...byRole.entries()].map(([role, r]) => `| ${role} | ${r.model} | ${r.runs} | ${formatTokens(r.tokens)} | ${formatCost(r.cost)} |`),
     ];
-    const visibleNotes = this.state.notes.filter((n) => !n.includes(":written") && !/^brainstorm:\d+$/.test(n) && !n.startsWith("breaker:"));
+    const visibleNotes = this.state.notes.filter((n) => !n.includes(":written") && !/^brainstorm:\d+$/.test(n) && !/^verify:\d+$/.test(n) && !n.startsWith("breaker:"));
     if (visibleNotes.length) {
       lines.push("", "## Notes", "", ...visibleNotes.map((n) => `- ${n}`));
     }
+    const extras = [
+      ["qa", "Exploratory QA reports: .factory/qa/"],
+      ["contributor.md", "New-contributor check: .factory/contributor.md"],
+      ["release-notes.md", "Release notes: .factory/release-notes.md"],
+    ].filter(([rel]) => fs.existsSync(this.deps.store.path(rel)));
+    lines.push("", "## More", "", ...extras.map(([, label]) => `- ${label}`), "- Retrospective: .factory/retro.md");
     return `${lines.join("\n")}\n`;
   }
 }

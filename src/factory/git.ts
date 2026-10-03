@@ -140,6 +140,24 @@ export async function commitAll(cwd: string, message: string): Promise<{ commit?
   return { commit: await headCommit(cwd) };
 }
 
+/** Untracked, non-ignored files (relative paths). */
+export async function untrackedFiles(cwd: string): Promise<string[]> {
+  const res = await git(cwd, ["ls-files", "--others", "--exclude-standard"]);
+  return res.stdout.split("\n").filter(Boolean);
+}
+
+/**
+ * Undo what a read-only worker left behind: restore tracked files and delete
+ * only the untracked files that were not there before (`before`), so
+ * dependencies installed into an un-ignored folder survive.
+ */
+export async function restoreAfter(cwd: string, before: Set<string>): Promise<string[]> {
+  await git(cwd, ["reset", "--hard", "HEAD"]);
+  const added = (await untrackedFiles(cwd)).filter((file) => !before.has(file));
+  for (const file of added) fs.rmSync(path.join(cwd, file), { force: true });
+  return added;
+}
+
 /** Throw away uncommitted changes in the worktree (after a failed ticket attempt). */
 export async function discardChanges(cwd: string): Promise<void> {
   await git(cwd, ["reset", "--hard", "HEAD"]);

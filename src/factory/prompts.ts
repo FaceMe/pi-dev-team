@@ -515,3 +515,77 @@ report exactly what the user must provide instead of guessing.
 
 Report the deployed URL (or the exact failure) at the end.`;
 }
+
+export function exploratoryQaPrompt(args: { profile: Profile; tickets: Ticket[]; requirements: string[]; round: number; fixed: Ticket[] }): string {
+  const delivered = args.tickets.filter((t) => t.status === "done" && t.kind !== "bug").map((t) => `${t.id} ${t.title} (${t.requirements.join(", ") || "no requirement"})`);
+  const fixed = args.fixed.map((t) => `${t.id} ${t.title}`);
+  return `Exploratory QA, round ${args.round}: try the integrated build the way a real user would.
+
+The specification is docs/spec.md (requirements: ${args.requirements.join(", ") || "see the spec"}).
+Stack: ${args.profile.stack}. Gates: ${args.profile.gates.map((g) => `${g.name}: \`${g.command}\``).join("; ")}.
+Delivered tickets:
+${bullet(delivered.length ? delivered : ["(none)"])}
+${fixed.length ? `Bugs fixed since the last round (check each is really fixed):\n${bullet(fixed)}\n` : ""}
+Do not read the tests and call it done: the unit tests already pass. Run the
+software itself — the CLI with real arguments, the API with real requests (start
+the server in the background with output to a log, and stop it afterwards), the
+UI's build output — and walk each requirement's acceptance criteria end to end.
+Then go off the happy path: empty and invalid input, missing files or
+configuration, large input, repeated or out-of-order actions, error messages.
+
+Rules: do not change any tracked file (scratch files go in /tmp); report what you
+observed, with the exact command and output as evidence. Severity: "critical"
+(crash, data loss, security, a core requirement unusable), "major" (a requirement
+or acceptance criterion not met, wrong result), "minor" (cosmetic, unclear
+message, edge case outside the spec).
+
+Reply with only this JSON:
+\`\`\`json
+{
+  "summary": "two or three sentences",
+  "checks": [{ "requirement": "FR-001", "result": "pass|fail|untested", "evidence": "command → output" }],
+  "bugs": [{ "title": "short", "severity": "critical|major|minor", "requirement": "FR-001",
+             "steps": ["exact step"], "expected": "…", "actual": "…", "evidence": "command and output" }]
+}
+\`\`\`
+Use "bugs": [] when you found none.`;
+}
+
+export function contributorPrompt(args: { idea: string }): string {
+  return `You are a new contributor who has just cloned this repository. Nobody can help
+you: use only what the repository's own documentation tells you (README.md,
+AGENTS.md, docs/, CHANGELOG.md, comments). The project: ${args.idea}
+
+1. Follow the docs to set the project up, run its tests and run it. Use the
+   commands exactly as documented; when a documented step is missing, wrong or
+   unclear, note it as a gap (and work around it if you can).
+2. Make one small, realistic extension the way the docs say changes are made:
+   for example a new option, a validation rule, or a small endpoint or command,
+   with a test. Follow the conventions in AGENTS.md. Keep it to a few files.
+3. Run the tests again; they must pass with your change.
+
+Reply with only this JSON:
+\`\`\`json
+{
+  "setup": ["commands you ran to set up, as documented"],
+  "test": ["the documented test command(s)"],
+  "run": ["the documented command(s) that run the software"],
+  "extension": { "description": "what you added", "files": ["changed files"] },
+  "gaps": [{ "doc": "README.md", "problem": "what was missing, wrong or unclear", "blocking": true }],
+  "ok": true
+}
+\`\`\`
+"blocking" means you could not continue without guessing. Set "ok" to false
+when the docs alone were not enough to set up, test or extend the project.`;
+}
+
+export function docsGapPrompt(args: { reasons: string[]; gaps: Array<{ doc: string; problem: string; blocking: boolean }> }): string {
+  return `A new contributor tried to set up, test and extend the project using only its
+documentation, and got stuck:
+
+${bullet(args.reasons)}
+${args.gaps.length ? `\nGaps they reported:\n${bullet(args.gaps.map((g) => `${g.blocking ? "[blocking] " : ""}${g.doc}: ${g.problem}`))}\n` : ""}
+Fix the documentation (README.md, AGENTS.md, docs/) so the next contributor
+succeeds. Run every command you document to confirm it works. Change
+documentation files only. Reply with a short summary of what you fixed.`;
+}
