@@ -105,7 +105,8 @@ export async function configureRoleModels(answers: SetupAnswers, deps: SetupDeps
       ...bulk.map((group) => group.label),
       saveLabel,
     ];
-    const selected = await deps.ui.select("Role models — Enter configures; Esc returns to Team", options, { initialIndex });
+    const title = saveLabel === SAVE_SETTINGS ? "Role models — Save settings to keep changes; Esc discards" : "Role models — Enter configures; Esc returns to Team";
+    const selected = await deps.ui.select(title, options, { initialIndex });
     if (selected === undefined) return false;
     if (selected === saveLabel) return true;
     initialIndex = Math.max(0, options.indexOf(selected));
