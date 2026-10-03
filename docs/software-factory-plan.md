@@ -11,9 +11,9 @@ It builds on the ideas in Cognition's
 [Devin Fusion](https://cognition.com/blog/devin-fusion) post, which the existing
 `fusion` extension already implements in part.
 
-- Status: **M0 and M1 implemented** (see [Implementation status](#implementation-status)); M2–M7 planned
+- Status: **M0–M2 implemented** (see [Implementation status](#implementation-status)); M3–M7 planned
 - Scope: this repository (pi extension package)
-- Last updated: 2026-09-24
+- Last updated: 2026-10-03
 
 ---
 
@@ -23,11 +23,23 @@ It builds on the ideas in Cognition's
 |---|---|---|
 | M0 hygiene | Done | Code split into `extensions/*/index.ts` + `src/`; one config module (`src/shared/config.ts`); bugs B1–B9 fixed plus B10 (the sidekick turn cap never worked: `shouldStopAfterTurn` is not an `Agent` option; now `finishTurn`); tsconfig, vitest, CI; v2.0.0 |
 | M1 quick-start slice | Done | `/factory` with quick setup, automatic team from any provider, interview, spec, architecture, plan, skeleton, test-first build with gates and cross-family review, escalation, docs, merge, report, budget breaker, pause/resume, doctor, demo, headless mode |
-| M2–M7 | Planned | Parallel tickets, deeper discovery (brainstorm fan-out, readiness scoring), profile templates, QA role, deploy hardening, benchmarks |
+| M2 resume, board and cost | Done | Run state moved to `.factory/factory.lock.json` (M1's `state.json` is migrated on first load) with normalization of damaged state, an archived-runs folder (`runs/`), and a run-scoped settings snapshot applied on resume (the team still follows current logins). Session start offers to resume. Live board widget, `/factory board`, `/factory trace [ticket\|role]`, `/factory roles` (picker Factory tab), `/factory cost` per phase/role/ticket/model with an estimated all-frontier savings line. Ledger entries carry `runId`, input/output token split and bounded traces; skeleton phase resumes without re-prompting a worker when the gates already pass |
+| M3–M7 | Planned | Parallel tickets, deeper discovery (brainstorm fan-out, readiness scoring), profile templates, QA role, deploy hardening, benchmarks |
 
-Verification: 71 tests, including the whole pipeline with **real `pi` worker
-processes** against a mock OpenAI-compatible model, and the real `/factory new`
-command run headless in a pi session.
+Verification: 222 tests across 17 files, including the whole pipeline with
+**real `pi` worker processes** against a mock OpenAI-compatible model, and the
+real `/factory new` command run headless in a pi session.
+
+Decisions made while building M2:
+
+- **The lock is the state file.** `.factory/factory.lock.json` replaces
+  `state.json` (the plan's §12.1 name), with a migration on first load and
+  normalization so a damaged file degrades to "no run" instead of a crash.
+- **The settings snapshot is run-scoped only** (autonomy, project mode, stack,
+  research, deploy). Team preset and pins are deliberately not snapshotted, so
+  `/factory team` changes keep applying on resume, as documented.
+- **Traces ride in the ledger.** Each worker entry stores its (already bounded)
+  trace so `/factory trace` works across restarts without a separate store.
 
 Decisions made while building M1:
 

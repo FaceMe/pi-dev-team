@@ -61,10 +61,13 @@ mkdir habit-tracker && cd habit-tracker && pi
 | Command | Action |
 |---|---|
 | `/factory new [idea]` | Quick setup, then run the whole flow |
-| `/factory status` · `/factory cost` | Where the run is; spend by role and model |
-| `/factory pause` · `/factory resume` | Pause after the current step; continue (also after restarting pi) |
+| `/factory status` · `/factory cost` | Where the run is; spend by phase, role, ticket and model, with estimated savings vs an all-frontier team |
+| `/factory board` | Ticket board: what is running, blocked and done |
+| `/factory trace [ticket\|role]` | Expandable trace of the last worker run |
+| `/factory pause` · `/factory resume` | Pause after the current step; continue (also after restarting pi — pi offers to resume when you open the project) |
 | `/factory doctor [probe]` | Check git, pi, models, team, pi-web-access, toolchains and deploy CLIs, with fixes; `probe` sends one tool call to each team model |
 | `/factory team [balanced\|cheap\|best]` | Show or change the team |
+| `/factory roles` | Assign a model to any role with the two-panel picker |
 | `/factory autonomy auto\|balanced\|careful` | Switch at any time, even mid-run |
 | `/factory settings` | Change the quick-setup answers for this folder |
 | `/factory run <role> <brief>` | Run one role once, read-only (try a model, ask the architect) |
@@ -85,8 +88,11 @@ How it works:
 - **Roles are Markdown** — override any role (tier, effort, tools, prompt) in
   `~/.pi/agent/factory/roles/<role>.md`.
 
-Project state lives in `.factory/` (spec, ADRs, profile, tickets, reviews,
-ledger, report; worker sessions and the worktree are git-ignored). See
+Project state lives in `.factory/` (the run lock `factory.lock.json`, spec,
+ADRs, profile, tickets, reviews, ledger, report; worker sessions and the
+worktree are git-ignored). A paused run survives a pi restart: the lock carries
+the phase, tickets, spend and a settings snapshot, and pi offers to resume when
+you open the project. See
 [docs/software-factory-plan.md](docs/software-factory-plan.md) for the design
 and roadmap.
 

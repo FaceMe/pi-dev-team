@@ -69,6 +69,32 @@ export type ProjectMode = "new" | "existing";
 export type ResearchMode = "web-access" | "install-web-access" | "off";
 export type DeployMode = "none" | "config" | "deploy";
 
+/**
+ * Run-scoped settings, snapshotted into the lock when a run starts so a resume
+ * reproduces the run's own answers. The team (preset and pins) is deliberately
+ * not snapshotted: it is re-derived from the models logged in at resume time.
+ */
+export interface RunSettings {
+  autonomy: Autonomy;
+  projectMode: ProjectMode;
+  stack: string;
+  research: ResearchMode;
+  deploy: DeployMode;
+  deployTarget?: string;
+}
+
+/** The run-scoped keys of SetupAnswers. */
+export function runSettings(answers: SetupAnswers): RunSettings {
+  return {
+    autonomy: answers.autonomy,
+    projectMode: answers.projectMode,
+    stack: answers.stack,
+    research: answers.research,
+    deploy: answers.deploy,
+    deployTarget: answers.deployTarget,
+  };
+}
+
 /** Answers to the quick setup questions. */
 export interface SetupAnswers {
   teamPreset: TeamPreset;
@@ -193,6 +219,8 @@ export interface FactoryState {
   status: "running" | "paused" | "waiting" | "failed" | "done";
   createdAt: string;
   updatedAt: string;
+  /** Run-scoped setup answers, snapshotted at start and applied on resume. */
+  settings?: RunSettings;
   /** Branch the user was on when the run started (release merges back into it). */
   baseBranch?: string;
   baseCommit?: string;
