@@ -524,8 +524,8 @@
         and gates are run by the factory itself — never claimed by an agent.
       </p>
       <div class="note">
-        <b>Headless too.</b> Without a UI (print / JSON / RPC mode), <code>/factory new</code> accepts the
-        prefilled answers and runs to completion — so the factory works from scripts and CI.
+        <b>Headless review.</b> Without interactive UI, <code>/factory new</code> uses saved setup answers.
+        It records the full specification and pauses for approval. Resume in an interactive session to review or amend the draft.
       </div>
     </div>
   </div>
@@ -954,6 +954,15 @@ total <span class="t-bold">$1.24</span> · 412.3k tokens · 19 worker run(s)
   </div>
 </section>
 
+<section id="factory-design">
+  <div class="kicker k-blue">Factory design and browser QA</div>
+  <h2>Review the design. Test the application.</h2>
+  <p class="lead">The designer writes a local preview, design system, and frontend handoff. Frontend workers read these files under <code>docs/design/</code>.</p>
+  <div class="note">Open <code>/factory settings</code> and select <b>Design/browser</b>. Enable your Paper, OpenDesign, or Doop MCP bridge and select its exact loaded tool names. OpenDesign provides read-only design references.</div>
+  <p>Enable Brave QA to test application journeys with project-local Playwright. The factory records actions, assertions, screenshots, and errors. Missing tools produce an untested result.</p>
+  <p>Use the <a href="factory.md">factory guide</a> for setup procedures and the <a href="factory-usability-plan.md">usability plan</a> for research and validation details.</p>
+</section>
+
 <!-- ============ PICKER ============ -->
 <section id="picker">
   <div class="kicker k-blue">05 · model picker</div>
@@ -1272,15 +1281,18 @@ total <span class="t-bold">$1.24</span> · 412.3k tokens · 19 worker run(s)
       <tr><th>Command</th><th>Action</th></tr>
       <tr><td><span class="cmd">/factory new [idea]</span></td><td class="desc">Quick setup, then run the whole flow</td></tr>
       <tr><td><span class="cmd">/factory status</span> · <span class="cmd">/factory cost</span></td><td class="desc">Where the run is · spend by phase, role, ticket and model, with savings vs an all-frontier team</td></tr>
-      <tr><td><span class="cmd">/factory board</span></td><td class="desc">Ticket board: running, blocked and done</td></tr>
+      <tr><td><span class="cmd">/factory board</span></td><td class="desc">Show progress, active workers, and open tickets</td></tr>
+      <tr><td><span class="cmd">/factory tasks [id]</span> · <span class="cmd">/factory agents</span></td><td class="desc">Inspect tasks, dependencies, live subagents, and recent results</td></tr>
+      <tr><td><span class="cmd">/factory spec</span></td><td class="desc">Read the full draft in a scrolling CLI viewer</td></tr>
+      <tr><td><span class="cmd">/factory integrations</span></td><td class="desc">Configure Paper, OpenDesign, Doop, and Brave browser QA</td></tr>
       <tr><td><span class="cmd">/factory trace [ticket|role]</span></td><td class="desc">Expandable trace of the last worker run — thinking, tool calls, output excerpts</td></tr>
       <tr><td><span class="cmd">/factory qa [round]</span> · <span class="cmd">/factory retro</span></td><td class="desc">Exploratory QA reports and the new-contributor check · the retrospective</td></tr>
       <tr><td><span class="cmd">/factory pause</span> · <span class="cmd">/factory resume</span></td><td class="desc">Pause after the current step · continue (also offered automatically when you reopen the project)</td></tr>
       <tr><td><span class="cmd">/factory doctor [probe]</span></td><td class="desc">Check git, pi, models, team, pi-web-access, toolchains, deploy CLIs — with fixes; probe sends one tool call to each team model</td></tr>
       <tr><td><span class="cmd">/factory team [balanced|cheap|best|refresh]</span></td><td class="desc">Show or change the team · re-derive from the models you're logged in to now</td></tr>
-      <tr><td><span class="cmd">/factory roles</span></td><td class="desc">Assign a model to any role with the picker's Factory tab</td></tr>
+      <tr><td><span class="cmd">/factory roles</span></td><td class="desc">Configure individual roles or role groups. Save or cancel a model choice to return to the same role list.</td></tr>
       <tr><td><span class="cmd">/factory autonomy &lt;preset&gt;</span></td><td class="desc">Switch at any time, even mid-run</td></tr>
-      <tr><td><span class="cmd">/factory settings</span></td><td class="desc">Change the quick-setup answers for this folder</td></tr>
+      <tr><td><span class="cmd">/factory settings</span></td><td class="desc">Save model, design, browser, and project settings without starting a run</td></tr>
       <tr><td><span class="cmd">/factory run &lt;role&gt; &lt;brief&gt;</span></td><td class="desc">Run one role once, read-only — try a model, ask the architect</td></tr>
       <tr><td><span class="cmd">/factory demo</span></td><td class="desc">Build a tiny to-do CLI in a temp folder on <code>auto</code></td></tr>
     </table>

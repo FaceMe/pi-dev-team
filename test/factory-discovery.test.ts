@@ -424,7 +424,7 @@ describe("spec validator", () => {
     expect(final.lastError).toContain("architect");
   }, 30_000);
 
-  itV("does not hard-fail on persistent validator problems; the user judges at the approval gate", async () => {
+  itV("pauses on persistent validator problems without approving an invalid draft", async () => {
     const cwd = tempDir("factory-specv2-");
     const runner = new ScriptedRunner({
       analyst: (req: WorkerRequest) => {
@@ -432,7 +432,7 @@ describe("spec validator", () => {
         return { text: "written", files: { ".factory/spec/spec.md": VAGUE_SPEC } };
       },
     });
-    const { ui, selects } = scriptedUi();
+    const { ui, selects } = scriptedUi({ select: () => "Pause the factory" });
     const a = answers();
     const deps = makeDeps(cwd, runner, ui, a);
     const final = await new FactoryRun(deps, newState(SMALL_IDEA, "run-sv2", a)).run();
@@ -440,13 +440,14 @@ describe("spec validator", () => {
     expect(final.notes.some((n) => n.startsWith("spec validator still failing"))).toBe(true);
     expect(selects[0].title).toContain("Approve the specification?");
     expect(selects[0].title).toMatch(/spec-validator issue\(s\) — see \.factory\/spec\/spec\.md/);
-    expect(final.phase).toBe("architecture");
-    expect(final.lastError).toContain("architect");
+    expect(final.phase).toBe("spec");
+    expect(deps.store.read("spec/approved.md")).toBeUndefined();
+    expect(final.status).toBe("paused");
   }, 30_000);
 
   it("falls back to counted requirements when the validator cannot run", async () => {
     const cwd = tempDir("factory-specstub-");
-    const spec = `# Spec\n\n- FR-001 Add numbers.\n  - Given 1 and 2 When added Then 3.\n- NFR-001 Responds in under 100 ms.\n`;
+    const spec = `# Spec\n\n- FR-001 Add numbers.\n  - Given 1 and 2 When added Then 3. Source: brief.\n- NFR-001 Responds in under 100 ms.\n`;
     const runner = new ScriptedRunner({
       analyst: (req: WorkerRequest) => {
         if (req.prompt.includes("interview round")) return { text: json({ ready: true, questions: [] }) };

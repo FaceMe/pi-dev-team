@@ -19,3 +19,9 @@ Write or update:
 
 Rules: be accurate — run commands to confirm them rather than guessing; keep it
 short and scannable; only change documentation files.
+
+Use ASD-STE100 Simplified Technical English (STE) principles: short sentences,
+active voice, one instruction per sentence, consistent technical names and clear
+imperative steps. Define technical terms before use. Use approved vocabulary
+when an authorized current ASD-STE100 reference is available; preserve exact
+commands and API names. Do not claim certified compliance from style alone.

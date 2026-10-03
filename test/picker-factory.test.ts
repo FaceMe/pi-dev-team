@@ -13,6 +13,7 @@ import {
   resolveFactoryRole,
   showFactoryRolePicker,
   showModelPicker,
+  SplitModelPickerComponent,
 } from "../src/picker/model-picker.js";
 import { fakeRegistry, fakeUi, makeModel, recordingPi } from "./helpers.js";
 
@@ -156,5 +157,58 @@ describe("showFactoryRolePicker fallback flow (non-TUI)", () => {
     expect(out).toBeDefined();
     expect(out?.factoryRole).toBeUndefined();
     expect("factoryRole" in (out ?? {})).toBe(false);
+  });
+});
+
+describe("persistent factory role picker", () => {
+  it("returns to the chooser after assignments and model cancellation", async () => {
+    const model = makeModel({ id: "m1", provider: "p" });
+    const { ui, selects } = fakeUi({ select: ["builder", "p/m1", "reviewer", undefined, undefined] });
+    const assigned: ModelPickerResult[] = [];
+    const out = await showFactoryRolePicker({ mode: "print", ui, modelRegistry: fakeRegistry([model]) } as any, recordingPi().api, {
+      roles: [{ name: "builder" }, { name: "reviewer" }],
+      onAssign: (result) => assigned.push(result),
+    });
+    expect(out).toBeUndefined();
+    expect(assigned).toHaveLength(1);
+    expect(assigned[0].factoryRole).toBe("builder");
+    expect(selects.map((s) => s.title)).toEqual([
+      "Assign models to factory roles", "Model for the builder role", "Assign models to factory roles",
+      "Model for the reviewer role", "Assign models to factory roles",
+    ]);
+    expect(selects[2].options[0]).toContain("p/m1");
+  });
+
+  it("renders the current assignment alongside the role description", () => {
+    expect(buildFactoryRoleRows([{ name: "builder", description: "Writes code", assignment: { provider: "p", modelId: "m1", effort: "high" } }], 80)).toEqual([
+      { name: "builder", description: "p/m1 · high — Writes code" },
+    ]);
+  });
+});
+
+
+describe("factory role picker TUI navigation", () => {
+  it("retains selected role after save and cancel, and exits from role chooser", () => {
+    const model = makeModel({ id: "m1", provider: "p" });
+    const done: unknown[] = [];
+    const assigned: ModelPickerResult[] = [];
+    const component = new SplitModelPickerComponent(
+      { requestRender() {} } as any, {} as any, (result) => done.push(result),
+      { mode: "tui", modelRegistry: fakeRegistry([model]) } as any, { ...recordingPi().api, getThinkingLevel: () => "off" },
+      { target: "factory-role", factoryRoles: [{ name: "builder" }, { name: "reviewer" }], onFactoryAssign: (result) => assigned.push(result) },
+    );
+    component.handleInput("\x1b[B"); // Select reviewer.
+    component.handleInput("\r"); // Role -> models.
+    component.handleInput("\r"); // Assign -> same role row.
+    expect(assigned.map((result) => result.factoryRole)).toEqual(["reviewer"]);
+    expect(done).toEqual([]);
+    component.handleInput("\r");
+    component.handleInput("\x1b"); // Cancel model selection -> role row.
+    expect(done).toEqual([]);
+    component.handleInput("\r");
+    component.handleInput("\r");
+    expect(assigned.map((result) => result.factoryRole)).toEqual(["reviewer", "reviewer"]);
+    component.handleInput("\x1b");
+    expect(done).toEqual([null]);
   });
 });

@@ -10,6 +10,7 @@ import * as path from "node:path";
 import { factoryConfigPath } from "../shared/config.js";
 import { readJsonFile, writeJsonFile } from "../shared/json-store.js";
 import { pricePerToken } from "../shared/models.js";
+import { integrationSettings } from "./integrations.js";
 import type { Model } from "@earendil-works/pi-ai";
 import type { Team } from "./team.js";
 import type { DeployMode, ProjectMode, ResearchMode, SetupAnswers } from "./types.js";
@@ -209,5 +210,6 @@ export function defaultAnswers(ctx: SetupContext, user: Partial<SetupAnswers>, p
     budgetUsd: project?.budgetUsd ?? ctx.budget.usd,
     budgetTokens: project?.budgetTokens ?? (ctx.budget.priced ? 0 : ctx.budget.tokens),
     ...(project?.build || user.build ? { build: { ...(user.build ?? {}), ...(project?.build ?? {}) } } : {}),
+    integrations: integrationSettings(project?.integrations ?? user.integrations),
   };
 }

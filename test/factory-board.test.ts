@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { boardLines } from "../src/factory/board.js";
+import { agentLines, boardLines, taskLines } from "../src/factory/board.js";
 import type { FactoryState, Ticket, TicketAttempt } from "../src/factory/types.js";
 
 function attempt(): TicketAttempt {
@@ -128,5 +128,34 @@ describe("boardLines", () => {
     boardLines(s, { activity: ["x: 1"] });
     expect(s.tickets.map((t) => t.id)).toEqual(["T-002", "T-001"]);
     expect(s.tickets[1].status).toBe("in_progress");
+  });
+});
+
+describe("full task and subagent views", () => {
+  it("shows all tasks, unmet dependencies and the latest failure", () => {
+    const s = state({ tickets: [ticket("T-001", "done"), ticket("T-002", "todo"), ticket("T-003", "blocked", { dependsOn: ["T-001", "T-002"], attempts: [{ ...attempt(), outcome: "gate_fail", note: "Button has no accessible label" }] }), ...Array.from({ length: 10 }, (_, i) => ticket(`T-${i + 4}`, "todo"))] });
+    const lines = taskLines(s);
+    expect(lines.filter(line => /^T-/.test(line))).toHaveLength(13);
+    expect(lines).toContain("  Waiting for: T-002");
+    expect(lines.join("\n")).toContain("Button has no accessible label");
+  });
+
+  it("shows a task's acceptance checks and handles missing tasks", () => {
+    const s = state({ tickets: [ticket("T-001", "todo", { brief: "Build a keyboard menu", acceptance: ["Escape returns to the same role"], requirements: ["FR-001"], writeScope: ["src/**"] })] });
+    expect(taskLines(s, "T-001").join("\n")).toContain("Escape returns to the same role");
+    expect(taskLines(s, "T-002")).toEqual(["No task named T-002."]);
+    expect(taskLines(state())).toEqual(["No tasks yet. Current phase: build."]);
+  });
+
+  it("separates live workers from this run's recent history after restart", () => {
+    const ledger = [{ kind: "worker", runId: "other-run", role: "old", model: "p/old", ok: true }, { kind: "worker", runId: "run-board", role: "qa", model: "p/test", ticket: "T-001", ok: false }];
+    const lines = agentLines(state(), [], ledger).join("\n");
+    expect(lines).toContain("0 running");
+    expect(lines).toContain("No live workers");
+    expect(lines).toContain("qa · p/test · T-001 · failed");
+    expect(lines).not.toContain("p/old");
+    const live = [{ id: "worker-1", role: "designer", model: "p/design", status: "running" as const, activity: "Inspecting the preview" }];
+    expect(agentLines(state(), live, ledger).join("\n")).toContain("Inspecting the preview");
+    expect(boardLines(state(), { workers: live }).join("\n")).toContain("designer · p/design");
   });
 });

@@ -74,7 +74,7 @@ describe.skipIf(!fs.existsSync(piCli))("factory with real pi workers", () => {
     expect(fs.readFileSync(path.join(cwd, ".factory/retro.md"), "utf8")).toMatch(/## Cost by phase/);
   }, 300_000);
 
-  it("runs headless through the real /factory command in a pi session", async () => {
+  it("pauses headless at specification approval and resumes after human review", async () => {
     const cwd = tempDir("factory-headless-");
     // Only the mock provider: hide ambient cloud credentials from the child.
     const env: NodeJS.ProcessEnv = {};
@@ -117,7 +117,23 @@ describe.skipIf(!fs.existsSync(piCli))("factory with real pi workers", () => {
       .map((e) => e.entry.data);
     expect(entries.some((d) => d.kind === "report")).toBe(true);
     const state = new FactoryStore(cwd).loadState()!;
-    expect(state.status).toBe("done");
+    expect(state.status).toBe("paused");
+    expect(state.phase).toBe("spec");
+    const store = new FactoryStore(cwd);
+    expect(store.read("spec/spec.md")).toContain("FR-001");
+    expect(store.read("spec/approved.md")).toBeUndefined();
+    expect(fs.existsSync(path.join(cwd, "src/add.js"))).toBe(false);
+    // Resume with an explicit review UI; the persisted draft is shown before approval.
+    const { ui } = scriptedUi();
+    const viewed: string[] = [];
+    ui.viewSpec = async markdown => { viewed.push(markdown); };
+    const roles = loadRoles();
+    const team = { members: Object.fromEntries([...roles.keys()].map(role => [role, { role, provider: "mock", modelId: "mock-model", tier: "daily" as const, family: "mock" }])), tiers: {} as any, notes: [] };
+    const runner = new PiSubprocessRunner(env);
+    const final = await new FactoryRun({ cwd, ui, runner, roles, team, answers: { teamPreset: "balanced", pins, autonomy: "auto", projectMode: "new", stack: "auto", research: "off", deploy: "none", budgetUsd: 0, budgetTokens: 0 }, store, webAccess: false, workerTimeoutMs: 120_000, gateTimeoutMs: 60_000 }, state).run();
+    expect(viewed).toEqual([store.read("spec/approved.md")]);
+    expect(final.lastError).toBeUndefined();
+    expect(final.status).toBe("done");
     expect(fs.readFileSync(path.join(cwd, "src/add.js"), "utf8")).toContain("a + b");
   }, 300_000);
 });

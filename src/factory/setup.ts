@@ -5,12 +5,15 @@
  */
 
 import { formatTokens } from "../shared/usage.js";
+import { integrationSettings } from "./integrations.js";
 import type { DeployTarget } from "./settings.js";
 import type { Team } from "./team.js";
 import { describeTeam } from "./team.js";
 import type { Autonomy, FactoryUI, SetupAnswers, TeamPreset } from "./types.js";
 
 export const START = "▶ Start with these answers";
+export const SAVE_SETTINGS = "✓ Save settings";
+export const BACK = "← Back";
 
 export const AUTONOMY_TEXT: Record<Autonomy, string> = {
   auto: "auto — you approve the spec; everything else runs",
@@ -26,6 +29,9 @@ const PRESET_TEXT: Record<TeamPreset, string> = {
 
 export interface SetupDeps {
   ui: FactoryUI;
+  /** Settings saves preferences without launching a project. */
+  mode?: "start" | "settings";
+  roleGroups?: { label: string; roles: string[] }[];
   roles: string[];
   deployTargets: DeployTarget[];
   webAccessInstalled: boolean;
@@ -33,7 +39,8 @@ export interface SetupDeps {
   budgetEstimate: { usd: number; tokens: number; priced: boolean; size: string };
   previewTeam: (answers: SetupAnswers) => Team;
   /** Opens the model picker for a role; returns the chosen model or undefined. */
-  pickModel?: (role: string) => Promise<{ provider: string; modelId: string; effort?: any } | undefined>;
+  pickModel?: (role: string, current?: SetupAnswers["pins"][string]) => Promise<{ provider: string; modelId: string; effort?: any } | undefined>;
+  configureIntegrations?: (current?: SetupAnswers["integrations"]) => Promise<SetupAnswers["integrations"] | undefined>;
 }
 
 export function budgetText(answers: SetupAnswers, estimate: SetupDeps["budgetEstimate"]): string {
@@ -68,7 +75,7 @@ export function setupLines(answers: SetupAnswers, deps: SetupDeps): string[] {
   const teamSummary = describeTeam(team).join(" · ") || "no models logged in";
   const pins = Object.keys(answers.pins).length;
   return [
-    START,
+    deps.mode === "settings" ? SAVE_SETTINGS : START,
     `Team: ${answers.teamPreset}${pins ? ` + ${pins} pinned` : ""} — ${teamSummary}`,
     `Autonomy: ${AUTONOMY_TEXT[answers.autonomy]}`,
     `Project: ${answers.projectMode === "existing" ? "add to the existing project in this folder" : "new project in this folder"}`,
@@ -76,38 +83,92 @@ export function setupLines(answers: SetupAnswers, deps: SetupDeps): string[] {
     `Web research: ${researchText(answers, deps.webAccessInstalled)}`,
     `Deployment: ${deployText(answers, deps.deployTargets)}`,
     `Budget: ${budgetText(answers, deps.budgetEstimate)}`,
+    ...(deps.configureIntegrations ? [`Design/browser: ${Object.values(answers.integrations?.design ?? {}).filter(bridge => bridge?.enabled !== false).length} design bridges · Brave QA ${answers.integrations?.browser?.enabled ? "on" : "off"}`] : []),
   ];
+}
+
+/** Edit assignments repeatedly; picker save/cancel returns to this list. */
+export async function configureRoleModels(answers: SetupAnswers, deps: SetupDeps, saveLabel = BACK): Promise<boolean> {
+  let initialIndex = 0;
+  for (;;) {
+    const team = deps.previewTeam(answers);
+    const assignment = (role: string) => {
+      const member = team.members[role] ?? answers.pins[role];
+      return member ? `${member.provider}/${member.modelId}${member.effort ? ` · ${member.effort}` : ""}` : "no model available";
+    };
+    const bulk = [
+      { label: "Assign all roles…", roles: deps.roles },
+      ...(deps.roleGroups ?? []).map((group) => ({ label: `Assign ${group.label}…`, roles: group.roles.filter((role) => deps.roles.includes(role)) })),
+    ].filter((group) => group.roles.length > 0);
+    const options = [
+      ...deps.roles.map((role) => `${role}: ${assignment(role)}${answers.pins[role] ? " (pinned)" : ""}`),
+      ...bulk.map((group) => group.label),
+      saveLabel,
+    ];
+    const title = saveLabel === SAVE_SETTINGS ? "Role models — Save settings to keep changes; Esc discards" : "Role models — Enter configures; Esc returns to Team";
+    const selected = await deps.ui.select(title, options, { initialIndex });
+    if (selected === undefined) return false;
+    if (selected === saveLabel) return true;
+    initialIndex = Math.max(0, options.indexOf(selected));
+    const group = bulk.find((item) => item.label === selected);
+    const role = deps.roles.find((name) => selected === name || selected.startsWith(`${name}:`));
+    const targets = group?.roles ?? (role ? [role] : []);
+    if (targets.length === 0 || !deps.pickModel) continue;
+    const first = targets[0];
+    const current = answers.pins[first] ?? team.members[first];
+    const model = await deps.pickModel(group ? group.label.replace(/…$/, "") : first, current);
+    if (model) for (const name of targets) answers.pins[name] = { ...model };
+  }
+}
+
+/** Standalone role settings: edits are staged until Save; Escape discards them. */
+export async function runRoleSetup(initial: SetupAnswers, deps: SetupDeps): Promise<SetupAnswers | undefined> {
+  const answers = { ...initial, pins: { ...initial.pins } };
+  return await configureRoleModels(answers, deps, SAVE_SETTINGS) ? answers : undefined;
+}
+
+async function configureTeam(answers: SetupAnswers, deps: SetupDeps): Promise<void> {
+  let initialIndex = 0;
+  for (;;) {
+    const options = [...(Object.keys(PRESET_TEXT) as TeamPreset[]).map((p) => PRESET_TEXT[p])];
+    if (deps.pickModel) options.push("configure role models…");
+    if (Object.keys(answers.pins).length > 0) options.push("clear pinned models");
+    options.push(BACK);
+    const pick = await deps.ui.select("Team", options, { initialIndex });
+    if (!pick || pick === BACK) return;
+    initialIndex = Math.max(0, options.indexOf(pick));
+    if (pick.startsWith("configure role") || pick.startsWith("pin a role")) {
+      await configureRoleModels(answers, deps);
+    } else if (pick.startsWith("clear pinned")) {
+      answers.pins = {};
+    } else {
+      answers.teamPreset = pick.split(" ")[0] as TeamPreset;
+    }
+  }
 }
 
 /** Run the quick setup. Returns the confirmed answers, or undefined if the user cancelled. */
 export async function runQuickSetup(initial: SetupAnswers, deps: SetupDeps): Promise<SetupAnswers | undefined> {
-  const answers: SetupAnswers = { ...initial, pins: { ...initial.pins } };
+  const answers: SetupAnswers = { ...initial, pins: { ...initial.pins }, ...(initial.integrations ? { integrations: integrationSettings(initial.integrations) } : {}) };
   const { ui } = deps;
 
-  for (let guard = 0; guard < 100; guard++) {
+  let initialIndex = 0;
+  for (;;) {
     const lines = setupLines(answers, deps);
-    const choice = await ui.select("Factory setup — Enter starts with these answers", lines);
+    const choice = await ui.select(deps.mode === "settings" ? "Factory settings — Save settings when finished" : "Factory setup — Enter starts with these answers", lines, { initialIndex });
     if (choice === undefined) return undefined;
-    if (choice === START) return answers;
+    if (choice === (deps.mode === "settings" ? SAVE_SETTINGS : START)) return answers;
+    initialIndex = Math.max(0, lines.indexOf(choice));
     const key = choice.split(":")[0];
 
     switch (key) {
+      case "Design/browser": {
+        const config = await deps.configureIntegrations?.(integrationSettings(answers.integrations));
+        if (config) answers.integrations = integrationSettings(config);
+        break;
+      }
       case "Team": {
-        const options = [...(Object.keys(PRESET_TEXT) as TeamPreset[]).map((p) => PRESET_TEXT[p])];
-        if (deps.pickModel) options.push("pin a role to a specific model…");
-        if (Object.keys(answers.pins).length > 0) options.push("clear pinned models");
-        const pick = await ui.select("Team", options);
-        if (!pick) break;
-        if (pick.startsWith("pin a role")) {
-          const role = await ui.select("Which role?", deps.roles);
-          if (!role || !deps.pickModel) break;
-          const model = await deps.pickModel(role);
-          if (model) answers.pins[role] = model;
-        } else if (pick.startsWith("clear pinned")) {
-          answers.pins = {};
-        } else {
-          answers.teamPreset = pick.split(" ")[0] as TeamPreset;
-        }
+        await configureTeam(answers, deps);
         break;
       }
       case "Autonomy": {
@@ -200,5 +261,4 @@ export async function runQuickSetup(initial: SetupAnswers, deps: SetupDeps): Pro
         break;
     }
   }
-  return answers;
 }

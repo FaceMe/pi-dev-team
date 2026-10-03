@@ -28,7 +28,7 @@ const SCRIPTS = {
   analyst: (req: any) =>
     req.prompt.includes("interview round")
       ? { text: json({ ready: true, questions: [] }) }
-      : { text: "ok", files: { ".factory/spec/spec.md": "- FR-001 x\n  Given a When b Then c\n" } },
+      : { text: "ok", files: { ".factory/spec/spec.md": "- FR-001 x\n  Given a When b Then c\n  Source: brief.\n" } },
   architect: () => ({ text: json({ stack: "node", gates: { install: "true", test: "node --test" } }), files: { ".factory/adr/0001-architecture.md": "# ADR\n" } }),
   planner: () => ({ text: json({ tickets: [{ id: "T-001", title: "x", role: "backend", requirements: ["FR-001"], brief: "b", writeScope: ["src/**", "test/**"] }] }) }),
   devops: () => ({ text: "ok", files: { "package.json": "{\"type\":\"module\"}", "test/a.test.js": "import t from 'node:test'; t('a', () => {});\n" } }),
@@ -91,6 +91,92 @@ function lastEntry(rec: ReturnType<typeof recordingPi>, kind: string): any {
 }
 
 describe("/factory command", () => {
+  it("shows tasks, subagents and the full draft without a running process", async () => {
+    const cwd = tempDir("factory-inspect-");
+    const { rec, ctx } = setup(cwd);
+    const store = new FactoryStore(cwd);
+    store.saveState(runState("inspection", { tickets: [ticket("T-001", "blocked")] }));
+    store.write("spec/spec.md", "# Complete draft\n\n" + "Detail.\n".repeat(120));
+    store.ledger({ kind: "worker", runId: "inspection", role: "designer", model: "p/design", ok: true });
+    ctx.hasUI = false;
+    await rec.commands.get("factory").handler("tasks T-001", ctx);
+    expect(lastEntry(rec, "tasks").lines.join("\n")).toContain("T-001 · blocked");
+    await rec.commands.get("factory").handler("agents", ctx);
+    expect(lastEntry(rec, "agents").lines.join("\n")).toContain("No live workers");
+    await rec.commands.get("factory").handler("spec", ctx);
+    expect(lastEntry(rec, "report").text).toBe(store.read("spec/spec.md"));
+  });
+
+  it("returns from settings to the main menu and preserves a cancelled run", async () => {
+    const cwd = tempDir("factory-cancel-new-");
+    const { rec, ctx, selects } = setup(cwd);
+    ctx.mode = "rpc";
+    const store = new FactoryStore(cwd);
+    store.saveState(runState("keep-me", { status: "paused" }));
+    const choices = ["Settings", "✓ Save settings", "Close"];
+    ctx.ui.select = async (title: string, options: string[]) => { selects.push({ title, options }); return choices.shift(); };
+    await rec.commands.get("factory").handler("", ctx);
+    expect(selects.map(s => s.title)).toEqual(["Factory", "Factory settings — Save settings when finished", "Factory"]);
+    ctx.ui.select = async () => undefined;
+    await rec.commands.get("factory").handler("new replacement", ctx);
+    expect(store.loadState()?.runId).toBe("keep-me");
+    expect(fs.existsSync(store.path("runs", "keep-me.json"))).toBe(false);
+  });
+
+  it("saves integrations through Settings and applies them on resume", async () => {
+    const cwd = tempDir("factory-settings-resume-");
+    const { rec, ctx, runner } = setup(cwd);
+    ctx.mode = "rpc";
+    const store = new FactoryStore(cwd);
+    store.saveState(runState("new-tools", { status: "paused", settings: { ...baseAnswers, integrations: { browser: { enabled: false } } } }));
+    const choices = ["Design/browser:", "Brave browser", "Enabled:", "← Back", "Save integrations", "✓ Save settings"];
+    ctx.ui.select = async (_title: string, options: string[]) => {
+      const wanted = choices.shift();
+      return wanted ? options.find(option => option.startsWith(wanted)) : "Pause the factory";
+    };
+    await rec.commands.get("factory").handler("settings", ctx);
+    expect(store.loadProject()?.integrations?.browser?.enabled).toBe(true);
+    expect(store.loadState()?.settings?.integrations?.browser?.enabled).toBe(true);
+    await rec.commands.get("factory").handler("resume", ctx);
+    await waitFor(() => store.loadState()?.status === "paused");
+    expect(runner.calls[0].integrations?.browser?.enabled).toBe(true);
+  });
+
+  it("queues settings behind a pending approval and allows pause to dismiss it", async () => {
+    const cwd = tempDir("factory-dialog-lock-");
+    const { rec, ctx } = setup(cwd);
+    ctx.mode = "rpc";
+    let approval = false;
+    let settingsOpened = false;
+    ctx.ui.select = async (title: string, options: string[], dialog?: { signal?: AbortSignal }) => {
+      if (title.startsWith("Approve")) {
+        approval = true;
+        return new Promise(resolve => dialog?.signal?.addEventListener("abort", () => resolve(undefined), { once: true }));
+      }
+      if (title.startsWith("Factory settings")) settingsOpened = true;
+      return options[0];
+    };
+    await rec.commands.get("factory").handler("new a tiny library", ctx);
+    await waitFor(() => approval);
+    const setting = rec.commands.get("factory").handler("settings", ctx);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(settingsOpened).toBe(false);
+    await rec.commands.get("factory").handler("pause", ctx);
+    await setting;
+    expect(settingsOpened).toBe(true);
+    await waitFor(() => new FactoryStore(cwd).loadState()?.status === "paused");
+  });
+
+  it("does not install research tools when saving only role models", async () => {
+    const cwd = tempDir("factory-role-save-");
+    const { rec, ctx, notes } = setup(cwd);
+    fs.writeFileSync(factoryConfigPath(), "{}");
+    ctx.mode = "rpc";
+    ctx.ui.select = async (_title: string, options: string[]) => options.find(option => option.includes("Save settings"));
+    await rec.commands.get("factory").handler("roles", ctx);
+    expect(notes.some(note => note.message.includes("Installing"))).toBe(false);
+  });
+
   it("runs quick setup (one Enter) and builds in the background", async () => {
     const cwd = tempDir("factory-cmd-");
     const { rec, runner, ctx, selects } = setup(cwd);
@@ -346,17 +432,23 @@ describe("/factory command", () => {
     const runner = new ScriptedRunner(SCRIPTS);
     createFactoryExtension({ runner })(rec.api);
     const reviewer = loadRoles({ projectDir: cwd }).get("reviewer")!;
-    const roleChoice = reviewer.description ? `reviewer - ${reviewer.description}` : "reviewer";
-    const { ui, notes, selects } = fakeUi({ select: [roleChoice, "p2/big-model"] });
+    const { ui, notes, selects } = fakeUi();
+    let step = 0;
+    ui.select = async (title, options) => {
+      selects.push({ title, options });
+      step++;
+      if (step === 1) return options.find(option => option.startsWith("reviewer:"));
+      if (step === 2) return options.find(option => option.includes("p2/big-model"));
+      return options.find(option => option.includes("Save settings"));
+    };
     const ctx: any = { hasUI: true, mode: "print", ui, cwd, modelRegistry: fakeRegistry(models), sessionManager: { getBranch: () => [] } };
 
     await rec.commands.get("factory").handler("roles", ctx);
-    expect(selects.map((s) => s.title)).toEqual(["Assign models to factory roles", "Model for the reviewer role"]);
+    expect(selects.map((s) => s.title)).toEqual(["Role models — Save settings to keep changes; Esc discards", "Model for reviewer", "Role models — Save settings to keep changes; Esc discards"]);
     const saved = JSON.parse(fs.readFileSync(factoryConfigPath(), "utf8"));
     expect(saved.pins.reviewer).toMatchObject({ provider: "p2", modelId: "big-model" });
-    expect(notes.at(-1)?.message).toMatch(/Role reviewer assigned to p2\/big-model/);
-    // No project answers in this folder: nothing project-level was written.
-    expect(new FactoryStore(cwd).loadProject()).toBeNull();
+    expect(notes.at(-1)?.message).toMatch(/Role models saved/);
+    expect(new FactoryStore(cwd).loadProject()?.pins?.reviewer).toMatchObject({ provider: "p2", modelId: "big-model" });
   });
 });
 

@@ -23,15 +23,15 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { pricePerToken } from "../shared/models.js";
 import { truncate } from "../shared/text.js";
 import { renderTraceSteps } from "../shared/trace.js";
 import { formatCost, formatTokens } from "../shared/usage.js";
-import { showFactoryRolePicker, showModelPicker } from "../picker/model-picker.js";
-import { boardLines } from "./board.js";
+import { showModelPicker } from "../picker/model-picker.js";
+import { agentLines, boardLines, taskLines } from "./board.js";
 import { buildCostReport, renderCostReport } from "./cost.js";
 import { formatDoctor, probeModels, runDoctor } from "./doctor.js";
 import { blockedCommand, inWriteScope } from "./guard.js";
@@ -49,7 +49,12 @@ import {
   loadUserDefaults,
   saveUserDefaults,
 } from "./settings.js";
-import { AUTONOMY_TEXT, runQuickSetup } from "./setup.js";
+import { AUTONOMY_TEXT, runQuickSetup, runRoleSetup } from "./setup.js";
+import { selectFactoryMenu } from "./menu.js";
+import { showSpecViewer } from "./spec-view.js";
+import { integrationSettings, integrationDiagnostics } from "./integrations.js";
+import { runIntegrationSetup } from "./integration-setup.js";
+import { Mutex } from "./mutex.js";
 import { FactoryStore } from "./store.js";
 import { buildTeam, describeTeam } from "./team.js";
 import type { Team } from "./team.js";
@@ -100,13 +105,19 @@ export function registerWorkerGuard(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeUi(pi: ExtensionAPI, ctx: ExtensionContext): FactoryUI {
+function makeUi(pi: ExtensionAPI, ctx: ExtensionContext, dialogLock?: Mutex, signal?: AbortSignal): FactoryUI {
   const hasUI = ctx.hasUI;
+  const dialog = <T>(action: () => Promise<T>): Promise<T> => dialogLock ? dialogLock.run(action) : action();
   return {
     notify: (message, level = "info") => ctx.ui.notify(message, level),
-    select: async (title, options) => (hasUI ? ctx.ui.select(title, options) : options[0]),
-    input: async (title, placeholder) => (hasUI ? ctx.ui.input(title, placeholder) : undefined),
-    confirm: async (title, message) => (hasUI ? ctx.ui.confirm(title, message) : false),
+    select: async (title, options, settings) => dialog(async () => hasUI ? selectFactoryMenu(ctx, title, options, settings?.initialIndex, signal) : undefined),
+    input: async (title, placeholder) => dialog(async () => hasUI && !signal?.aborted ? ctx.ui.input(title, placeholder, { signal }) : undefined),
+    confirm: async (title, message) => dialog(async () => hasUI && !signal?.aborted ? ctx.ui.confirm(title, message, { signal }) : false),
+    viewSpec: async markdown => dialog(async () => {
+      pi.appendEntry(TAG, { kind: "report", text: markdown });
+      if (hasUI) await showSpecViewer(ctx, "Factory specification", markdown, signal);
+    }),
+    editSpec: async markdown => dialog(async () => hasUI && !signal?.aborted ? ctx.ui.editor("Edit specification draft", markdown) : undefined),
     status: (text) => {
       try {
         ctx.ui.setStatus(TAG, text);
@@ -183,6 +194,8 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
     }
 
     const runner = options.runner ?? new PiSubprocessRunner();
+    // Commands and background approval dialogs share one terminal surface.
+    const dialogLock = new Mutex();
     let active: { run: FactoryRun; controller: AbortController; promise: Promise<FactoryState>; cwd: string } | undefined;
 
     const rolesFor = (cwd: string) => loadRoles({ projectDir: cwd, trustProject: false });
@@ -193,7 +206,7 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
     const startRun = (ctx: ExtensionContext, cwd: string, answers: SetupAnswers, state: FactoryState, webAccess: boolean): Promise<FactoryState> => {
       const store = new FactoryStore(cwd);
       const controller = new AbortController();
-      const ui = makeUi(pi, ctx);
+      const ui = makeUi(pi, ctx, dialogLock, controller.signal);
       const deps: PipelineDeps = {
         cwd,
         ui,
@@ -221,7 +234,7 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
     };
 
     /** Quick setup with prefilled answers. Returns undefined when cancelled. */
-    const quickSetup = async (ctx: ExtensionContext, cwd: string, idea: string, forceDefaults = false): Promise<{ answers: SetupAnswers; webAccess: boolean } | undefined> => {
+    const quickSetup = async (ctx: ExtensionContext, cwd: string, idea: string, forceDefaults = false, mode: "start" | "settings" | "roles" = "start"): Promise<{ answers: SetupAnswers; webAccess: boolean } | undefined> => {
       const store = new FactoryStore(cwd);
       const user = loadUserDefaults();
       const names = toolNames(pi);
@@ -234,16 +247,24 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
 
       let answers: SetupAnswers | undefined = initial;
       if (ctx.hasUI && !forceDefaults) {
-        answers = await runQuickSetup(initial, {
+        answers = await (mode === "roles" ? runRoleSetup : runQuickSetup)(initial, {
           ui: makeUi(pi, ctx),
+          mode: mode === "start" ? "start" : "settings",
           roles: [...roles.keys()],
+          roleGroups: [
+            { label: "planning and review roles", roles: ["analyst", "researcher", "architect", "planner", "reviewer"] },
+            { label: "build roles", roles: ["backend", "frontend", "devops"] },
+            { label: "design and frontend roles", roles: ["designer", "frontend"] },
+            { label: "test and documentation roles", roles: ["qa", "contributor", "docs"] },
+          ],
           deployTargets,
           webAccessInstalled,
           detectedStack: detectStack(cwd),
           budgetEstimate: budget,
           previewTeam: (a) => buildTeam(ctx.modelRegistry, roles, a),
-          pickModel: async (role) => {
-            const result = await showModelPicker(ctx, pi, { target: "select", title: `Model for the ${role} role` });
+          configureIntegrations: current => runIntegrationSetup(current, makeUi(pi, ctx), names),
+          pickModel: async (role, current) => {
+            const result = await showModelPicker(ctx, pi, { target: "select", title: `Model for ${role}`, initialModel: current, initialEffort: current?.effort });
             return result ? { provider: result.model.provider, modelId: result.model.id, effort: result.effort } : undefined;
           },
         });
@@ -253,9 +274,16 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
       saveUserDefaults(answers);
       store.ensure();
       store.saveProject(answers);
+      if (mode === "settings") {
+        const state = active?.run.state ?? store.loadState();
+        if (state) {
+          state.settings = runSettings(answers);
+          store.saveState(state);
+        }
+      }
 
       let webAccess = webAccessInstalled;
-      if (answers.research === "install-web-access" && !webAccessInstalled) {
+      if (mode !== "roles" && answers.research === "install-web-access" && !webAccessInstalled) {
         ctx.ui.notify("Installing pi-web-access for research (pi install npm:pi-web-access)…", "info");
         const res = await installWebAccess();
         if (res.ok) {
@@ -285,14 +313,12 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
         const ok = await ctx.ui.confirm("Start a new run?", `A ${previous.phase} run (${previous.runId}) is not finished here. Archive it and start over?`);
         if (!ok) return;
       }
-      if (previous) {
-        store.archiveState(previous.runId);
-      }
       const setup = await quickSetup(ctx, cwd, idea, opts.forceDefaults);
       if (!setup) {
         ctx.ui.notify("Factory setup cancelled.", "info");
         return;
       }
+      if (previous) store.archiveState(previous.runId);
       if (opts.autonomy) setup.answers.autonomy = opts.autonomy;
       const state = newState(idea, makeRunId(), setup.answers);
       state.settings = runSettings(setup.answers);
@@ -333,6 +359,7 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
         if (snapshot.research !== undefined) answers.research = snapshot.research;
         if (snapshot.deploy !== undefined) answers.deploy = snapshot.deploy;
         if (snapshot.deployTarget !== undefined) answers.deployTarget = snapshot.deployTarget;
+        if (snapshot.integrations !== undefined) answers.integrations = integrationSettings(snapshot.integrations);
       }
       const webAccess = detectWebAccess(names) || answers.research === "web-access";
       ctx.ui.notify(`Resuming ${state.runId} at ${state.phase}.`, "info");
@@ -350,6 +377,8 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
         availableCount: available.length,
         providers: [...new Set(available.map((m) => m.provider))],
         webAccess: detectWebAccess(toolNames(pi)),
+        integrations: new FactoryStore(ctx.cwd).loadProject()?.integrations ?? user.integrations,
+        availableTools: toolNames(pi),
       });
       if (probe) {
         ctx.ui.notify("Probing each team model with one tool call…", "info");
@@ -395,7 +424,7 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
 
     // -- command ----------------------------------------------------------------
 
-    const SUBCOMMANDS = ["new", "resume", "pause", "status", "board", "cost", "trace", "history", "qa", "retro", "doctor", "team", "roles", "autonomy", "settings", "run", "demo", "help"];
+    const SUBCOMMANDS = ["new", "resume", "pause", "status", "board", "tasks", "agents", "spec", "integrations", "cost", "trace", "history", "qa", "retro", "doctor", "team", "roles", "autonomy", "settings", "run", "demo", "help"];
 
     pi.registerCommand("factory", {
       description: "Software factory: turn an idea into a tested, documented project with a team of models",
@@ -404,9 +433,9 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
         if (second !== undefined) {
           if (first === "autonomy") return ["auto", "balanced", "careful"].filter((v) => v.startsWith(second)).map((v) => ({ value: `autonomy ${v}`, label: v }));
           if (first === "team") return ["balanced", "cheap", "best", "refresh"].filter((v) => v.startsWith(second)).map((v) => ({ value: `team ${v}`, label: v }));
-          if (first === "history") {
+          if (first === "history" || first === "tasks") {
             const state = new FactoryStore(active?.cwd ?? process.cwd()).loadState();
-            const items = (state?.tickets.map((t) => t.id) ?? []).filter((v) => v.startsWith(second)).map((v) => ({ value: `history ${v}`, label: v }));
+            const items = (state?.tickets.map((t) => t.id) ?? []).filter((v) => v.startsWith(second)).map((v) => ({ value: `${first} ${v}`, label: v }));
             return items.length ? items : null;
           }
           if (first === "trace") {
@@ -422,6 +451,7 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
         return items.length ? items : null;
       },
       handler: async (args, ctx) => {
+        const handler = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
         const trimmed = args.trim();
         const sub = trimmed.split(/\s+/)[0]?.toLowerCase() ?? "";
         const rest = trimmed.slice(sub.length).trim();
@@ -432,7 +462,9 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
               kind: "status",
               lines: [
                 "/factory new [idea] — quick setup, then the whole flow",
-                "/factory status · board · cost · trace [ticket|role] · history [ticket] — watch the run",
+                "/factory status · board · tasks [id] · agents · cost · trace [ticket|role] · history [ticket] — inspect the run",
+                "/factory spec — read the full specification in the CLI",
+                "/factory integrations — configure Paper, OpenDesign, Doop, and Brave QA",
                 "/factory qa [round] · retro — exploratory QA reports, new-contributor check, retrospective",
                 "/factory pause · resume — stop after this step / continue (also after restarting pi)",
                 "/factory doctor [probe] · team [preset] · roles · autonomy <p> · settings · run <role> <brief> · demo",
@@ -442,28 +474,26 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
           }
 
           case "": {
-            const state = new FactoryStore(ctx.cwd).loadState();
-            if (active || (state && state.status !== "done")) {
-              const choice = await ctx.ui.select("Factory", [
-                active ? "Show status" : "Resume the run",
-                active ? "Pause the run" : "Show status",
-                "Doctor (check setup)",
-                "Start a new project",
-              ]);
-              if (choice === "Resume the run") await resume(ctx);
-              else if (choice === "Pause the run") active?.controller.abort();
-              else if (choice === "Show status") pi.appendEntry(TAG, { kind: "status", lines: stateSummary(active?.run.state ?? state!) });
-              else if (choice?.startsWith("Doctor")) await doctor(ctx, false);
-              else if (choice === "Start a new project") {
-                const idea = (await ctx.ui.input("What should the factory build?", "e.g. a habit tracker with a web UI and a REST API"))?.trim();
-                if (idea) await startNew(ctx, ctx.cwd, idea);
-              }
+            if (!ctx.hasUI) {
+              await handler("status", ctx);
               return;
             }
-            const idea = (await ctx.ui.input("What should the factory build?", "e.g. a habit tracker with a web UI and a REST API"))?.trim();
-            if (idea) await startNew(ctx, ctx.cwd, idea);
-            else ctx.ui.notify("Usage: /factory new <idea> · /factory doctor · /factory demo", "info");
-            return;
+            let selected = 0;
+            for (;;) {
+              const state = active?.run.state ?? new FactoryStore(ctx.cwd).loadState();
+              const items = [
+                "Task list", "Subagent list", "View specification", "Board", "Settings", "Role models", "Design and browser integrations",
+                ...(state && state.status !== "done" ? [active ? "Pause the run" : "Resume the run"] : []),
+                "Doctor (check setup)", "Start a new project", "Close",
+              ];
+              const choice = await selectFactoryMenu(ctx, "Factory", items, selected);
+              if (!choice || choice === "Close") return;
+              selected = Math.max(0, items.indexOf(choice));
+              const command = ({ "Task list": "tasks", "Subagent list": "agents", "View specification": "spec", "Board": "board", "Settings": "settings", "Role models": "roles", "Design and browser integrations": "integrations", "Doctor (check setup)": "doctor" } as Record<string, string>)[choice];
+              if (command) await handler(command, ctx);
+              else if (choice === "Start a new project") { await handler("new", ctx); return; }
+              else { await handler(choice === "Pause the run" ? "pause" : "resume", ctx); return; }
+            }
           }
 
           case "new": {
@@ -503,7 +533,49 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
               ctx.ui.notify("No factory run in this folder.", "info");
               return;
             }
-            pi.appendEntry(TAG, { kind: "status", lines: boardLines(state) });
+            pi.appendEntry(TAG, { kind: "status", lines: boardLines(state, { workers: active?.run.workerSnapshots() }) });
+            return;
+          }
+
+          case "spec": {
+            const spec = new FactoryStore(ctx.cwd).read("spec/spec.md");
+            if (!spec) { ctx.ui.notify("No specification draft yet. Start or resume the factory to write it.", "info"); return; }
+            await makeUi(pi, ctx).viewSpec!(spec);
+            return;
+          }
+
+          case "tasks": {
+            const state = active?.run.state ?? new FactoryStore(ctx.cwd).loadState();
+            const lines = state ? taskLines(state, rest || undefined) : ["No factory run in this folder."];
+            pi.appendEntry(TAG, { kind: "tasks", lines });
+            if (ctx.hasUI) await showSpecViewer(ctx, "Factory tasks", "```text\n" + lines.join("\n") + "\n```");
+            return;
+          }
+
+          case "agents": {
+            const store = new FactoryStore(ctx.cwd);
+            const lines = agentLines(active?.run.state ?? store.loadState(), active?.run.workerSnapshots() ?? [], store.readLedger());
+            pi.appendEntry(TAG, { kind: "agents", lines });
+            if (ctx.hasUI) await showSpecViewer(ctx, "Factory subagents", "```text\n" + lines.join("\n") + "\n```");
+            return;
+          }
+
+          case "integrations": {
+            const store = new FactoryStore(ctx.cwd);
+            const answers = defaultAnswers({ cwd: ctx.cwd, toolNames: toolNames(pi), budget: { usd: 0, tokens: 0, priced: false, size: "small" }, deployTargets: [] }, loadUserDefaults(), store.loadProject());
+            if (!ctx.hasUI) { pi.appendEntry(TAG, { kind: "status", lines: formatDoctor(integrationDiagnostics(answers.integrations, ctx.cwd, toolNames(pi))) }); return; }
+            const integrations = await runIntegrationSetup(answers.integrations, makeUi(pi, ctx), toolNames(pi));
+            if (integrations) {
+              // Resolve bridge paths before workers move into their own worktrees.
+              for (const bridge of Object.values(integrations.design ?? {})) if (bridge) bridge.extensions = bridge.extensions?.map(file => path.resolve(ctx.cwd, file));
+              if (integrations.browser?.extensions) integrations.browser.extensions = integrations.browser.extensions.map(file => path.resolve(ctx.cwd, file));
+              answers.integrations = integrations;
+              store.saveProject(answers);
+              // Explicit settings changes update a paused run's snapshot for resume.
+              const state = active?.run.state ?? store.loadState();
+              if (state && state.settings) { state.settings.integrations = integrations; store.saveState(state); }
+              ctx.ui.notify("Integrations saved for this folder. Active workers keep their current tools.", "info");
+            }
             return;
           }
 
@@ -627,25 +699,12 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
           }
 
           case "roles": {
-            const roles = rolesFor(ctx.cwd);
-            const result = await showFactoryRolePicker(ctx, pi, {
-              roles: [...roles.values()].map((r) => ({ name: r.name, description: r.description })),
-            });
-            if (!result?.factoryRole) return;
-            const roleName = result.factoryRole;
-            const pin = { provider: result.model.provider, modelId: result.model.id, effort: result.effort };
-            const store = new FactoryStore(ctx.cwd);
-            const user = loadUserDefaults();
-            const answers = {
-              ...defaultAnswers({ cwd: ctx.cwd, toolNames: [], budget: { usd: 0, tokens: 0, priced: false, size: "small" }, deployTargets: [] }, user, null),
-              ...user,
-            } as SetupAnswers;
-            answers.pins = { ...(answers.pins ?? {}), [roleName]: pin };
-            saveUserDefaults(answers);
-            const project = store.loadProject();
-            if (project) store.saveProject({ ...(project as SetupAnswers), pins: answers.pins } as SetupAnswers);
-            ctx.ui.notify(`Role ${roleName} assigned to ${pin.provider}/${pin.modelId}${pin.effort ? ` (${pin.effort})` : ""}.`, "info");
-            if (active) ctx.ui.notify("The running build keeps its team; the change applies to the next run or resume.", "info");
+            if (!ctx.hasUI) {
+              await handler("team", ctx);
+              return;
+            }
+            const setup = await quickSetup(ctx, ctx.cwd, new FactoryStore(ctx.cwd).loadState()?.idea ?? "", false, "roles");
+            if (setup) ctx.ui.notify("Role models saved. Changes apply on the next run or resume.", "info");
             return;
           }
 
@@ -675,7 +734,11 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
           }
 
           case "settings": {
-            const setup = await quickSetup(ctx, ctx.cwd, new FactoryStore(ctx.cwd).loadState()?.idea ?? "");
+            if (!ctx.hasUI) {
+              ctx.ui.notify("Open /factory settings in an interactive session to change settings.", "info");
+              return;
+            }
+            const setup = await quickSetup(ctx, ctx.cwd, new FactoryStore(ctx.cwd).loadState()?.idea ?? "", false, "settings");
             if (setup) ctx.ui.notify("Factory settings saved for this folder.", "info");
             return;
           }
@@ -731,6 +794,11 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
           default:
             ctx.ui.notify(`Unknown subcommand "${sub}". Try: ${SUBCOMMANDS.join(", ")}`, "info");
         }
+        };
+        const subcommand = args.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+        const modal = ["", "new", "settings", "roles", "integrations", "spec", "tasks", "agents", "demo"].includes(subcommand);
+        if (ctx.hasUI && modal) await dialogLock.run(() => handler(args, ctx));
+        else await handler(args, ctx);
       },
     });
 

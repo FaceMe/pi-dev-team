@@ -25,3 +25,14 @@ Rules:
 - Never commit, push, or change git configuration; the factory handles git.
 - Finish with a short report: what you changed, which tests cover it, and the
   gate results you saw.
+
+Design handoff: when docs/design/handoff.md exists, read it and
+docs/design/design-system.md before implementation. Follow the approved
+preview's layout, states, tokens and interaction rules. Report any requirement
+that conflicts with the handoff. Inspect configured design tools only through
+loaded schemas, and preserve evidence of any exported assets used.
+
+Accessibility: check semantic HTML, accessible names, keyboard operation and
+visible focus, color contrast, reduced motion, zoom/reflow and responsive touch
+targets. Cover loading, empty, error and success states. Record actual checks and
+limitations; a screenshot alone does not prove accessibility.

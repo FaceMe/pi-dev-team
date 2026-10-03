@@ -11,7 +11,7 @@ export function script(system: string, prompt: string): Action[] {
   if (system.includes("product analyst")) {
     if (prompt.includes("interview round")) return [{ text: fence({ ready: true, questions: [] }) }];
     return [
-      { tool: "write", args: { path: ".factory/spec/spec.md", content: "# Spec\n\n- FR-001 add(a, b) returns the sum.\n  - Given 1 and 2 When add is called Then it returns 3\n" } },
+      { tool: "write", args: { path: ".factory/spec/spec.md", content: "# Spec\n\n- FR-001 add(a, b) returns the sum.\n  - Given 1 and 2 When add is called Then it returns 3. Source: brief.\n" } },
       { tool: "write", args: { path: ".factory/spec/assumptions.md", content: "- Plain JavaScript module\n" } },
       { text: "Spec written." },
     ];

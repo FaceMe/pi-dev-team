@@ -10,6 +10,8 @@
  * switch into worker mode (write-scope guard on, Fusion off unless requested).
  */
 
+import { fileURLToPath } from "node:url";
+import { integrationWorkerConfig } from "./integrations.js";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -58,8 +60,12 @@ export function buildWorkerArgs(request: WorkerRequest, promptFile: string): str
     `${request.member.provider}/${request.member.modelId}`,
   ];
   if (request.member.effort) args.push("--thinking", request.member.effort);
-  args.push(request.tools.length > 0 ? "--tools" : "--no-tools");
-  if (request.tools.length > 0) args.push(request.tools.join(","));
+  const integration = integrationWorkerConfig(request.role, request.integrations, request.cwd);
+  const tools = [...new Set([...request.tools, ...integration.tools])];
+  for (const extension of integration.extensions) args.push("-e", extension);
+  if (integration.tools.includes("factory_browser_qa")) args.push("-e", fileURLToPath(new URL("./browser-extension.ts", import.meta.url)));
+  args.push(tools.length > 0 ? "--tools" : "--no-tools");
+  if (tools.length > 0) args.push(tools.join(","));
   args.push("--append-system-prompt", promptFile, "--", request.prompt);
   return args;
 }
@@ -99,7 +105,8 @@ export class PiSubprocessRunner implements WorkerRunner {
     fs.mkdirSync(request.sessionDir, { recursive: true });
     const promptDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-factory-"));
     const promptFile = path.join(promptDir, `${request.role}.md`);
-    fs.writeFileSync(promptFile, request.systemPrompt, "utf8");
+    const integration = integrationWorkerConfig(request.role, request.integrations, request.cwd, this.env);
+    fs.writeFileSync(promptFile, [request.systemPrompt, integration.prompt].filter(Boolean).join("\n\n"), "utf8");
 
     const messages: any[] = [];
     const usage = emptyUsage();
@@ -135,6 +142,7 @@ export class PiSubprocessRunner implements WorkerRunner {
           // the gap (where the provider supports it). An explicit setting wins.
           PI_CACHE_RETENTION: "long",
           ...this.env,
+          ...integration.env,
           [WORKER_ENV.worker]: "1",
           [WORKER_ENV.role]: request.role,
           [WORKER_ENV.writeScope]: JSON.stringify(request.writeScope),

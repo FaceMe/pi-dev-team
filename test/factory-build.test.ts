@@ -314,11 +314,11 @@ const TODO_SPEC = `# Spec
 
 ## Functional requirements
 - FR-001 Store todos.
-  - Given a title When a todo is added Then it is listed.
+  - Given a title When a todo is added Then it is listed. Source: brief.
 - FR-002 HTTP API lists todos.
-  - Given stored todos When GET /todos Then they are returned as JSON.
+  - Given stored todos When GET /todos Then they are returned as JSON. Source: brief.
 - FR-003 Web UI renders todos.
-  - Given todos When the page renders Then each todo is a list item.
+  - Given todos When the page renders Then each todo is a list item. Source: brief.
 `;
 
 const TODO_TICKETS = [
@@ -355,6 +355,12 @@ function todoScripts(overrides: Record<string, Script> = {}): Record<string, Scr
       text: json({ stack: "Node 22 + node:test", gates: { install: "true", test: "node --test" }, manifests: ["package.json"], contracts: ["todo-api.md"] }),
       files: { ".factory/adr/0001-architecture.md": "# ADR 1\nNode, node:test.\n", ".factory/contracts/todo-api.md": "# API\nGET /todos -> string[]\n" },
     }),
+    designer: () => ({ text: "Design ready.", files: {
+      ".factory/design/design-system.md": "# Design system\nAccessible neutral palette.",
+      ".factory/design/handoff.md": "# Handoff\nRender todos as semantic list items.",
+      ".factory/design/preview.html": "<!doctype html><ul><li>Example todo</li></ul>",
+      ".factory/design/evidence.json": JSON.stringify({ status: "untested", reason: "No browser integration configured" }),
+    } }),
     planner: () => ({ text: json({ tickets: TODO_TICKETS }) }),
     devops: () => ({
       text: "Skeleton ready.",
@@ -370,7 +376,13 @@ function todoScripts(overrides: Record<string, Script> = {}): Record<string, Scr
       return { text: "Tests written.", files: { ...QA_TESTS[id], ...(id === "T-002" ? { "src/api/handlers.js": "export const getTodos = () => 'cheat';\n" } : {}) } };
     },
     backend: builder,
-    frontend: builder,
+    frontend: req => {
+      expect(fs.readFileSync(path.join(req.cwd, "docs/design/handoff.md"), "utf8")).toContain("semantic list items");
+      expect(fs.readFileSync(path.join(req.cwd, "docs/design/design-system.md"), "utf8")).toContain("neutral palette");
+      expect(fs.readFileSync(path.join(req.cwd, "docs/design/preview.html"), "utf8")).toContain("Example todo");
+      expect(req.prompt).toContain("docs/design/handoff.md");
+      return builder(req, 1);
+    },
     reviewer: () => ({ text: json({ verdict: "approve", findings: [] }) }),
     docs: () => ({ text: "Docs written.", files: { "README.md": "# Todo\n\nRun `node --test`.\n" } }),
     ...overrides,
@@ -424,6 +436,9 @@ describe("parallel build loop", () => {
       ["T-002", "done", "written"],
       ["T-003", "done", "written"],
     ]);
+    expect(scripted.calls.findIndex(call => call.role === "designer")).toBeLessThan(scripted.calls.findIndex(call => call.role === "planner"));
+    expect(deps.store.read("design/handoff.md")).toContain("semantic list items");
+    expect(deps.store.read("design/inputs.json")).toContain("Web UI renders todos");
     // T-002 and T-003 both depend only on T-001 and have disjoint scopes: they were built at the same time.
     expect(runner.maxTickets).toBe(2);
 

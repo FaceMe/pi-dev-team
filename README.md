@@ -5,7 +5,7 @@ A software factory, a model picker and a hybrid model harness for the
 
 1. **Software factory** (`/factory`) — a team of role-specialised agents
    (analyst, researcher, architect, planner, backend, frontend, devops,
-   reviewer, docs) that interviews you, writes a spec, designs, builds
+   designer, reviewer, docs) that interviews you, writes a spec, designs, builds
    test-first, reviews, documents and merges a maintainable project. Works with
    any model pi supports.
 2. **Model picker, roles & reasoning effort** — a two-panel picker, a role manager
@@ -86,16 +86,19 @@ mkdir habit-tracker && cd habit-tracker && pi
 |---|---|
 | `/factory new [idea]` | Quick setup, then run the whole flow |
 | `/factory status` · `/factory cost` | Where the run is; spend by phase, role, ticket and model, with estimated savings vs an all-frontier team |
-| `/factory board` | Ticket board: what is running, blocked and done |
+| `/factory board` | Show progress, active workers, and open tickets |
+| `/factory tasks [id]` · `/factory agents` | Inspect all tasks, a task brief, live subagents, and recent results |
+| `/factory spec` | Read the full specification in a scrolling CLI viewer |
+| `/factory integrations` | Configure Paper, OpenDesign, Doop, and Brave browser QA |
 | `/factory trace [ticket\|role]` | Expandable trace of the last worker run |
 | `/factory history [ticket]` | A ticket's history — QA, attempts, gates with parsed failures, review, merges — or a summary of all tickets |
 | `/factory qa [round]` · `/factory retro` | Exploratory QA reports and the new-contributor check; the retrospective |
 | `/factory pause` · `/factory resume` | Pause after the current step; continue (also after restarting pi — pi offers to resume when you open the project) |
 | `/factory doctor [probe]` | Check git, pi, models, team, pi-web-access, toolchains and deploy CLIs, with fixes; `probe` sends one tool call to each team model |
 | `/factory team [balanced\|cheap\|best]` | Show or change the team |
-| `/factory roles` | Assign a model to any role with the two-panel picker |
+| `/factory roles` | Configure models and effort for individual roles, role groups, or the full team |
 | `/factory autonomy auto\|balanced\|careful` | Switch at any time, even mid-run |
-| `/factory settings` | Change the quick-setup answers for this folder |
+| `/factory settings` | Save model, design, browser, and project settings without starting a run |
 | `/factory run <role> <brief>` | Run one role once, read-only (try a model, ask the architect) |
 | `/factory demo` | Build a tiny to-do CLI in a temp folder on `auto` |
 
@@ -113,8 +116,9 @@ How it works:
   change before running gates, scans every ticket's diff for secrets before
   it merges, and planning itself keeps parallel tickets' write scopes
   disjoint.
-- **Headless**: without a UI (print/JSON/RPC mode) `/factory new` accepts the
-  prefilled answers and runs to completion.
+- **Headless**: without interactive UI, `/factory new` uses the saved setup answers,
+  records the complete specification draft, and pauses for review. Resume in an
+  interactive session to approve or amend the draft.
 - **Roles are Markdown** — override any role (tier, effort, tools, prompt) in
   `~/.pi/agent/factory/roles/<role>.md`.
 
@@ -129,6 +133,25 @@ and roadmap.
 See [docs/factory.md](docs/factory.md) for the full guide — resuming runs,
 the board, cost reports, traces and per-role model assignment.
 
+## Factory design and review
+
+Settings retain the parent screen when you finish a model choice.
+Use bulk role groups to configure the team quickly.
+The specification opens in the CLI before approval.
+Select **Edit draft…** or **Request changes…** to amend it.
+The factory validates and displays the revised draft before approval.
+
+The designer writes a preview, design system, and frontend handoff.
+Configure Paper, OpenDesign, and Doop through your installed pi MCP bridge.
+OpenDesign supplies read-only design references.
+Frontend workers receive the design files under `docs/design/`.
+
+Enable Brave QA to test application behavior with project-local Playwright.
+The factory saves actions, assertions, screenshots, and errors as evidence.
+Missing browser tools are reported as untested.
+See the [setup procedures](docs/factory.md#designer-and-design-tools) and
+[usability implementation plan](docs/factory-usability-plan.md).
+
 ## Model picker
 
 ### Two-panel model picker
@@ -138,7 +161,7 @@ Open with `/models`, `/mp`, `/picker`, `/model-picker` or `Ctrl+Shift+M`.
 - **Left panel** — providers with auth indicators and model counts.
 - **Right panel** — models with context window, thinking/reasoning badges with effective effort (e.g. `🧠 high`), and vision indicators.
 - **Spec card** — shows active effort, token limits, cost, and exact supported reasoning levels.
-- **Factory tab** — `/factory roles` opens the same picker on a factory-role list: pick a role, then a model for it (`Esc` returns to the role list).
+- **Factory role settings** — `/factory roles` shows current assignments. Select a role or a group, then use the model picker. Save or cancel a model choice to return to the same role list. Select **Save settings** to keep the assignments.
 
 | Key | Action |
 |---|---|
