@@ -1,6 +1,7 @@
 /** Core types for the software factory. */
 
 import type { Usage } from "@earendil-works/pi-ai";
+import type { GateFailureDetails } from "./gate-parse.js";
 import type { Readiness } from "./readiness.js";
 import type { EffortLevel } from "../shared/models.js";
 import type { Tier } from "../shared/tiers.js";
@@ -113,6 +114,35 @@ export interface SetupAnswers {
   budgetUsd: number;
   /** Token budget used when prices are unknown; 0 = no limit. */
   budgetTokens: number;
+  /** Build-loop tuning (plan §10.2, §10.4); read from project.json or factory.json, never asked. */
+  build?: Partial<BuildSettings>;
+}
+
+/** Build-loop tuning; see buildSettings() for the defaults. */
+export interface BuildSettings {
+  /** Tickets built at the same time (dependencies and write scopes permitting). */
+  maxParallel: number;
+  /** Fraction of the budget at which the breaker pauses and asks. */
+  budgetBreaker: number;
+  /** Fraction of tickets that may escalate before the breaker asks. */
+  escalationBreaker: number;
+  /** A QA worker writes failing acceptance tests before the builder starts. */
+  qa: boolean;
+}
+
+export const DEFAULT_BUILD_SETTINGS: BuildSettings = { maxParallel: 3, budgetBreaker: 0.8, escalationBreaker: 0.3, qa: true };
+
+/** Normalise build settings: out-of-range values fall back to the defaults. */
+export function buildSettings(raw: Partial<BuildSettings> | undefined): BuildSettings {
+  const d = DEFAULT_BUILD_SETTINGS;
+  const fraction = (v: unknown, fallback: number) => (typeof v === "number" && v > 0 && v <= 1 ? v : fallback);
+  const parallel = raw?.maxParallel;
+  return {
+    maxParallel: typeof parallel === "number" && Number.isInteger(parallel) && parallel >= 1 ? Math.min(parallel, 16) : d.maxParallel,
+    budgetBreaker: fraction(raw?.budgetBreaker, d.budgetBreaker),
+    escalationBreaker: fraction(raw?.escalationBreaker, d.escalationBreaker),
+    qa: typeof raw?.qa === "boolean" ? raw.qa : d.qa,
+  };
 }
 
 export interface Question {
@@ -143,12 +173,24 @@ export interface Ticket {
   writeScope: string[];
   status: "todo" | "in_progress" | "done" | "blocked" | "skipped";
   attempts: TicketAttempt[];
+  /** Merge commit on the integration branch once the ticket is done. */
   commit?: string;
+  /** The ticket's own branch and worktree while it is being built. */
+  branch?: string;
+  worktree?: string;
+  /** Integration commit the ticket branch last synced with; its diff is the ticket's change. */
+  base?: string;
+  /** QA-first step: "written" (acceptance tests committed), "none" (QA wrote nothing), "skipped". */
+  qa?: "written" | "none" | "skipped";
+  /** Test files the QA worker wrote for this ticket. */
+  qaTests?: string[];
+  /** Moved up the role's model ladder at least once (feeds the escalation breaker). */
+  escalated?: boolean;
 }
 
 export interface TicketAttempt {
   model: string;
-  outcome: "ok" | "gate_fail" | "review_fail" | "error";
+  outcome: "ok" | "gate_fail" | "review_fail" | "secret" | "conflict" | "integration_fail" | "error";
   costUsd: number;
   at: string;
   note?: string;
@@ -166,6 +208,8 @@ export interface GateResult {
   exitCode: number;
   durationMs: number;
   output: string;
+  /** Failing tests and diagnostics parsed from the output (failed gates only). */
+  details?: GateFailureDetails;
 }
 
 /** Stack profile written by the architect. */

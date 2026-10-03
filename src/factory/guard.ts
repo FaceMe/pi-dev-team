@@ -46,26 +46,46 @@ export function inWriteScope(cwd: string, target: string, scope: string[]): bool
   const rel = relativeToCwd(cwd, target);
   if (!rel) return false;
   // Never let a worker touch git internals or factory state.
-  if (rel === ".git" || rel.startsWith(".git/") || rel.startsWith(".factory/state") ) return false;
+  if (rel === ".git" || rel.startsWith(".git/") || rel.startsWith(".factory/state") || rel === ".factory/factory.lock.json") return false;
   return scope.some((glob) => globToRegExp(glob).test(rel));
 }
 
 const DESTRUCTIVE: Array<[RegExp, string]> = [
-  [/\bgit\s+(push|commit|reset\s+--hard|rebase|checkout\s+-f|clean\s+-[a-z]*f|config|remote|tag|worktree|branch\s+-[dD])\b/, "git history and remotes are managed by the factory"],
+  [/\bgit\s+(push|commit|reset\s+--hard|rebase|checkout\s+-f|clean\s+-[a-z]*f|config|remote|tag|worktree|branch\s+-[dD]|switch|merge|cherry-pick|am|stash|filter-branch|filter-repo|update-ref|gc|reflog\s+(expire|delete))\b/, "git history and remotes are managed by the factory"],
   [/\brm\s+-[a-z]*r[a-z]*f?\s+(\/|~|\$HOME|\.\.)(\s|$|\/)/, "recursive delete outside the project"],
-  [/\bsudo\b/, "sudo is not allowed"],
+  [/\bsudo\b|\bdoas\b/, "sudo is not allowed"],
   [/\b(npm|pnpm|yarn|cargo|twine|gem)\s+publish\b/, "publishing packages is not allowed"],
-  [/\bpoetry\s+publish\b/, "publishing packages is not allowed"],
+  [/\bpoetry\s+publish\b|\buv\s+publish\b|\bdotnet\s+nuget\s+push\b/, "publishing packages is not allowed"],
   [/\b(fly|flyctl)\s+deploy\b|\bvercel\b.*--prod|\bnetlify\s+deploy\b|\bwrangler\s+(deploy|publish)\b|\brailway\s+up\b|\bkubectl\s+(apply|delete)\b|\bterraform\s+(apply|destroy)\b|\baws\s+\S+\s+(create|delete|put|update)|\bgcloud\s+.*\bdeploy\b|\baz\s+.*\bcreate\b|\bdocker\s+push\b|\bheroku\s+/, "deployment commands need the user's approval"],
   [/:\(\)\s*\{\s*:\|:&\s*\};:/, "fork bomb"],
   [/\bcurl\b[^|]*\|\s*(sh|bash)\b|\bwget\b[^|]*\|\s*(sh|bash)\b/, "piping remote scripts into a shell"],
+  [/\bmkfs(\.\w+)?\b|\bdd\b[^|;&]*\bof=\/dev\/|>\s*\/dev\/(sd|nvme|disk|hd)/, "writing to block devices is not allowed"],
+  [/(~|\$HOME|\/home\/[^/\s]+|\/Users\/[^/\s]+)\/\.(ssh|aws|gnupg|kube|netrc|npmrc|pypirc|docker\/config\.json|config\/gcloud|config\/gh)\b/, "reading or changing credentials is not allowed"],
 ];
 
+/** Absolute paths a recursive delete targets that lie outside cwd. */
+function deletesOutside(command: string, cwd: string): string | undefined {
+  const re = /\brm\s+((?:-[a-zA-Z]+\s+)+)([^;&|]+)/g;
+  for (let m = re.exec(command); m; m = re.exec(command)) {
+    if (!/r/i.test(m[1])) continue;
+    for (const target of m[2].trim().split(/\s+/)) {
+      const t = target.replace(/^["']|["']$/g, "");
+      if (!t.startsWith("/")) continue;
+      if (relativeToCwd(cwd, t) === undefined) return t;
+    }
+  }
+  return undefined;
+}
+
 /** Reason a bash command is blocked, or undefined when it is allowed. */
-export function blockedCommand(command: string, options: { allowDeploy?: boolean } = {}): string | undefined {
+export function blockedCommand(command: string, options: { allowDeploy?: boolean; cwd?: string } = {}): string | undefined {
   for (const [pattern, reason] of DESTRUCTIVE) {
     if (options.allowDeploy && reason.startsWith("deployment")) continue;
     if (pattern.test(command)) return reason;
+  }
+  if (options.cwd) {
+    const outside = deletesOutside(command, options.cwd);
+    if (outside) return `recursive delete outside the project (${outside})`;
   }
   return undefined;
 }

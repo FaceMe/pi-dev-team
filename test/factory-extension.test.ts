@@ -224,6 +224,40 @@ describe("/factory command", () => {
     expect(notes.at(-1)?.message).toBe("No traced worker runs yet.");
   });
 
+  it("shows ticket history for one ticket or all, and completes ticket ids", async () => {
+    const cwd = tempDir("factory-history-cmd-");
+    const { rec, ctx, notes } = setup(cwd);
+    const store = new FactoryStore(cwd);
+    const state = runState("run-h");
+    state.tickets = [ticket("T-001", "done"), ticket("T-002", "todo")];
+    store.saveState(state);
+    store.ledger({ kind: "ticket", runId: "run-h", ticket: "T-001", event: "started", branch: "factory/run-h-T-001" });
+    store.ledger({ kind: "ticket", runId: "run-h", ticket: "T-001", event: "done", attempts: 1 });
+    store.ledger({ kind: "ticket", runId: "run-old", ticket: "T-001", event: "blocked" });
+    await rec.commands.get("factory").handler("history T-001", ctx);
+    const lines = lastEntry(rec, "status").lines as string[];
+    expect(lines[0]).toMatch(/^history of T-001/);
+    expect(lines.slice(1).map((l) => l.slice(10))).toEqual(["started on factory/run-h-T-001", "✓ done after 1 attempt(s)"]);
+    await rec.commands.get("factory").handler("history", ctx);
+    expect((lastEntry(rec, "status").lines as string[]).slice(1)).toEqual([
+      expect.stringMatching(/^✓ T-001 ticket T-001 · 0 attempt\(s\)/),
+      expect.stringMatching(/^· T-002 ticket T-002/),
+    ]);
+    const previous = process.cwd();
+    process.chdir(cwd);
+    try {
+      expect(rec.commands.get("factory").getArgumentCompletions("history T-00").map((i: any) => i.value)).toEqual(["history T-001", "history T-002"]);
+    } finally {
+      process.chdir(previous);
+    }
+
+    const empty = tempDir("factory-history-none-");
+    const fresh = setup(empty);
+    await fresh.rec.commands.get("factory").handler("history", fresh.ctx);
+    expect(fresh.notes.at(-1)?.message).toBe("No factory run in this folder.");
+    expect(notes).toEqual([]);
+  });
+
   it("shows the board for the stored run", async () => {
     const cwd = tempDir("factory-board-cmd-");
     const { rec, ctx, notes } = setup(cwd);

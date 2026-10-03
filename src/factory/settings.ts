@@ -208,5 +208,6 @@ export function defaultAnswers(ctx: SetupContext, user: Partial<SetupAnswers>, p
     deployTarget: project?.deployTarget,
     budgetUsd: project?.budgetUsd ?? ctx.budget.usd,
     budgetTokens: project?.budgetTokens ?? (ctx.budget.priced ? 0 : ctx.budget.tokens),
+    ...(project?.build || user.build ? { build: { ...(user.build ?? {}), ...(project?.build ?? {}) } } : {}),
   };
 }

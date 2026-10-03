@@ -361,7 +361,32 @@ ${args.settings.deploy !== "none" ? "Also add deployment configuration (a produc
 then report what you created and the gate results.`;
 }
 
+export function qaPrompt(ticket: Ticket, profile: Profile, testScope: string[]): string {
+  const test = profile.gates.find((g) => g.name === "test");
+  return `Write the acceptance tests for ticket ${ticket.id}: ${ticket.title} — before it is implemented.
+
+${ticket.brief}
+
+Requirements covered: ${ticket.requirements.join(", ") || "(none listed)"} — see docs/spec.md${profile.contracts?.length ? "; interfaces are pinned by docs/contracts/" : ""}.
+Acceptance criteria (at least one test each):
+${bullet(ticket.acceptance)}
+
+You may change only test files matching: ${testScope.join(", ")}
+The test command is \`${test?.command ?? "the project's test gate"}\`. Run it: your new tests should fail
+because the feature is missing (not because of a syntax error), and every
+existing test should still pass.
+
+Reply with the test files you wrote and the criterion each one covers.`;
+}
+
 export function ticketPrompt(ticket: Ticket, profile: Profile): string {
+  const qa = ticket.qaTests?.length
+    ? `QA already wrote failing acceptance tests for this ticket: ${ticket.qaTests.join(", ")}.
+Make them pass. Do not weaken, skip or delete them; if one is genuinely wrong,
+fix it minimally and explain why in your report.
+
+`
+    : "Write the tests for the acceptance criteria first, then the implementation.\n";
   return `Implement ticket ${ticket.id}: ${ticket.title}
 
 ${ticket.brief}
@@ -376,8 +401,7 @@ You may change only files matching: ${ticket.writeScope.join(", ")}
 Before finishing, run these gates from the repository root and make them pass:
 ${profile.gates.map((g) => `- ${g.name}: \`${g.command}\``).join("\n")}
 
-Write the tests for the acceptance criteria first, then the implementation.
-Report what you changed and which tests cover each acceptance criterion.`;
+${qa}Report what you changed and which tests cover each acceptance criterion.`;
 }
 
 export function gateFeedbackPrompt(ticket: Ticket, failure: string): string {
@@ -394,6 +418,39 @@ export function reviewFeedbackPrompt(ticket: Ticket, findings: string): string {
 ${findings}
 
 Address every blocking finding, keep the gates passing, and report what you changed.`;
+}
+
+export function secretFeedbackPrompt(ticket: Ticket, findings: string): string {
+  return `The factory's secret scan blocked ${ticket.id} from merging. These look like real credentials:
+
+${findings}
+
+Remove them from the code and from any committed file. Read secrets from
+environment variables instead, and list each variable (with a placeholder
+value) in .env.example if that file is in your scope. Keep the gates passing
+and report what you changed.`;
+}
+
+export function conflictPrompt(ticket: Ticket, files: string[]): string {
+  return `Other tickets were merged into the integration branch while you worked on ${ticket.id}.
+The factory merged the integration branch into your branch and these files
+conflict:
+${bullet(files)}
+
+Resolve every conflict (remove all <<<<<<< ======= >>>>>>> markers), keeping
+both your change and the integrated work, then run the gates and report.`;
+}
+
+export function integrationFeedbackPrompt(ticket: Ticket, failure: string): string {
+  return `${ticket.id} passed its gates on its own branch, but the gates failed after it was merged
+with the other finished tickets on the integration branch. The factory undid
+that merge and brought the integrated work into your branch, so you can now
+reproduce the failure locally:
+
+${failure}
+
+Fix your change so it works together with the integrated code (do not change
+other tickets' files), run the gates, and report.`;
 }
 
 export function scopeFeedback(files: string[], scope: string[]): string {

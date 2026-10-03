@@ -59,14 +59,18 @@ mkdir habit-tracker && cd habit-tracker && pi
    plan recorded as a traceability matrix (`.factory/traceability.json`
    links every requirement to the tickets covering it). You approve per the
    autonomy preset.
-4. **Build** — a walking skeleton first, then each ticket test-first in a git
-   worktree (`factory/<run>` branch). Gates (install/build/typecheck/lint/test)
-   are run by the factory, not claimed by the agent; a reviewer from a
-   different model family approves each ticket. Failures retry with feedback,
-   then escalate to a stronger model, then ask you. The plan also gives
-   tickets that could run at the same time disjoint write scopes, so
-   independent tickets can build in parallel without touching each other's
-   files.
+4. **Build** — a walking skeleton first, then the tickets, **in parallel**
+   wherever dependencies and disjoint write scopes allow (up to 3 at once),
+   each in its own git worktree and branch. A QA worker writes failing
+   acceptance tests first; the builder makes them pass. Gates
+   (install/build/typecheck/lint/test) are run by the factory, not claimed by
+   the agent, and failures come back parsed (failing test names, compiler
+   errors with file:line). A secret scan and a reviewer from a different
+   model family must pass before a ticket merges into the integration branch
+   (`factory/<run>`), where every gate runs again; conflicts and red
+   integrations go back to the ticket's builder. Failures retry with
+   feedback, then escalate to a stronger model, then ask you; breakers stop
+   at 80% of the budget or when over 30% of tickets escalate.
 5. **Docs and release** — README, architecture notes, `AGENTS.md`, CHANGELOG;
    the branch is merged into yours when the gates pass; `.factory/report.md`
    lists tickets and cost by role.
@@ -77,6 +81,7 @@ mkdir habit-tracker && cd habit-tracker && pi
 | `/factory status` · `/factory cost` | Where the run is; spend by phase, role, ticket and model, with estimated savings vs an all-frontier team |
 | `/factory board` | Ticket board: what is running, blocked and done |
 | `/factory trace [ticket\|role]` | Expandable trace of the last worker run |
+| `/factory history [ticket]` | A ticket's history — QA, attempts, gates with parsed failures, review, merges — or a summary of all tickets |
 | `/factory pause` · `/factory resume` | Pause after the current step; continue (also after restarting pi — pi offers to resume when you open the project) |
 | `/factory doctor [probe]` | Check git, pi, models, team, pi-web-access, toolchains and deploy CLIs, with fixes; `probe` sends one tool call to each team model |
 | `/factory team [balanced\|cheap\|best]` | Show or change the team |
@@ -93,10 +98,13 @@ How it works:
   your providers and extensions (pi-web-access for research), and a crash
   never takes down your session.
 - **Guard rails inside every worker**: `edit`/`write` outside the ticket's
-  write scope are blocked, and so are `git push`/commit, `sudo`, publishing,
-  piped remote scripts, and deploy commands (unless you approved a deploy).
-  The factory also reverts any out-of-scope change before running gates, and
-  planning itself keeps parallel tickets' write scopes disjoint.
+  write scope are blocked, and so are `git push`/commit/merge and other
+  history operations, `sudo`, publishing, recursive deletes outside the
+  worktree, credential stores, piped remote scripts, and deploy commands
+  (unless you approved a deploy). The factory also reverts any out-of-scope
+  change before running gates, scans every ticket's diff for secrets before
+  it merges, and planning itself keeps parallel tickets' write scopes
+  disjoint.
 - **Headless**: without a UI (print/JSON/RPC mode) `/factory new` accepts the
   prefilled answers and runs to completion.
 - **Roles are Markdown** — override any role (tier, effort, tools, prompt) in
@@ -104,7 +112,7 @@ How it works:
 
 Project state lives in `.factory/` (the run lock `factory.lock.json`, spec,
 contracts, ADRs, profile, tickets, traceability matrix, reviews, ledger,
-report; worker sessions and the worktree are git-ignored). A paused run
+report; worker sessions and the worktrees are git-ignored). A paused run
 survives a pi restart: the lock carries the phase, tickets, spend and a
 settings snapshot, and pi offers to resume when you open the project. See
 [docs/software-factory-plan.md](docs/software-factory-plan.md) for the design
@@ -557,7 +565,7 @@ only, no extra model call), or `off`.
 - `~/.pi/agent/settings.json` — `defaultProvider`, `defaultModel`, and `modelThinkingLevels` (per-model reasoning efforts natively recognized by Pi core on model switch).
 - `~/.pi/agent/fusion.json` — Fusion configuration (main/sidekick slots, routing, limits).
 - `~/.pi/agent/fusion-stats.json` — Fusion lifetime cost/savings ledger.
-- `~/.pi/agent/factory.json` — factory answers remembered across projects (team preset, pins, autonomy, research).
+- `~/.pi/agent/factory.json` — factory answers remembered across projects (team preset, pins, autonomy, research), plus optional build-loop settings under `build` (`maxParallel`, `budgetBreaker`, `escalationBreaker`, `qa`; see [the guide](docs/factory.md#the-build-loop)).
 - `~/.pi/agent/factory/roles/*.md` — optional role overrides.
 - `<project>/.factory/` — a factory run's state, artifacts and ledger.
 
@@ -569,9 +577,11 @@ code lives in `src/`:
 - `src/shared/` — config files, model helpers, capability tiers, traces, usage
 - `src/picker/` — the two-panel model picker, roles and effort controller
 - `src/fusion/` — the Fusion engine (`engine.ts`) and its commands/UI (`extension.ts`)
-- `src/factory/` — the software factory: `pipeline.ts` (phase machine), `runner.ts`
-  (pi worker subprocesses), `guard.ts`, `team.ts`, `setup.ts`, `gates.ts`,
-  `git.ts`, `prompts.ts`, and the default roles in `roles/*.md`
+- `src/factory/` — the software factory: `pipeline.ts` (phase machine and build
+  loop), `scheduler.ts` (parallel ticket scheduling), `runner.ts` (pi worker
+  subprocesses), `guard.ts`, `secrets.ts`, `gates.ts` and `gate-parse.ts`
+  (structured gate failures), `team.ts`, `setup.ts`, `git.ts`, `history.ts`,
+  `prompts.ts`, and the default roles in `roles/*.md`
 
 Pi core packages are peer dependencies supplied by pi itself. For development:
 

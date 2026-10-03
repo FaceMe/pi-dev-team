@@ -25,7 +25,7 @@ function globsOverlap(a: string, b: string): boolean {
 }
 
 /** First overlapping glob pair of two scopes, reported as the more specific (longer) glob. */
-function firstOverlap(a: string[], b: string[]): string | undefined {
+export function firstOverlap(a: string[], b: string[]): string | undefined {
   for (const ga of a) {
     for (const gb of b) {
       if (globsOverlap(ga, gb)) return ga.length >= gb.length ? ga : gb;

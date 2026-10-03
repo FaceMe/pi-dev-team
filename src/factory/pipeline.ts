@@ -21,17 +21,27 @@ import { outOfScope } from "./guard.js";
 import { describeGateFailure, gatesPassed, normalizeProfile, runGates, summarizeGates } from "./gates.js";
 import {
   changedFiles,
+  changedSince,
   commitAll,
+  commitDiff,
   currentBranch,
+  deleteBranch,
   ensureRepo,
   ensureWorktree,
+  filesBetween,
   git,
   headCommit,
   isClean,
+  mergeBranch,
   mergeInto,
   removeWorktree,
+  resetTo,
+  revertToBase,
   workingDiff,
 } from "./git.js";
+import { Mutex } from "./mutex.js";
+import { nextRunnable } from "./scheduler.js";
+import { describeSecrets, scanDiff } from "./secrets.js";
 import { extractJson } from "./json-reply.js";
 import { requirementIds, validatePlan } from "./plan.js";
 import { matchProfileTemplates, templatesForPrompt } from "./profiles.js";
@@ -48,6 +58,7 @@ import type { Team } from "./team.js";
 import { buildTraceability, traceabilityJson, traceabilitySummary } from "./traceability.js";
 import type {
   Answer,
+  BuildSettings,
   FactoryState,
   FactoryUI,
   GateResult,
@@ -61,7 +72,10 @@ import type {
   WorkerResult,
   WorkerRunner,
 } from "./types.js";
-import { PHASE_ORDER } from "./types.js";
+import { PHASE_ORDER, buildSettings } from "./types.js";
+import { orderTickets } from "./order.js";
+
+export { orderTickets };
 
 export interface PipelineDeps {
   cwd: string;
@@ -90,6 +104,13 @@ const DEFAULTS = "Use your defaults for the remaining questions";
 const MAX_ATTEMPTS_PER_MODEL = 2;
 /** Brainstorms per run (plan §9.2); tracked via "brainstorm:<n>" notes so the cap survives resume. */
 const MAX_BRAINSTORMS = 2;
+/** Roles whose tickets get QA-first acceptance tests. */
+const QA_ROLES = new Set(["backend", "frontend"]);
+/** Write-scope globs that hold tests (the QA worker's scope is the ticket's test globs). */
+const TEST_GLOB = /(^|\/|[._-])(tests?|specs?|__tests__|e2e)([._/-]|$)/i;
+
+type IntegrationResult = { kind: "merged"; commit?: string } | { kind: "conflict"; files: string[] } | { kind: "integration_fail"; failure: string };
+
 /** Lockfiles a package manager may touch whenever the manifest is in scope. */
 const LOCKFILES = [
   "package-lock.json",
@@ -130,29 +151,33 @@ export function makeRunId(date = new Date()): string {
   return `run-${stamp}`;
 }
 
-/** Tickets in dependency order (stable for already-ordered plans). */
-export function orderTickets(tickets: Ticket[]): Ticket[] {
-  const byId = new Map(tickets.map((t) => [t.id, t]));
-  const out: Ticket[] = [];
-  const visiting = new Set<string>();
-  const done = new Set<string>();
-  const visit = (t: Ticket) => {
-    if (done.has(t.id) || visiting.has(t.id)) return;
-    visiting.add(t.id);
-    for (const dep of t.dependsOn) {
-      const d = byId.get(dep);
-      if (d) visit(d);
+/** An AbortSignal that fires when any of the given signals does. */
+function anySignal(signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const live = signals.filter((s): s is AbortSignal => s !== undefined);
+  if (live.length <= 1) return live[0];
+  const controller = new AbortController();
+  for (const s of live) {
+    if (s.aborted) {
+      controller.abort();
+      break;
     }
-    visiting.delete(t.id);
-    done.add(t.id);
-    out.push(t);
-  };
-  tickets.forEach(visit);
-  return out;
+    s.addEventListener("abort", () => controller.abort(), { once: true });
+  }
+  return controller.signal;
 }
 
 export class FactoryRun {
   private activity: string[] = [];
+  /** One prompt at a time, whichever parallel ticket asks. */
+  private readonly uiLock = new Mutex();
+  /** One merge into the integration branch at a time. */
+  private readonly mergeLock = new Mutex();
+  /** Aborts the sibling tickets when one stops the run (pause, blocker, failure). */
+  private buildStop?: AbortController;
+  /** Tickets being built right now. */
+  private readonly inFlight = new Set<string>();
+  /** Worktrees whose dependencies were installed by this process. */
+  private readonly installed = new Set<string>();
 
   constructor(
     private readonly deps: PipelineDeps,
@@ -232,11 +257,24 @@ export class FactoryRun {
   }
 
   private checkAbort(): void {
-    if (this.deps.signal?.aborted) throw new StopRun("paused", "Factory paused. Run /factory resume to continue.");
+    if (this.deps.signal?.aborted || this.buildStop?.signal.aborted) throw new StopRun("paused", "Factory paused. Run /factory resume to continue.");
+  }
+
+  private get signal(): AbortSignal | undefined {
+    return anySignal([this.deps.signal, this.buildStop?.signal]);
   }
 
   private get autonomy() {
     return this.deps.answers.autonomy;
+  }
+
+  private get settings(): BuildSettings {
+    return buildSettings(this.deps.answers.build);
+  }
+
+  /** A user prompt, serialised so parallel tickets never ask at the same time. */
+  private ask(title: string, options: string[]): Promise<string | undefined> {
+    return this.uiLock.run(() => this.deps.ui.select(title, options));
   }
 
   // -------------------------------------------------------------------------
@@ -290,24 +328,58 @@ ${prompts.settingsSummary(this.deps.answers)}
 Work only inside the current working directory.`;
   }
 
-  /** Stop at the budget breaker (80%) and ask to raise it or pause. */
+  /** Stop at the budget breaker (80% by default) and ask to raise it or pause. */
   private async checkBudget(): Promise<void> {
-    const { state, deps } = this;
-    const overUsd = state.budgetUsd > 0 && state.spentUsd >= state.budgetUsd * 0.8;
-    const overTokens = state.budgetTokens > 0 && state.spentTokens >= state.budgetTokens * 0.8;
-    if (!overUsd && !overTokens) return;
-    const spent = overUsd ? `${formatCost(state.spentUsd)} of $${state.budgetUsd}` : `${formatTokens(state.spentTokens)} of ${formatTokens(state.budgetTokens)} tokens`;
-    const choice = await deps.ui.select(`Budget: ${spent} used (${state.phase}). Continue?`, [
-      "Raise the budget by 50% and continue",
-      "Pause the factory",
-    ]);
-    if (choice?.startsWith("Raise")) {
-      if (overUsd) state.budgetUsd = Math.ceil(state.budgetUsd * 1.5);
-      if (overTokens) state.budgetTokens = Math.ceil(state.budgetTokens * 1.5);
+    const { state } = this;
+    const over = () => {
+      const fraction = this.settings.budgetBreaker;
+      return {
+        usd: state.budgetUsd > 0 && state.spentUsd >= state.budgetUsd * fraction,
+        tokens: state.budgetTokens > 0 && state.spentTokens >= state.budgetTokens * fraction,
+      };
+    };
+    if (!over().usd && !over().tokens) return;
+    await this.uiLock.run(async () => {
+      // A parallel ticket may have raised the budget while this one waited.
+      const { usd, tokens } = over();
+      if (!usd && !tokens) return;
+      this.checkAbort();
+      const spent = usd ? `${formatCost(state.spentUsd)} of $${state.budgetUsd}` : `${formatTokens(state.spentTokens)} of ${formatTokens(state.budgetTokens)} tokens`;
+      const choice = await this.deps.ui.select(`Budget: ${spent} used (${state.phase}). Continue?`, [
+        "Raise the budget by 50% and continue",
+        "Pause the factory",
+      ]);
+      if (choice?.startsWith("Raise")) {
+        if (usd) state.budgetUsd = Math.ceil(state.budgetUsd * 1.5);
+        if (tokens) state.budgetTokens = Math.ceil(state.budgetTokens * 1.5);
+        this.save();
+        return;
+      }
+      throw new StopRun("paused", "Factory paused at the budget limit. Run /factory resume to continue.");
+    });
+  }
+
+  /** Stop and ask when more than the configured share of tickets has escalated (asked once per run). */
+  private async checkEscalationBreaker(): Promise<void> {
+    const { state } = this;
+    const tripped = () => {
+      if (state.notes.includes("breaker:escalation")) return undefined;
+      const escalated = state.tickets.filter((t) => t.escalated).length;
+      return state.tickets.length > 0 && escalated / state.tickets.length > this.settings.escalationBreaker ? escalated : undefined;
+    };
+    if (tripped() === undefined) return;
+    await this.uiLock.run(async () => {
+      const escalated = tripped();
+      if (escalated === undefined) return;
+      this.checkAbort();
+      const choice = await this.deps.ui.select(
+        `${escalated} of ${state.tickets.length} tickets needed a stronger model — the tickets may be too large or the briefs unclear. Continue?`,
+        ["Continue building", "Pause the factory (review .factory/tickets.json, then /factory resume)"],
+      );
+      if (!choice?.startsWith("Continue")) throw new StopRun("paused", "Factory paused at the escalation breaker. Run /factory resume to continue.");
+      state.notes.push("breaker:escalation");
       this.save();
-      return;
-    }
-    throw new StopRun("paused", "Factory paused at the budget limit. Run /factory resume to continue.");
+    });
   }
 
   async work(
@@ -318,8 +390,11 @@ Work only inside the current working directory.`;
     await this.checkBudget();
     const role = this.role(roleName);
     const member = options.member ?? this.member(roleName);
-    this.activity = [];
-    this.showStatus(`${roleName} · ${member.provider}/${member.modelId}${options.ticket ? ` · ${options.ticket}` : ""}`);
+    const label = () =>
+      this.inFlight.size > 1
+        ? `building ${[...this.inFlight].join(", ")} in parallel`
+        : `${roleName} · ${member.provider}/${member.modelId}${options.ticket ? ` · ${options.ticket}` : ""}`;
+    this.showStatus(label());
     const result = await this.deps.runner.run({
       role: roleName,
       member,
@@ -333,11 +408,11 @@ Work only inside the current working directory.`;
       sidekick: role.sidekick,
       allowDeploy: options.allowDeploy,
       timeoutMs: this.deps.workerTimeoutMs ?? 30 * 60_000,
-      signal: this.deps.signal,
+      signal: this.signal,
       onActivity: (line) => {
-        this.activity.push(`${roleName}: ${line}`);
+        this.activity.push(`${options.ticket ? `${options.ticket} ` : ""}${roleName}: ${line}`);
         if (this.activity.length > 20) this.activity.shift();
-        this.showStatus(`${roleName} · ${member.provider}/${member.modelId}${options.ticket ? ` · ${options.ticket}` : ""}`);
+        this.showStatus(label());
       },
     });
     this.state.spentUsd += result.usage.cost.total;
@@ -384,17 +459,20 @@ Work only inside the current working directory.`;
     throw new StopRun("failed", `The ${roleName} worker did not return usable JSON after 3 attempts.`);
   }
 
-  private async approve(title: string, summary: string, extraOptions: string[] = []): Promise<string> {
-    const options = ["Approve", ...extraOptions, "Pause the factory"];
-    this.deps.ui.log("approval", { title, summary });
-    this.state.status = "waiting";
-    this.save();
-    this.showStatus("waiting for your approval");
-    const choice = await this.deps.ui.select(`${title}\n\n${summary}`, options);
-    this.state.status = "running";
-    this.save();
-    if (!choice || choice === "Pause the factory") throw new StopRun("paused", "Factory paused. Run /factory resume to continue.");
-    return choice;
+  private approve(title: string, summary: string, extraOptions: string[] = []): Promise<string> {
+    return this.uiLock.run(async () => {
+      this.checkAbort();
+      const options = ["Approve", ...extraOptions, "Pause the factory"];
+      this.deps.ui.log("approval", { title, summary });
+      this.state.status = "waiting";
+      this.save();
+      this.showStatus("waiting for your approval");
+      const choice = await this.deps.ui.select(`${title}\n\n${summary}`, options);
+      this.state.status = "running";
+      this.save();
+      if (!choice || choice === "Pause the factory") throw new StopRun("paused", "Factory paused. Run /factory resume to continue.");
+      return choice;
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -878,14 +956,38 @@ Work only inside the current working directory.`;
     return profile;
   }
 
-  private async gates(worktree: string, options: { skipInstall?: boolean } = {}): Promise<{ ok: boolean; results: GateResult[] }> {
+  private async gates(
+    worktree: string,
+    options: { skipInstall?: boolean; ticket?: string; where?: "ticket" | "integration" | "qa" } = {},
+  ): Promise<{ ok: boolean; results: GateResult[] }> {
     const profile = this.profile();
-    this.showStatus("running gates");
+    this.showStatus(options.ticket ? `running gates · ${options.ticket}${options.where === "integration" ? " on integration" : ""}` : "running gates");
     const results = await runGates(profile, worktree, { skipInstall: options.skipInstall, timeoutMs: this.deps.gateTimeoutMs });
     const ok = gatesPassed(results, profile, options.skipInstall);
-    this.deps.store.ledger({ kind: "gates", runId: this.state.runId, phase: this.state.phase, ok, summary: summarizeGates(results) });
-    this.deps.ui.log("gates", { ok, summary: summarizeGates(results) });
+    if (results.some((r) => r.gate === "install" && r.ok)) this.installed.add(worktree);
+    const failed = results.find((r) => !r.ok);
+    this.deps.store.ledger({
+      kind: "gates",
+      runId: this.state.runId,
+      phase: this.state.phase,
+      ticket: options.ticket,
+      where: options.where,
+      ok,
+      summary: summarizeGates(results),
+      ...(failed ? { failedGate: failed.gate, failures: failed.details } : {}),
+    });
+    this.deps.ui.log("gates", { ok, summary: `${options.ticket ? `${options.ticket}${options.where === "integration" ? " (integration)" : ""}: ` : ""}${summarizeGates(results)}` });
     return { ok, results };
+  }
+
+  /** Gates in a ticket worktree: install once per worktree, again only when a manifest changed. */
+  private ticketGates(dir: string, ticket: Ticket, manifestsChanged: boolean, where: "ticket" | "qa" = "ticket") {
+    return this.gates(dir, { skipInstall: this.installed.has(dir) && !manifestsChanged, ticket: ticket.id, where });
+  }
+
+  /** Append a ticket-history event to the ledger (/factory history <ticket>). */
+  private ticketEvent(ticket: Ticket, event: string, data: Record<string, unknown> = {}): void {
+    this.deps.store.ledger({ kind: "ticket", runId: this.state.runId, ticket: ticket.id, event, ...data });
   }
 
   private async skeleton(): Promise<void> {
@@ -940,16 +1042,56 @@ Work only inside the current working directory.`;
     throw new StopRun("paused", `Skeleton gates failing. Worktree: ${worktree}. Fix and run /factory resume.`);
   }
 
+  // -- build (plan §10) ---------------------------------------------------------
+
+  /**
+   * The parallel build loop: start every ticket the scheduler allows (settled
+   * dependencies, disjoint write scopes, at most maxParallel), each in its own
+   * worktree, and start more as tickets finish. The first ticket that stops the
+   * run (pause, blocker, failure) aborts its siblings; their tickets stay
+   * in progress and continue from their worktrees on resume.
+   */
   private async build(): Promise<void> {
-    const worktree = await this.ensureWorkspace();
-    for (const ticket of orderTickets(this.state.tickets)) {
-      if (ticket.status === "done" || ticket.status === "skipped") continue;
-      const blocked = ticket.dependsOn.filter((dep) => this.state.tickets.find((t) => t.id === dep)?.status !== "done");
-      if (blocked.length > 0) {
-        this.state.notes.push(`${ticket.id} built without unfinished dependencies: ${blocked.join(", ")}`);
+    const { state } = this;
+    await this.ensureWorkspace();
+    const profile = this.profile();
+    // Resuming means the user dealt with whatever blocked a ticket.
+    for (const t of state.tickets) if (t.status === "blocked") t.status = "todo";
+    await this.cleanupTicketWorkspaces();
+
+    const scopeOf = (t: Ticket) => this.scopeFor(t, profile);
+    const running = new Map<string, Promise<void>>();
+    let failure: unknown;
+    this.buildStop = new AbortController();
+    try {
+      for (;;) {
+        if (failure === undefined) {
+          for (const ticket of nextRunnable(state.tickets, new Set(running.keys()), this.settings.maxParallel, scopeOf)) {
+            this.noteSkippedDependencies(ticket);
+            const task = this.buildTicket(ticket)
+              .catch((error) => {
+                if (failure === undefined) {
+                  failure = error;
+                  this.buildStop?.abort();
+                }
+              })
+              .finally(() => running.delete(ticket.id));
+            running.set(ticket.id, task);
+          }
+        }
+        if (running.size === 0) break;
+        await Promise.race(running.values());
       }
-      await this.buildTicket(ticket, worktree);
+    } finally {
+      this.buildStop = undefined;
     }
+    if (failure !== undefined) throw failure;
+  }
+
+  private noteSkippedDependencies(ticket: Ticket): void {
+    const skipped = ticket.dependsOn.filter((dep) => this.state.tickets.find((t) => t.id === dep)?.status === "skipped");
+    const note = `${ticket.id} built without unfinished dependencies: ${skipped.join(", ")}`;
+    if (skipped.length > 0 && !this.state.notes.includes(note)) this.state.notes.push(note);
   }
 
   private scopeFor(ticket: Ticket, profile: Profile): string[] {
@@ -973,102 +1115,345 @@ Work only inside the current working directory.`;
     return current;
   }
 
-  private async buildTicket(ticket: Ticket, worktree: string, startWith?: TeamMember): Promise<void> {
+  // -- ticket workspaces ---------------------------------------------------------
+
+  /** The ticket's own worktree on branch <factory branch>-<ticket id>, branched from the integration head. */
+  private async ticketWorkspace(ticket: Ticket): Promise<string> {
+    const { deps, state } = this;
+    ticket.branch ??= `${state.branch}-${ticket.id}`;
+    ticket.worktree ??= deps.store.path("worktrees", `${state.runId}-${ticket.id}`);
+    if (!fs.existsSync(path.join(ticket.worktree, ".git"))) {
+      const branchExists = (await git(deps.cwd, ["rev-parse", "--verify", `refs/heads/${ticket.branch}`])).ok;
+      const integrationHead = await headCommit(state.worktree!);
+      if (!integrationHead) throw new StopRun("failed", "The integration worktree has no commits.");
+      const wt = await ensureWorktree(deps.cwd, ticket.worktree, ticket.branch, integrationHead);
+      if (wt.error) throw new StopRun("failed", `git worktree for ${ticket.id}: ${wt.error}`);
+      if (!branchExists || !ticket.base) ticket.base = integrationHead;
+    }
+    ticket.base ??= await headCommit(ticket.worktree);
+    this.save();
+    return ticket.worktree;
+  }
+
+  /** Remove a ticket's worktree and branch (after it merged or was skipped). */
+  private async dropTicketWorkspace(ticket: Ticket): Promise<void> {
+    if (ticket.worktree) await removeWorktree(this.deps.cwd, ticket.worktree);
+    if (ticket.branch) await deleteBranch(this.deps.cwd, ticket.branch);
+    ticket.worktree = undefined;
+    ticket.branch = undefined;
+    ticket.base = undefined;
+    this.save();
+  }
+
+  /** On (re)entering the build: drop worktrees left behind by settled tickets (crash, manual edits). */
+  private async cleanupTicketWorkspaces(): Promise<void> {
+    for (const ticket of this.state.tickets) {
+      if ((ticket.status === "done" || ticket.status === "skipped") && (ticket.worktree || ticket.branch)) {
+        await this.dropTicketWorkspace(ticket);
+      }
+    }
+  }
+
+  /** Changed files that still contain merge-conflict markers. */
+  private conflictMarkers(dir: string, files: string[]): string[] {
+    return files.filter((file) => {
+      try {
+        const full = path.join(dir, file);
+        if (!fs.statSync(full).isFile() || fs.statSync(full).size > 2_000_000) return false;
+        return /^(<{7}|>{7}) /m.test(fs.readFileSync(full, "utf8"));
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  // -- QA-first (plan §10.1) -------------------------------------------------------
+
+  private qaScope(ticket: Ticket): string[] {
+    return ticket.writeScope.filter((glob) => TEST_GLOB.test(glob));
+  }
+
+  /**
+   * Before the builder starts, the QA worker turns the acceptance criteria into
+   * failing tests inside the ticket's test globs; the factory commits them on
+   * the ticket branch so the builder implements against them.
+   */
+  private async qaFirst(ticket: Ticket, dir: string, profile: Profile): Promise<void> {
+    if (ticket.qa) return;
+    const scope = this.qaScope(ticket);
+    const why = !this.settings.qa
+      ? "disabled in settings"
+      : !QA_ROLES.has(ticket.role)
+        ? `${ticket.role} ticket`
+        : ticket.acceptance.length === 0
+          ? "no acceptance criteria"
+          : scope.length === 0
+            ? "no test globs in the write scope"
+            : !this.deps.roles.has("qa") || !this.deps.team.members.qa
+              ? "no qa role or model"
+              : undefined;
+    if (why) {
+      ticket.qa = "skipped";
+      this.save();
+      this.ticketEvent(ticket, "qa", { result: "skipped", reason: why });
+      return;
+    }
+
+    const result = await this.work("qa", { prompt: prompts.qaPrompt(ticket, profile, scope), cwd: dir, session: `${ticket.id}-qa`, writeScope: scope, ticket: ticket.id });
+    if (result.isError) {
+      await resetTo(dir, "HEAD");
+      ticket.qa = "none";
+      this.save();
+      this.ticketEvent(ticket, "qa", { result: "error", error: truncate(result.errorMessage ?? "", 200) });
+      return;
+    }
+    const changed = await changedSince(dir, "HEAD");
+    const outside = outOfScope(changed, scope);
+    if (outside.length) await revertToBase(dir, "HEAD", outside);
+    const tests = changed.filter((file) => !outside.includes(file));
+    if (tests.length === 0) {
+      ticket.qa = "none";
+      this.save();
+      this.ticketEvent(ticket, "qa", { result: "no tests written" });
+      return;
+    }
+    // Red check: the new tests should fail before the implementation exists.
+    const gates = await this.ticketGates(dir, ticket, false, "qa");
+    const commit = await commitAll(dir, `test(${ticket.id}): acceptance tests (QA)`);
+    if (commit.error) throw new StopRun("failed", `git commit: ${commit.error}`);
+    ticket.qa = "written";
+    ticket.qaTests = tests;
+    this.save();
+    this.ticketEvent(ticket, "qa", { result: gates.ok ? "tests already pass" : "red", tests, reverted: outside.length ? outside : undefined });
+  }
+
+  // -- one ticket ----------------------------------------------------------------
+
+  private async buildTicket(ticket: Ticket, startWith?: TeamMember): Promise<void> {
     const { deps, state } = this;
     const profile = this.profile();
     const role = this.role(ticket.role);
     ticket.status = "in_progress";
     this.save();
+    this.inFlight.add(ticket.id);
+    try {
+      const dir = await this.ticketWorkspace(ticket);
+      this.ticketEvent(ticket, "started", { branch: ticket.branch, base: ticket.base, model: startWith ? `${startWith.provider}/${startWith.modelId}` : undefined });
+      await this.qaFirst(ticket, dir, profile);
 
-    let current: TeamMember | undefined = startWith ?? this.member(ticket.role);
-    let prompt = prompts.ticketPrompt(ticket, profile);
-    const scope = this.scopeFor(ticket, profile);
+      let current: TeamMember | undefined = startWith ?? this.member(ticket.role);
+      let prompt = prompts.ticketPrompt(ticket, profile);
+      const scope = this.scopeFor(ticket, profile);
 
-    while (current) {
-      for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_MODEL; attempt++) {
-        const result = await this.work(ticket.role, { prompt, cwd: worktree, session: ticket.id, writeScope: scope, member: current, ticket: ticket.id });
-        const model = `${current.provider}/${current.modelId}`;
-        const record = (outcome: Ticket["attempts"][number]["outcome"], note?: string) => {
-          ticket.attempts.push({ model, outcome, costUsd: result.usage.cost.total, at: new Date().toISOString(), note });
-          this.save();
-        };
-        if (result.isError) {
-          record("error", result.errorMessage);
-          prompt = `Your previous run ended with an error: ${result.errorMessage}. Continue the ticket.`;
-          continue;
-        }
-
-        const changed = await changedFiles(worktree);
-        const outside = outOfScope(changed, scope);
-        let scopeNote = "";
-        if (outside.length > 0) {
-          await this.revertOutOfScope(worktree, outside);
-          scopeNote = prompts.scopeFeedback(outside, ticket.writeScope);
-        }
-        const manifestsChanged = changed.some((file) => profile.manifests.includes(path.basename(file)));
-        const gates = await this.gates(worktree, { skipInstall: !manifestsChanged });
-        if (!gates.ok) {
-          record("gate_fail", truncate(describeGateFailure(gates.results), 200));
-          prompt = `${prompts.gateFeedbackPrompt(ticket, describeGateFailure(gates.results))}${scopeNote ? `\n\n${scopeNote}` : ""}`;
-          continue;
-        }
-
-        const review = await this.review(ticket, worktree, gates.results);
-        if (review.verdict !== "approve") {
-          record("review_fail", truncate(review.text, 200));
-          prompt = `${prompts.reviewFeedbackPrompt(ticket, review.text)}${scopeNote ? `\n\n${scopeNote}` : ""}`;
-          continue;
-        }
-
-        if (this.autonomy === "careful") {
-          const files = await changedFiles(worktree);
-          const choice = await this.approve(`Commit ${ticket.id}: ${ticket.title}?`, `Files: ${files.slice(0, 12).join(", ")}${files.length > 12 ? " …" : ""}\nGates: ${summarizeGates(gates.results)}\nReview: approved`, ["Request changes…"]);
-          if (choice !== "Approve") {
-            const typed = (await deps.ui.input(`What should change in ${ticket.id}?`))?.trim();
-            prompt = prompts.reviewFeedbackPrompt(ticket, typed || "The user asked for changes.");
+      while (current) {
+        for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_MODEL; attempt++) {
+          const result = await this.work(ticket.role, { prompt, cwd: dir, session: ticket.id, writeScope: scope, member: current, ticket: ticket.id });
+          const model = `${current.provider}/${current.modelId}`;
+          const record = (outcome: Ticket["attempts"][number]["outcome"], note?: string) => {
+            ticket.attempts.push({ model, outcome, costUsd: result.usage.cost.total, at: new Date().toISOString(), note });
+            this.save();
+            this.ticketEvent(ticket, "attempt", { attempt: ticket.attempts.length, model, outcome, note });
+          };
+          if (result.isError) {
+            record("error", result.errorMessage);
+            prompt = `Your previous run ended with an error: ${result.errorMessage}. Continue the ticket.`;
             continue;
           }
-        }
 
-        const commit = await commitAll(worktree, `feat(${ticket.id}): ${ticket.title}`);
-        if (commit.error) throw new StopRun("failed", `git commit: ${commit.error}`);
-        record("ok");
-        ticket.status = "done";
-        ticket.commit = commit.commit;
-        this.save();
-        deps.ui.log("ticket", { id: ticket.id, title: ticket.title, status: "done", attempts: ticket.attempts.length });
+          // The ticket's change is everything that differs from its base (the last integration sync).
+          const base = ticket.base!;
+          const changed = await changedSince(dir, base);
+          const outside = outOfScope(changed, scope);
+          let scopeNote = "";
+          if (outside.length > 0) {
+            await revertToBase(dir, base, outside);
+            scopeNote = prompts.scopeFeedback(outside, ticket.writeScope);
+            this.ticketEvent(ticket, "scope_revert", { files: outside });
+          }
+          const withNote = (text: string) => (scopeNote ? `${text}\n\n${scopeNote}` : text);
+          const inScope = changed.filter((file) => !outside.includes(file));
+
+          const markers = this.conflictMarkers(dir, inScope);
+          if (markers.length > 0) {
+            record("conflict", `conflict markers left in ${markers.join(", ")}`);
+            prompt = withNote(prompts.conflictPrompt(ticket, markers));
+            continue;
+          }
+
+          const manifestsChanged = inScope.some((file) => profile.manifests.includes(path.basename(file)));
+          const gates = await this.ticketGates(dir, ticket, manifestsChanged);
+          if (!gates.ok) {
+            record("gate_fail", truncate(describeGateFailure(gates.results), 200));
+            prompt = withNote(prompts.gateFeedbackPrompt(ticket, describeGateFailure(gates.results)));
+            continue;
+          }
+
+          const fullDiff = await workingDiff(dir, 400_000, base);
+          const secrets = scanDiff(fullDiff);
+          if (secrets.length > 0) {
+            record("secret", truncate(describeSecrets(secrets), 200));
+            prompt = withNote(prompts.secretFeedbackPrompt(ticket, describeSecrets(secrets)));
+            continue;
+          }
+
+          const review = await this.review(ticket, dir, gates.results, fullDiff);
+          if (review.verdict !== "approve") {
+            record("review_fail", truncate(review.text, 200));
+            prompt = withNote(prompts.reviewFeedbackPrompt(ticket, review.text));
+            continue;
+          }
+
+          if (this.autonomy === "careful") {
+            const changes = await this.approveTicket(ticket, inScope, gates.results);
+            if (changes !== undefined) {
+              prompt = prompts.reviewFeedbackPrompt(ticket, changes || "The user asked for changes.");
+              continue;
+            }
+          }
+
+          const commit = await commitAll(dir, `feat(${ticket.id}): ${ticket.title}`);
+          if (commit.error) throw new StopRun("failed", `git commit: ${commit.error}`);
+
+          const merged = await this.integrate(ticket, dir, profile);
+          if (merged.kind === "conflict") {
+            record("conflict", `merge conflict with integration: ${merged.files.join(", ")}`);
+            prompt = prompts.conflictPrompt(ticket, merged.files);
+            continue;
+          }
+          if (merged.kind === "integration_fail") {
+            record("integration_fail", truncate(merged.failure, 200));
+            prompt = prompts.integrationFeedbackPrompt(ticket, merged.failure);
+            continue;
+          }
+
+          record("ok");
+          ticket.status = "done";
+          ticket.commit = merged.commit;
+          this.save();
+          await this.dropTicketWorkspace(ticket);
+          this.ticketEvent(ticket, "done", { commit: merged.commit, attempts: ticket.attempts.length });
+          deps.ui.log("ticket", { id: ticket.id, title: ticket.title, status: "done", attempts: ticket.attempts.length });
+          return;
+        }
+        const next = escalate(deps.team, role, current);
+        if (next) {
+          deps.ui.notify(`${ticket.id}: escalating ${ticket.role} from ${current.modelId} to ${next.modelId}.`, "info");
+          state.notes.push(`${ticket.id} escalated to ${next.provider}/${next.modelId}`);
+          ticket.escalated = true;
+          this.save();
+          this.ticketEvent(ticket, "escalated", { from: `${current.provider}/${current.modelId}`, to: `${next.provider}/${next.modelId}` });
+          await this.checkEscalationBreaker();
+        }
+        current = next;
+      }
+
+      const choice = await this.ask(`${ticket.id} (${ticket.title}) still fails after every model on the ${ticket.role} ladder.`, [
+        "Retry with the strongest model",
+        "Skip this ticket and continue",
+        "Pause the factory (fix it yourself, then /factory resume)",
+      ]);
+      if (choice?.startsWith("Retry")) {
+        ticket.status = "todo";
+        return await this.buildTicket(ticket, this.strongest(ticket.role));
+      }
+      if (choice?.startsWith("Skip")) {
+        ticket.status = "skipped";
+        await this.dropTicketWorkspace(ticket);
+        this.ticketEvent(ticket, "skipped");
         return;
       }
-      const next = escalate(deps.team, role, current);
-      if (next) {
-        deps.ui.notify(`${ticket.id}: escalating ${ticket.role} from ${current.modelId} to ${next.modelId}.`, "info");
-        state.notes.push(`${ticket.id} escalated to ${next.provider}/${next.modelId}`);
-      }
-      current = next;
-    }
-
-    const choice = await deps.ui.select(`${ticket.id} (${ticket.title}) still fails after every model on the ${ticket.role} ladder.`, [
-      "Retry with the strongest model",
-      "Skip this ticket and continue",
-      "Pause the factory (fix it yourself, then /factory resume)",
-    ]);
-    if (choice?.startsWith("Retry")) {
-      ticket.status = "todo";
-      return this.buildTicket(ticket, worktree, this.strongest(ticket.role));
-    }
-    if (choice?.startsWith("Skip")) {
-      await git(worktree, ["reset", "--hard", "HEAD"]);
-      await git(worktree, ["clean", "-fd"]);
-      ticket.status = "skipped";
+      ticket.status = "blocked";
       this.save();
-      return;
+      this.ticketEvent(ticket, "blocked");
+      throw new StopRun("paused", `${ticket.id} is blocked. Worktree: ${dir}. Run /factory resume when ready.`);
+    } finally {
+      this.inFlight.delete(ticket.id);
     }
-    ticket.status = "blocked";
-    throw new StopRun("paused", `${ticket.id} is blocked. Worktree: ${worktree}. Run /factory resume when ready.`);
   }
 
-  private async review(ticket: Ticket, worktree: string, gates: GateResult[]): Promise<{ verdict: "approve" | "changes"; text: string }> {
-    const diff = await workingDiff(worktree);
+  /** Careful autonomy: the user approves each ticket commit. Returns requested changes, or undefined when approved. */
+  private approveTicket(ticket: Ticket, files: string[], gates: GateResult[]): Promise<string | undefined> {
+    return this.uiLock.run(async () => {
+      this.checkAbort();
+      const title = `Commit ${ticket.id}: ${ticket.title}?`;
+      const summary = `Files: ${files.slice(0, 12).join(", ")}${files.length > 12 ? " …" : ""}\nGates: ${summarizeGates(gates)}\nReview: approved`;
+      this.deps.ui.log("approval", { title, summary });
+      const choice = await this.deps.ui.select(`${title}\n\n${summary}`, ["Approve", "Request changes…", "Pause the factory"]);
+      if (!choice || choice === "Pause the factory") throw new StopRun("paused", "Factory paused. Run /factory resume to continue.");
+      if (choice === "Approve") return undefined;
+      return (await this.deps.ui.input(`What should change in ${ticket.id}?`))?.trim() ?? "";
+    });
+  }
+
+  // -- integration (plan §10.1) ----------------------------------------------------
+
+  /**
+   * Merge a finished ticket branch into the integration branch and re-run every
+   * gate there. One merge at a time. A conflict, or red gates after the merge,
+   * undoes the merge and brings the integration branch into the ticket branch
+   * so the builder can resolve or reproduce it in its own worktree.
+   */
+  private integrate(ticket: Ticket, dir: string, profile: Profile): Promise<IntegrationResult> {
+    return this.mergeLock.run(async () => {
+      this.checkAbort();
+      const integration = this.state.worktree!;
+      for (let round = 0; round < 2; round++) {
+        const before = (await headCommit(integration))!;
+        const merge = await mergeBranch(integration, ticket.branch!, `Merge ${ticket.id}: ${ticket.title}`);
+        if (!merge.ok) {
+          this.ticketEvent(ticket, "conflict", { files: merge.conflicts, error: merge.conflicts.length ? undefined : truncate(merge.error ?? "", 200) });
+          const left = await this.syncTicket(ticket, dir, before, profile);
+          if (left === undefined) return { kind: "conflict", files: merge.conflicts.length ? merge.conflicts : ["(merge failed; see the ledger)"] };
+          if (left.length > 0) return { kind: "conflict", files: left };
+          // Every conflict was outside the ticket's scope and resolved to the integration side: merge again.
+          continue;
+        }
+        const merged = await filesBetween(integration, before, "HEAD");
+        const manifestsChanged = merged.some((file) => profile.manifests.includes(path.basename(file)));
+        const gates = await this.gates(integration, { skipInstall: !manifestsChanged, ticket: ticket.id, where: "integration" });
+        if (!gates.ok) {
+          await resetTo(integration, before);
+          await this.syncTicket(ticket, dir, before, profile);
+          const failure = describeGateFailure(gates.results);
+          this.ticketEvent(ticket, "integration_fail", { gate: gates.results.find((r) => !r.ok)?.gate });
+          return { kind: "integration_fail", failure };
+        }
+        const commit = await headCommit(integration);
+        this.ticketEvent(ticket, "merged", { commit, files: merged.length });
+        return { kind: "merged", commit };
+      }
+      return { kind: "conflict", files: ["(the integration branch kept conflicting; see the ledger)"] };
+    });
+  }
+
+  /**
+   * Merge the integration branch (at `integrationHead`) into the ticket branch,
+   * which becomes the ticket's new base. Conflicts outside the ticket's write
+   * scope take the integration side; the in-scope ones are returned with their
+   * markers left for the builder (a clean sync is committed). Undefined when
+   * the merge could not even start.
+   */
+  private async syncTicket(ticket: Ticket, dir: string, integrationHead: string, profile: Profile): Promise<string[] | undefined> {
+    const res = await mergeBranch(dir, integrationHead, `Merge integration into ${ticket.id}`, { keepConflicts: true });
+    if (!res.ok && res.conflicts.length === 0) return undefined;
+    ticket.base = integrationHead;
+    this.save();
+    if (res.ok) return [];
+    const outside = outOfScope(res.conflicts, this.scopeFor(ticket, profile));
+    for (const file of outside) {
+      await git(dir, ["checkout", "--theirs", "--", file]);
+      await git(dir, ["add", "--", file]);
+    }
+    const left = res.conflicts.filter((file) => !outside.includes(file));
+    if (left.length === 0) {
+      const commit = await commitAll(dir, `Merge integration into ${ticket.id}`);
+      if (commit.error) return undefined;
+    }
+    return left;
+  }
+
+  private async review(ticket: Ticket, worktree: string, gates: GateResult[], fullDiff: string): Promise<{ verdict: "approve" | "changes"; text: string }> {
+    const diff = fullDiff.length > 60_000 ? `${fullDiff.slice(0, 60_000)}\n… (diff truncated at 60000 chars)` : fullDiff;
     const reply = await this.workJson<{ verdict: "approve" | "changes"; findings: Array<{ severity: string; file?: string; issue: string }> }>(
       "reviewer",
       { prompt: prompts.reviewPrompt({ ticket, diff, gates }), cwd: worktree, session: `${ticket.id}-review`, writeScope: [] },
@@ -1082,7 +1467,9 @@ Work only inside the current working directory.`;
     const text = reply.findings.map((f) => `- [${f.severity}] ${f.file ? `${f.file}: ` : ""}${f.issue}`).join("\n") || "(no findings)";
     this.deps.store.write(`reviews/${ticket.id}-${ticket.attempts.length + 1}.md`, `# Review of ${ticket.id}\n\nVerdict: ${reply.verdict}\n\n${text}\n`);
     // A "changes" verdict without blocking findings is treated as approval.
-    return { verdict: reply.verdict === "changes" && blocking.length > 0 ? "changes" : "approve", text };
+    const verdict = reply.verdict === "changes" && blocking.length > 0 ? "changes" : "approve";
+    this.ticketEvent(ticket, "review", { verdict, blocking: blocking.length, findings: reply.findings.length, model: `${this.member("reviewer").provider}/${this.member("reviewer").modelId}` });
+    return { verdict, text };
   }
 
   private async docs(): Promise<void> {
@@ -1114,17 +1501,24 @@ Work only inside the current working directory.`;
     const { deps, state } = this;
     const worktree = await this.ensureWorkspace();
     const final = await this.gates(worktree);
+    // Last secret scan over everything the factory branch adds, before it reaches the user's branch.
+    const secrets = state.baseCommit ? scanDiff(await commitDiff(worktree, state.baseCommit, "HEAD")) : [];
+    if (secrets.length) {
+      state.notes.push(`not merged: the secret scan found ${secrets.length} likely credential(s):\n${describeSecrets(secrets)}`);
+      deps.ui.notify(`Secret scan: ${secrets.length} likely credential(s) on ${state.branch}; not merging. See .factory/report.md.`, "warning");
+    }
     const done = state.tickets.filter((t) => t.status === "done").length;
     const skipped = state.tickets.filter((t) => t.status === "skipped").map((t) => t.id);
     const summary = [
       `${done}/${state.tickets.length} tickets delivered${skipped.length ? ` (skipped: ${skipped.join(", ")})` : ""}.`,
       `Gates on the final build: ${summarizeGates(final.results)}`,
+      `Secret scan: ${secrets.length ? `${secrets.length} finding(s)` : "clean"}`,
       `Spent: ${this.budgetLine()}.`,
       `Branch: ${state.branch}${state.baseBranch ? ` → merge into ${state.baseBranch}` : ""}`,
     ].join("\n");
 
     let merged = false;
-    if (state.baseBranch && final.ok) {
+    if (state.baseBranch && final.ok && secrets.length === 0) {
       const onBase = (await currentBranch(deps.cwd)) === state.baseBranch;
       const clean = await isClean(deps.cwd);
       let go = this.autonomy !== "careful";
@@ -1194,7 +1588,7 @@ Work only inside the current working directory.`;
       "|---|---|---|---|---|",
       ...[...byRole.entries()].map(([role, r]) => `| ${role} | ${r.model} | ${r.runs} | ${formatTokens(r.tokens)} | ${formatCost(r.cost)} |`),
     ];
-    const visibleNotes = this.state.notes.filter((n) => !n.includes(":written") && !/^brainstorm:\d+$/.test(n));
+    const visibleNotes = this.state.notes.filter((n) => !n.includes(":written") && !/^brainstorm:\d+$/.test(n) && !n.startsWith("breaker:"));
     if (visibleNotes.length) {
       lines.push("", "## Notes", "", ...visibleNotes.map((n) => `- ${n}`));
     }
