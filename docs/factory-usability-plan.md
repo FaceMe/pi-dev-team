@@ -60,7 +60,7 @@ Keep the existing phase machine, saved state, ticket isolation, and quality gate
 
 ## Validation
 
-The final check passed on 2026-10-04: **31 test files and 396 tests passed**.
+The final check passed on 2026-10-04: **31 test files and 397 tests passed**.
 The check includes TypeScript validation and the full test suite.
 The two optional Brave tests were enabled for this run.
 
@@ -77,6 +77,11 @@ Both packaged skills passed `quick_validate.py`.
 Native pi discovery reported both skills with no diagnostics.
 `npm pack --dry-run` included both skill files.
 The final whitespace check passed.
+
+Browser evidence uses a filesystem marker for its freshness cutoff.
+This prevents wall-clock precision differences from rejecting new evidence.
+The regression check covers a wall clock that is ahead of the filesystem clock.
+Stale records and screenshots remain rejected.
 
 External Paper, OpenDesign, and Doop accounts were not connected during validation.
 The bridge test proves worker loading and tool selection through a fixture extension.

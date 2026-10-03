@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { FactoryStore } from "../src/factory/store.js";
 import { tempDir } from "./helpers.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { browserEvidencePassed, persistBrowserEvidence } from "../src/factory/pipeline.js";
 const pass = { status: "pass", browser: "Brave", actions: [{ action: "assertText", selector: "h1", value: "Welcome", result: "pass" }], screenshots: ["shot.png"], consoleErrors: [] };
 describe("pipeline browser evidence gate", () => {
@@ -48,7 +48,7 @@ describe("durable browser evidence", () => {
 });
 
 describe("configured browser verification", () => {
-  it("runs exploratory QA when its flag is disabled and stores evidence before cleanup", async () => {
+  it.each([0, 5000])("runs exploratory QA when disabled and stores evidence with a %i ms wall-clock offset", async (clockOffset) => {
     const { execFileSync } = await import("node:child_process");
     const { FactoryRun, newState } = await import("../src/factory/pipeline.js");
     const { scriptedUi, ScriptedRunner } = await import("./factory-helpers.js");
@@ -74,7 +74,12 @@ describe("configured browser verification", () => {
       fs.writeFileSync(path.join(directory, "evidence.json"), JSON.stringify({ ...pass, screenshots: [shot] }));
       return { summary: "Browser checked", checks: [], bugs: [] };
     };
-    await run.verify();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + clockOffset);
+    try {
+      await run.verify();
+    } finally {
+      clock.mockRestore();
+    }
     expect(called).toBe(true);
     expect(state.tickets).toEqual([]);
     const evidence = JSON.parse(store.read("qa/browser-round-1/evidence.json")!);

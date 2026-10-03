@@ -111,6 +111,17 @@ export function browserEvidencePassed(item: unknown): boolean {
     Array.isArray(evidence.consoleErrors) && evidence.consoleErrors.length === 0;
 }
 
+/** Use the evidence filesystem's clock and precision for the freshness cutoff. */
+function browserEvidenceStart(evidenceDir: string): number {
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  const marker = fs.mkdtempSync(path.join(evidenceDir, ".review-start-"));
+  try {
+    return fs.statSync(marker).mtimeMs;
+  } finally {
+    fs.rmdirSync(marker);
+  }
+}
+
 /** Copy browser records and current screenshots into durable storage before cleanup. */
 export function persistBrowserEvidence(store: FactoryStore, evidenceDir: string, round: number, startedAt: number): unknown[] {
   const evidence: unknown[] = [];
@@ -1730,7 +1741,8 @@ Write only inside the current working directory and the assigned file scope.`;
     if (gates.ok && (settings.exploratoryQa || browserRequired) && this.hasWorker("qa")) {
       const fixed = state.tickets.filter((t) => t.kind === "bug" && t.status === "done" && t.foundInRound === round - 1);
       const untrackedBefore = new Set(await untrackedFiles(worktree));
-      const browserReviewStarted = Date.now();
+      const evidenceDir = path.join(worktree, ".factory/qa/browser");
+      const browserReviewStarted = browserRequired ? browserEvidenceStart(evidenceDir) : 0;
       report = await this.tryWorkJson(
         "qa",
         {
@@ -1742,7 +1754,6 @@ Write only inside the current working directory and the assigned file scope.`;
         normalizeQaReport,
       );
       if (browserRequired) {
-        const evidenceDir = path.join(worktree, ".factory/qa/browser");
         const evidence = persistBrowserEvidence(deps.store, evidenceDir, round, browserReviewStarted);
         const passed = evidence.some(browserEvidencePassed);
         if (!passed) {
