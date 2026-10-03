@@ -139,6 +139,31 @@ Pressing `e` on any reasoning model opens the dedicated effort picker in the rig
 | `Space` | Apply selected effort **and** immediately switch to that model |
 | `Esc` / `←` | Cancel and return to the model list |
 
+### Quick slots — your top 8 models on hotkeys
+
+Skip provider → model → effort navigation: your 8 most popular / recently used
+models are always one keystroke away, each with the reasoning effort you last
+used with it.
+
+| Key / command | Action |
+|---|---|
+| `Alt+1` … `Alt+8` | Switch straight to quick slot N — anywhere in pi, no picker needed (also works inside the picker) |
+| `/quick` | List the slots and pick one |
+| `/quick <n>` | Switch to slot N |
+
+The picker shows the slots in a **Quick** ribbon (`⌥1 claude-sonnet (high)  ⌥2 …`).
+
+Ranking is *frecency*: every explicit switch (picker, `/model`, roles, quick
+slots) adds 1 to the model's score after the old score decays with a one-week
+half-life — so a model you use every day stays on top, and one you tried once a
+month ago fades out. Session restores and `Ctrl+P` cycling are not counted.
+Until you have 8 used models, the remaining slots are filled with your daily /
+frontier / small roles, Fusion slots and default model. History lives in
+`~/.pi/agent/model-usage.json`.
+
+> On macOS, set your terminal's Option key to send Meta/Esc+ (Terminal:
+> *Use Option as Meta key*; iTerm2: *Left Option key → Esc+*) so `Alt+N` reaches pi.
+
 ### Roles
 
 Assign models to three roles and switch between them instantly:
