@@ -58,6 +58,10 @@ export type RoleConfig = ModelRef;
 export interface ModelRolesState {
   roles: { daily?: RoleConfig; small?: RoleConfig; frontier?: RoleConfig };
   defaultModel?: { provider: string; modelId: string };
+  /** Key that opens the Quick models table (pi key syntax). Default: ctrl+q, or alt+m with Windows keybindings. */
+  quickShortcut?: string;
+  /** macOS: treat Option+1…8 (typed as ¡ ™ £ ¢ ∞ § ¶ • on a US layout) as quick slots while the editor is empty. Default: true. */
+  quickMacOptionKeys?: boolean;
 }
 
 /**

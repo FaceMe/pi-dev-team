@@ -9,6 +9,7 @@ import {
   USAGE_HALF_LIFE_MS,
 } from "../src/shared/recents.js";
 import modelPicker, { resolveQuickSlots, SplitModelPickerComponent } from "../src/picker/model-picker.js";
+import { quickSlotFromKey, renderQuickTable } from "../src/picker/quick-table.js";
 import { fakeRegistry, fakeUi, makeModel, recordingPi, useTempAgentDir } from "./helpers.js";
 
 let agent: ReturnType<typeof useTempAgentDir>;
@@ -63,6 +64,41 @@ describe("model usage store", () => {
   });
 });
 
+describe("quick table", () => {
+  const big = makeModel({ id: "claude-big", provider: "anthropic", reasoning: true, contextWindow: 1_000_000 });
+  const small = makeModel({ id: "flash", provider: "google", contextWindow: 128_000 });
+  const slots = [
+    { model: big, effort: "high", source: "used", uses: 14, lastUsed: 1_000_000 - 2 * 3600_000 },
+    { model: small, effort: "off", source: "small role", uses: 0, lastUsed: 0 },
+  ];
+
+  it("shows all 8 rows with key, model, provider, effort, uses, recency and why", () => {
+    const lines = renderQuickTable(slots, { width: 120, activeKey: "anthropic/claude-big", now: 1_000_000, platform: "linux", openKey: "Ctrl+Q" });
+    expect(lines[0]).toMatch(/QUICK MODELS\s+Ctrl\+Q · Alt\+1…8$/);
+    expect(lines[2]).toMatch(/^ +1  Alt\+1  ● claude-big\s+anthropic\s+high\s+14  2h ago\s+1M  used/);
+    expect(lines[3]).toMatch(/2  Alt\+2    flash\s+google\s+off\s+0  never\s+128k  small role/);
+    expect(lines.slice(2, 10)).toHaveLength(8);
+    expect(lines[9]).toMatch(/8  Alt\+8    —/);
+    for (const line of lines) expect(line.length).toBeLessThanOrEqual(120);
+  });
+
+  it("drops less important columns at narrow widths but keeps the model", () => {
+    const lines = renderQuickTable(slots, { width: 44, platform: "darwin" });
+    expect(lines[1]).toMatch(/Model/);
+    expect(lines[1]).not.toMatch(/Why|Context/);
+    expect(lines[2]).toContain("claude-big");
+    for (const line of lines) expect(line.length).toBeLessThanOrEqual(44);
+  });
+
+  it("maps Alt+digit encodings and (optionally) macOS Option characters to slots", () => {
+    expect(quickSlotFromKey("\x1b3")).toBe(2);
+    expect(quickSlotFromKey("\x1b[51;3u")).toBe(2);
+    expect(quickSlotFromKey("£")).toBeUndefined();
+    expect(quickSlotFromKey("£", { macOption: true })).toBe(2);
+    expect(quickSlotFromKey("•", { macOption: true })).toBe(7);
+  });
+});
+
 describe("quick slots in pi", () => {
   const reasoning = makeModel({ id: "thinker", provider: "a", reasoning: true });
   const plain = makeModel({ id: "plain", provider: "b" });
@@ -103,14 +139,58 @@ describe("quick slots in pi", () => {
     expect(rec.thinkingLevels).toEqual(["high"]);
   });
 
-  it("/quick without args lists the slots and switches to the chosen one", async () => {
+  it("/quick without args opens the table; a digit switches straight away", async () => {
     recordModelUse("a", "thinker", "high");
     recordModelUse("b", "plain");
     recordModelUse("b", "plain");
-    const { rec, ctx, selects } = setup();
+    const { rec, ctx } = setup();
+    let rendered: string[] = [];
+    ctx.ui.custom = (factory: any) =>
+      new Promise((resolve) => {
+        const table = factory({ requestRender: () => undefined }, { fg: (_c: string, t: string) => t }, {}, resolve);
+        rendered = table.render(120);
+        table.handleInput("2");
+      });
     await rec.commands.get("quick").handler("", ctx);
-    expect(selects[0].options).toEqual(["1. b/plain (active)", "2. a/thinker (high)"]);
-    expect(rec.setModelCalls).toEqual([plain]);
+    const text = rendered.join("\n");
+    expect(text).toMatch(/QUICK MODELS/);
+    expect(text).toMatch(/#\s+Key\s+Model\s+Provider\s+Effort\s+Uses\s+Last used/);
+    expect(text).toMatch(/1\s+\S+\s+● plain\s+b\s+off\s+2\s+just now/);
+    expect(text).toMatch(/2\s+\S+\s+thinker\s+a\s+high\s+1/);
+    expect(rec.setModelCalls).toEqual([reasoning]);
+    expect(rec.thinkingLevels).toEqual(["high"]);
+  });
+
+  it("registers a shortcut that opens the table in any terminal", () => {
+    const { rec } = setup();
+    const expected = process.platform === "win32" ? "alt+m" : "ctrl+q";
+    if (!process.env.WSL_DISTRO_NAME) expect(rec.shortcuts.has(expected)).toBe(true);
+    expect([...rec.shortcuts.keys()]).toEqual(expect.arrayContaining(["alt+1", "alt+8"]));
+  });
+
+  it("macOS: Option+digit characters switch slots only while the editor is empty", async () => {
+    const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    try {
+      recordModelUse("a", "thinker", "low");
+      const { rec, ctx } = setup();
+      let listener: ((data: string) => any) | undefined;
+      let editor = "";
+      ctx.ui.onTerminalInput = (handler: any) => ((listener = handler), () => undefined);
+      ctx.ui.getEditorText = () => editor;
+      for (const h of rec.handlers.get("session_start") ?? []) h({}, ctx);
+      expect(listener).toBeDefined();
+
+      editor = "costs 3";
+      expect(listener!("£")).toBeUndefined(); // typing a pound sign in a message
+      editor = "";
+      expect(listener!("x")).toBeUndefined();
+      expect(listener!("¡")).toEqual({ consume: true });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(rec.setModelCalls).toEqual([reasoning]);
+    } finally {
+      Object.defineProperty(process, "platform", original);
+    }
   });
 
   it("warns on an empty slot", async () => {

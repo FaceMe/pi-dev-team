@@ -45,6 +45,7 @@ export interface RecordingPi {
   activeTools: string[];
   emitted: Array<{ name: string; data: unknown }>;
   messages: Array<{ message: any; options: any }>;
+  shortcuts: Map<string, any>;
 }
 
 export function recordingPi(options: { setModelResult?: boolean } = {}): RecordingPi {
@@ -59,6 +60,7 @@ export function recordingPi(options: { setModelResult?: boolean } = {}): Recordi
     activeTools: [],
     emitted: [],
     messages: [],
+    shortcuts: new Map(),
   };
   const listeners = new Map<string, Array<(data: unknown) => void>>();
   rec.api = {
@@ -71,7 +73,7 @@ export function recordingPi(options: { setModelResult?: boolean } = {}): Recordi
     sendMessage: (message: any, options: any) => rec.messages.push({ message, options }),
     registerTool: (tool: any) => rec.tools.set(tool.name, tool),
     registerCommand: (name: string, command: any) => rec.commands.set(name, command),
-    registerShortcut: () => undefined,
+    registerShortcut: (key: string, shortcut: any) => rec.shortcuts.set(key, shortcut),
     registerEntryRenderer: () => undefined,
     registerMessageRenderer: () => undefined,
     on: (event: string, handler: (...args: any[]) => any) => {
