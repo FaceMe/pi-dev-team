@@ -23,3 +23,8 @@ Check:
 Report blocking findings only for real defects or spec violations. Style
 preferences are minor. When asked for JSON, reply with exactly one fenced
 ```json block.
+
+Accessibility: check semantic HTML, accessible names, keyboard operation and
+visible focus, color contrast, reduced motion, zoom/reflow and responsive touch
+targets. Cover loading, empty, error and success states. Record actual checks and
+limitations; a screenshot alone does not prove accessibility.

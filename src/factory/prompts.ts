@@ -529,7 +529,7 @@ ${fixed.length ? `Bugs fixed since the last round (check each is really fixed):\
 Do not read the tests and call it done: the unit tests already pass. Run the
 software itself — the CLI with real arguments, the API with real requests (start
 the server in the background with output to a log, and stop it afterwards), the
-UI's build output — and walk each requirement's acceptance criteria end to end.
+UI in the running browser (use configured Brave automation where available) — and walk each requirement's acceptance criteria end to end.
 Then go off the happy path: empty and invalid input, missing files or
 configuration, large input, repeated or out-of-order actions, error messages.
 
@@ -543,7 +543,7 @@ Reply with only this JSON:
 \`\`\`json
 {
   "summary": "two or three sentences",
-  "checks": [{ "requirement": "FR-001", "result": "pass|fail|untested", "evidence": "command → output" }],
+  "checks": [{ "requirement": "FR-001", "result": "pass|fail|untested", "evidence": "command → output; for UI include Brave URL, viewport, actions and screenshot paths" }],
   "bugs": [{ "title": "short", "severity": "critical|major|minor", "requirement": "FR-001",
              "steps": ["exact step"], "expected": "…", "actual": "…", "evidence": "command and output" }]
 }
@@ -588,4 +588,35 @@ ${args.gaps.length ? `\nGaps they reported:\n${bullet(args.gaps.map((g) => `${g.
 Fix the documentation (README.md, AGENTS.md, docs/) so the next contributor
 succeeds. Run every command you document to confirm it works. Change
 documentation files only. Reply with a short summary of what you fixed.`;
+}
+
+/** Concrete design contract, usable even without a connected design server. */
+export function designPrompt(args: { idea: string; settings: SetupAnswers; spec: string }): string {
+  return `Design the user interface for: ${args.idea}
+
+${settingsSummary(args.settings)}
+
+Specification:
+${args.spec}
+
+Read the existing UI and docs/architecture.md if present. Create these artifacts:
+- .factory/design/design-system.md: tokens, typography, spacing, responsive layout,
+  accessible components, and their loading/empty/error/success/focus states.
+- .factory/design/handoff.md: screen/component inventory mapped to FR identifiers,
+  interactions, responsive rules, copy, assets and frontend acceptance checks.
+- .factory/design/preview.html: self-contained responsive HTML/CSS preview of core
+  journeys, openable locally without dependencies. Use real representative content.
+- .factory/design/evidence.json: {"integrations": [{"provider": "paper|opendesign|doop",
+  "status": "used|unavailable|not-configured", "tools": [], "artifacts": [], "reason": "..."}],
+  "preview": ".factory/design/preview.html", "screenshots": []}.
+
+Use every enabled design provider for an appropriate task when its tools are
+loaded (e.g. preview canvas, reusable design system, handoff/export). Inspect its
+actual tool schemas and current project first. If unavailable, record the reason
+and complete local artifacts. Copy usable exported assets into the design scope.
+Record only real tool calls and returned artifact links. Configuration is not a
+successful connection. If browser tooling is configured, inspect the local
+preview in Brave and capture evidence; otherwise mark browser review untested.
+Do not fabricate screenshots, remote URLs or successful browser checks.
+Reply with artifact paths, design decisions, provider status and open limitations.`;
 }

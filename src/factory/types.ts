@@ -1,5 +1,6 @@
 /** Core types for the software factory. */
 
+import type { IntegrationSettings } from "./integrations.js";
 import type { Usage } from "@earendil-works/pi-ai";
 import type { GateFailureDetails } from "./gate-parse.js";
 import type { Readiness } from "./readiness.js";
@@ -85,6 +86,7 @@ export interface RunSettings {
   research: ResearchMode;
   deploy: DeployMode;
   deployTarget?: string;
+  integrations?: IntegrationSettings;
 }
 
 /** The run-scoped keys of SetupAnswers. */
@@ -96,6 +98,7 @@ export function runSettings(answers: SetupAnswers): RunSettings {
     research: answers.research,
     deploy: answers.deploy,
     deployTarget: answers.deployTarget,
+    integrations: answers.integrations,
   };
 }
 
@@ -112,6 +115,7 @@ export interface SetupAnswers {
   deploy: DeployMode;
   /** Deploy target when deploy === "deploy" (e.g. "fly", "vercel", or free text). */
   deployTarget?: string;
+  integrations?: IntegrationSettings;
   /** Dollar budget; 0 = no limit. */
   budgetUsd: number;
   /** Token budget used when prices are unknown; 0 = no limit. */
@@ -263,6 +267,7 @@ export interface Profile {
 
 export interface WorkerRequest {
   role: string;
+  integrations?: IntegrationSettings;
   member: TeamMember;
   tools: string[];
   systemPrompt: string;
@@ -330,7 +335,9 @@ export interface FactoryState {
 /** UI surface the pipeline needs; the extension adapts ctx.ui, tests script it. */
 export interface FactoryUI {
   notify(message: string, level?: "info" | "warning" | "error"): void;
-  select(title: string, options: string[]): Promise<string | undefined>;
+  select(title: string, options: string[], config?: { initialIndex?: number }): Promise<string | undefined>;
+  viewSpec?(markdown: string): Promise<void>;
+  editSpec?(markdown: string): Promise<string | undefined>;
   input(title: string, placeholder?: string): Promise<string | undefined>;
   confirm(title: string, message: string): Promise<boolean>;
   status(text: string | undefined): void;

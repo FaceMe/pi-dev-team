@@ -4,6 +4,7 @@
  * every distinct team model (costs a fraction of a cent each).
  */
 
+import { integrationDiagnostics, type IntegrationSettings } from "./integrations.js";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -52,6 +53,8 @@ export async function runDoctor(args: {
   availableCount: number;
   providers: string[];
   webAccess: boolean;
+  integrations?: IntegrationSettings;
+  availableTools?: string[];
 }): Promise<DoctorLine[]> {
   const lines: DoctorLine[] = [];
   const hasGit = await gitAvailable();
@@ -87,6 +90,7 @@ export async function runDoctor(args: {
   lines.push({ ok: present.length > 0 ? true : "warn", label: "toolchains", detail: present.length ? present.join(", ") : "none of the common toolchains found" });
   const deploy = detectDeployTargets();
   lines.push({ ok: true, label: "deploy CLIs", detail: deploy.length ? deploy.map((d) => d.cli).join(", ") : "none (deployment options: local or config only)" });
+  lines.push(...integrationDiagnostics(args.integrations, args.cwd, args.availableTools));
   return lines;
 }
 
