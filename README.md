@@ -155,9 +155,21 @@ used with it.
 
 | Key / command | Action |
 |---|---|
-| `Alt+1` … `Alt+8` | Switch straight to quick slot N — anywhere in pi, no picker needed (also works inside the picker) |
-| `/quick` | List the slots and pick one |
+| `Ctrl+Q` (`Alt+M` with Windows/WSL keybindings) | Open the **Quick models table**, then press `1`–`8` to switch. Works in every terminal |
+| `Alt+1` … `Alt+8` | Switch straight to quick slot N, anywhere in pi and inside the picker, when your terminal sends Alt to pi |
+| macOS `Option+1` … `Option+8` | Same, even without "Option as Meta": the characters they type (`¡ ™ £ ¢ ∞ § ¶ •`) switch slots while the editor is empty, so typing `£` in a message still works |
+| `/quick` | Open the table |
 | `/quick <n>` | Switch to slot N |
+
+```
+ QUICK MODELS                                                       Ctrl+Q · Alt+1…8
+  #  Key    Model                Provider   Effort   Uses  Last used  Context  Why
+› 1  Alt+1  ● claude-sonnet-5    anthropic  high       14  2h ago        1M  used
+  2  Alt+2    gpt-5.5            openai     medium      9  1d ago      400k  used
+  3  Alt+3    glm-5.3-flash      zai        off         0  never       200k  small role
+  …
+ [1-8] Switch  [↑/↓] Move  [Enter] Switch  [Esc] Close
+```
 
 The picker shows the slots in a **Quick** ribbon (`⌥1 claude-sonnet (high)  ⌥2 …`).
 
@@ -169,8 +181,12 @@ Until you have 8 used models, the remaining slots are filled with your daily /
 frontier / small roles, Fusion slots and default model. History lives in
 `~/.pi/agent/model-usage.json`.
 
-> On macOS, set your terminal's Option key to send Meta/Esc+ (Terminal:
-> *Use Option as Meta key*; iTerm2: *Left Option key → Esc+*) so `Alt+N` reaches pi.
+> **Alt+digit not reaching pi?** Some terminals keep it: GNOME Terminal and
+> Konsole switch tabs with `Alt+1`…`9`, and macOS types `¡™£…` unless the Option
+> key sends Meta (Terminal: *Use Option as Meta key*; iTerm2: *Left Option key →
+> Esc+*). `Ctrl+Q` then `1`–`8` always works. Change the table key with
+> `"quickShortcut": "ctrl+b"` in `~/.pi/agent/model-roles.json`; turn the macOS
+> Option characters off with `"quickMacOptionKeys": false`.
 
 ### Roles
 

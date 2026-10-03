@@ -103,6 +103,7 @@ import {
   updateFusionConfig,
 } from "../shared/config.js";
 import type { FusionConfig, FusionSlot, ModelRolesState, RoleConfig } from "../shared/config.js";
+import type { QuickSlotSource } from "../shared/recents.js";
 import {
   loadModelUsage,
   QUICK_SLOT_COUNT,
@@ -111,6 +112,7 @@ import {
   recordModelUse,
 } from "../shared/recents.js";
 import { refKey } from "../shared/models.js";
+import { MAC_OPTION_DIGITS, QuickTableComponent, quickSlotFromKey, renderQuickTable } from "./quick-table.js";
 
 export {
   getModelThinkingLevel,
@@ -383,6 +385,11 @@ export function getEffectiveModelEffort(
 export interface QuickSlot {
   model: Model<any>;
   effort: ThinkingLevel;
+  /** Why the model is here: used often/recently, or padding from roles / Fusion / default. */
+  source: QuickSlotSource;
+  /** Explicit switches to this model, and when it was last switched to (0 when never). */
+  uses: number;
+  lastUsed: number;
 }
 
 /**
@@ -398,13 +405,14 @@ export function resolveQuickSlots(
   const refs = rankQuickModels((ref) => !!ctx.modelRegistry.find(ref.provider, ref.modelId));
   return refs.map((ref) => {
     const model = ctx.modelRegistry.find(ref.provider, ref.modelId)!;
-    const lastEffort = usage[refKey(ref)]?.effort ?? ref.effort;
+    const entry = usage[refKey(ref)];
+    const lastEffort = entry?.effort ?? ref.effort;
     const effort = !isReasoningModel(model)
       ? "off"
       : lastEffort
       ? (clampThinkingLevel(model, lastEffort as any) as ThinkingLevel)
       : getEffectiveModelEffort(model, undefined, undefined, rolesState, fusionConfig);
-    return { model, effort };
+    return { model, effort, source: ref.source, uses: entry?.count ?? 0, lastUsed: entry?.lastUsed ?? 0 };
   });
 }
 
@@ -436,6 +444,54 @@ export async function switchToQuickSlot(
   const effortText = isReasoningModel(model) ? ` (effort: ${effort.toUpperCase()})` : "";
   ctx.ui.notify(`Switched to [Quick ${index + 1}]: ${model.provider}/${model.id}${effortText}`, "info");
   return true;
+}
+
+/** Open picker/table overlays: the macOS Option-key listener stays out of their way. */
+let quickOverlayOpen = 0;
+
+/** pi swaps several defaults (ctrl+q among them) on Windows and WSL. */
+function usesWindowsKeybindings(): boolean {
+  return process.platform === "win32" || (process.platform === "linux" && !!(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP));
+}
+
+/** Key that opens the Quick models table. */
+export function quickTableShortcut(rolesState: ModelRolesState = loadRolesState()): string {
+  const configured = rolesState.quickShortcut?.trim().toLowerCase();
+  return configured || (usesWindowsKeybindings() ? "alt+m" : "ctrl+q");
+}
+
+export function macOptionKeysEnabled(platform: NodeJS.Platform = process.platform, rolesState?: ModelRolesState): boolean {
+  if (platform !== "darwin") return false;
+  return (rolesState ?? loadRolesState()).quickMacOptionKeys !== false;
+}
+
+function formatShortcut(key: string): string {
+  return key
+    .split("+")
+    .map((part) => (part.length === 1 ? part.toUpperCase() : part[0].toUpperCase() + part.slice(1)))
+    .join("+");
+}
+
+/** The Quick models table: an overlay in the TUI (1–8 switch), plain text elsewhere. */
+export async function showQuickTable(ctx: ExtensionContext | ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
+  const slots = resolveQuickSlots(ctx);
+  const activeKey = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+  const openKey = formatShortcut(quickTableShortcut());
+  if (ctx.mode !== "tui") {
+    const lines = renderQuickTable(slots, { width: 110, activeKey, openKey });
+    ctx.ui.notify(lines.join("\n"), "info");
+    return;
+  }
+  quickOverlayOpen += 1;
+  let index: number | null;
+  try {
+    index = await ctx.ui.custom<number | null>((tui, theme, _keybindings, done) => {
+      return new QuickTableComponent(slots, done, { activeKey, theme, openKey }, () => tui.requestRender());
+    });
+  } finally {
+    quickOverlayOpen -= 1;
+  }
+  if (index !== null && index !== undefined) await switchToQuickSlot(ctx, pi, slots[index], index);
 }
 
 function formatQuickSlot(slot: QuickSlot): string {
@@ -965,12 +1021,11 @@ export class SplitModelPickerComponent {
 
     // --- Normal Two-Panel Picker Input Handling ---
 
-    // 0. Alt+1 … Alt+8: jump straight to a quick slot (works in search mode too)
-    for (let i = 0; i < QUICK_SLOT_COUNT; i++) {
-      if (matchesKey(data, Key.alt(String(i + 1) as "1"))) {
-        void this.selectQuickSlot(i);
-        return;
-      }
+    // 0. Alt+1 … Alt+8 (or macOS Option+1 … 8 outside search): jump straight to a quick slot
+    const quickIndex = quickSlotFromKey(data, { macOption: macOptionKeysEnabled() && !this.isSearchMode });
+    if (quickIndex !== undefined) {
+      void this.selectQuickSlot(quickIndex);
+      return;
     }
 
     // 1. ESC: Clear search, return to the role list (chooser), or exit
@@ -1756,11 +1811,17 @@ export async function showModelPicker(
     return fallbackModelPicker(ctx, options);
   }
 
-  const result = await ctx.ui.custom<(ModelPickerResult & Model<any>) | null>(
-    (tui, theme, _keybindings, done) => {
-      return new SplitModelPickerComponent(tui, theme, done, ctx, pi, options);
-    }
-  );
+  quickOverlayOpen += 1;
+  let result: (ModelPickerResult & Model<any>) | null;
+  try {
+    result = await ctx.ui.custom<(ModelPickerResult & Model<any>) | null>(
+      (tui, theme, _keybindings, done) => {
+        return new SplitModelPickerComponent(tui, theme, done, ctx, pi, options);
+      }
+    );
+  } finally {
+    quickOverlayOpen -= 1;
+  }
 
   if (!result) return null;
   const picked: ModelPickerResult = { model: result.model ?? result, effort: result.effort ?? "off" };
@@ -2459,8 +2520,44 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  const tableKey = quickTableShortcut();
+  pi.registerShortcut(tableKey as any, {
+    description: "Open the Quick models table (then 1–8 to switch)",
+    handler: async (ctx) => {
+      await showQuickTable(ctx, pi);
+    },
+  });
+
+  // macOS: Option+1…8 usually types ¡ ™ £ ¢ ∞ § ¶ • instead of reaching pi as
+  // Alt+digit. Treat those characters as quick slots while the editor is empty
+  // (so typing "£" in a message still works) and no picker is open.
+  let stopOptionKeys: (() => void) | undefined;
+  pi.on("session_start", (_event, ctx) => {
+    stopOptionKeys?.();
+    stopOptionKeys = undefined;
+    if (ctx.mode !== "tui" || !macOptionKeysEnabled()) return;
+    stopOptionKeys = ctx.ui.onTerminalInput((data) => {
+      if (quickOverlayOpen > 0) return undefined;
+      const index = MAC_OPTION_DIGITS.indexOf(data);
+      if (index < 0) return undefined;
+      let editorText = "";
+      try {
+        editorText = ctx.ui.getEditorText();
+      } catch {
+        return undefined;
+      }
+      if (editorText !== "") return undefined;
+      void switchToQuickSlot(ctx, pi, resolveQuickSlots(ctx)[index], index);
+      return { consume: true };
+    });
+  });
+  pi.on("session_shutdown", () => {
+    stopOptionKeys?.();
+    stopOptionKeys = undefined;
+  });
+
   pi.registerCommand("quick", {
-    description: "Switch to one of your top 8 popular / recently used models (also Alt+1 … Alt+8)",
+    description: "Show your top 8 models as a table and switch (also Alt+1 … Alt+8)",
     getArgumentCompletions: (prefix: string) => {
       const p = prefix.trim();
       const list = Array.from({ length: QUICK_SLOT_COUNT }, (_, i) => String(i + 1))
@@ -2492,14 +2589,14 @@ async function handleQuickCommand(args: string, ctx: ExtensionCommandContext, pi
     ctx.ui.notify("No quick models yet. They fill up as you switch models (or set roles in /models).", "info");
     return;
   }
+  if (ctx.mode === "tui" || !ctx.hasUI) {
+    await showQuickTable(ctx, pi);
+    return;
+  }
   const choices = slots.map((slot, i) => {
     const active = ctx.model && modelsAreEqual(ctx.model, slot.model) ? " (active)" : "";
     return `${i + 1}. ${slot.model.provider}/${formatQuickSlot(slot)}${active}`;
   });
-  if (!ctx.hasUI) {
-    ctx.ui.notify(`Quick models (Alt+1 … Alt+${slots.length}):\n${choices.join("\n")}`, "info");
-    return;
-  }
   const choice = await ctx.ui.select("Quick switch (Alt+1 … Alt+8 work anywhere):", choices);
   if (!choice) return;
   const index = choices.indexOf(choice);

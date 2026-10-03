@@ -69,6 +69,13 @@ export function recordModelEffort(provider: string, modelId: string, effort: Eff
   writeJsonFile(modelUsagePath(), state);
 }
 
+/** Why a model holds a quick slot: picked often/recently, or padding from config. */
+export type QuickSlotSource = "used" | "daily role" | "frontier role" | "small role" | "fusion main" | "fusion sidekick" | "default";
+
+export interface RankedQuickModel extends ModelRef {
+  source: QuickSlotSource;
+}
+
 /**
  * The quick-switch slots: the highest-scoring used models first, then (until
  * there are `limit`) the configured roles, Fusion slots and default model.
@@ -77,31 +84,31 @@ export function recordModelEffort(provider: string, modelId: string, effort: Eff
 export function rankQuickModels(
   exists: (ref: ModelRef) => boolean,
   options: { limit?: number; now?: number } = {}
-): ModelRef[] {
+): RankedQuickModel[] {
   const limit = options.limit ?? QUICK_SLOT_COUNT;
   const now = options.now ?? Date.now();
   const seen = new Set<string>();
-  const slots: ModelRef[] = [];
-  const add = (ref: ModelRef | undefined) => {
+  const slots: RankedQuickModel[] = [];
+  const add = (ref: ModelRef | undefined, source: QuickSlotSource) => {
     if (!ref || slots.length >= limit) return;
     const key = refKey(ref);
     if (seen.has(key) || !exists(ref)) return;
     seen.add(key);
-    slots.push({ provider: ref.provider, modelId: ref.modelId, effort: ref.effort });
+    slots.push({ provider: ref.provider, modelId: ref.modelId, effort: ref.effort, source });
   };
 
   const used = Object.values(loadModelUsage().models).sort(
     (a, b) => decayedScore(b, now) - decayedScore(a, now) || b.lastUsed - a.lastUsed
   );
-  for (const entry of used) add(entry);
+  for (const entry of used) add(entry, "used");
 
   const roles = loadRolesState();
-  add(roles.roles.daily);
-  add(roles.roles.frontier);
-  add(roles.roles.small);
+  add(roles.roles.daily, "daily role");
+  add(roles.roles.frontier, "frontier role");
+  add(roles.roles.small, "small role");
   const fusion = loadFusionConfig();
-  add(fusion.main);
-  add(fusion.sidekick);
-  add(roles.defaultModel);
+  add(fusion.main, "fusion main");
+  add(fusion.sidekick, "fusion sidekick");
+  add(roles.defaultModel, "default");
   return slots;
 }
