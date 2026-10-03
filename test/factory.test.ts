@@ -277,7 +277,7 @@ const SPEC = `# Spec
 
 ## Functional requirements
 - FR-001 Add numbers.
-  - Given two numbers When added Then the sum is returned.
+  - Given two numbers When added Then the sum is returned. Source: brief.
 `;
 
 function happyScripts(overrides: Record<string, any> = {}) {

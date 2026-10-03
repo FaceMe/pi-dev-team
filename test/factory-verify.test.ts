@@ -189,7 +189,7 @@ const SPEC = `# Spec
 
 ## Functional requirements
 - FR-001 Add two numbers given on the command line.
-  - Given "1" and "2" When added Then 3 is printed.
+  - Given "1" and "2" When added Then 3 is printed. Source: brief.
 `;
 
 const addTest = "import test from 'node:test';\nimport assert from 'node:assert';\nimport { add } from '../src/add.js';\ntest('add', () => assert.equal(add(1, 2), 3));\n";

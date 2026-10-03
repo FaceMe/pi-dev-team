@@ -304,6 +304,7 @@ Reply again with the corrected complete plan as one fenced json block.`;
     : "";
   return `Plan the build for the project in .factory/spec/spec.md, following the
 architecture in .factory/adr/0001-architecture.md.
+When present, read .factory/design/design-system.md and .factory/design/handoff.md before assigning frontend tickets. Map their components and responsive/accessibility requirements into the ticket briefs.
 Stack: ${args.profile.stack}
 Gates: ${args.profile.gates.map((g) => `${g.name}: \`${g.command}\``).join("; ")}
 ${contracts}${feedback}
@@ -392,7 +393,7 @@ fix it minimally and explain why in your report.
 ${ticket.brief}
 
 Requirements covered: ${ticket.requirements.join(", ") || "(none listed)"} — see docs/spec.md.
-Acceptance criteria:
+${ticket.role === "frontend" ? "Read docs/design/design-system.md and docs/design/handoff.md when present; implement their components, tokens, responsive states and accessibility requirements. Preview and binary assets are in docs/design/.\n" : ""}Acceptance criteria:
 ${bullet(ticket.acceptance)}
 
 You may change only files matching: ${ticket.writeScope.join(", ")}

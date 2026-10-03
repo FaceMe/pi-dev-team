@@ -46,6 +46,7 @@ import {
   untrackedFiles,
   workingDiff,
 } from "./git.js";
+import { integrationSettings } from "./integrations.js";
 import { Mutex } from "./mutex.js";
 import { nextRunnable } from "./scheduler.js";
 import { describeSecrets, scanDiff } from "./secrets.js";
@@ -96,6 +97,60 @@ import {
 import type { ContributorOutcome, QaBug, QaReport } from "./verify.js";
 
 export { orderTickets };
+
+/** Evidence only covers the recorded browser actions, never implies all requirements passed. */
+export function browserEvidencePassed(item: unknown): boolean {
+  if (!item || typeof item !== "object") return false;
+  const evidence = item as Record<string, any>;
+  return evidence.status === "pass" && evidence.browser === "Brave" &&
+    Array.isArray(evidence.actions) && evidence.actions.length > 0 && evidence.actions.every((action: any) => action?.result === "pass" &&
+      ["click", "fill", "press", "assertText"].includes(action.action) && typeof action.selector === "string" && !!action.selector.trim() &&
+      (!["press", "assertText"].includes(action.action) || (typeof action.value === "string" && !!action.value.trim()))) &&
+    evidence.actions.some((action: any) => action.action === "assertText") &&
+    Array.isArray(evidence.screenshots) && evidence.screenshots.some((file: any) => typeof file === "string" && !!file) &&
+    Array.isArray(evidence.consoleErrors) && evidence.consoleErrors.length === 0;
+}
+
+/** Copy browser records and current screenshots into durable storage before cleanup. */
+export function persistBrowserEvidence(store: FactoryStore, evidenceDir: string, round: number, startedAt: number): unknown[] {
+  const evidence: unknown[] = [];
+  if (fs.existsSync(evidenceDir)) {
+    for (const entry of fs.readdirSync(evidenceDir, { recursive: true })) {
+      const relative = String(entry);
+      const source = path.join(evidenceDir, relative);
+      const stat = fs.lstatSync(source);
+      if (!stat.isFile() || stat.isSymbolicLink()) continue;
+      const destination = store.path("qa", `browser-round-${round}`, relative);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.copyFileSync(source, destination);
+      if (!relative.endsWith(".json") || stat.mtimeMs < startedAt) continue;
+      try {
+        const recorded = JSON.parse(fs.readFileSync(source, "utf8"));
+        const screenshots = Array.isArray(recorded.screenshots) ? recorded.screenshots : [];
+        const persisted: string[] = [];
+        for (const file of screenshots) {
+          if (typeof file !== "string") continue;
+          const screenshot = path.resolve(evidenceDir, file);
+          const rel = path.relative(evidenceDir, screenshot);
+          const realRelative = path.relative(fs.realpathSync(evidenceDir), fs.realpathSync(screenshot));
+          if (!rel || rel.startsWith("..") || path.isAbsolute(rel) || realRelative.startsWith("..") || path.isAbsolute(realRelative)) continue;
+          // Only real screenshots produced in this review count; stale or escaped paths never satisfy the gate.
+          const shotStat = fs.lstatSync(screenshot);
+          if (!shotStat.isFile() || shotStat.isSymbolicLink() || shotStat.size === 0 || shotStat.mtimeMs < startedAt) continue;
+          const saved = store.path("qa", `browser-round-${round}`, rel);
+          fs.mkdirSync(path.dirname(saved), { recursive: true });
+          fs.copyFileSync(screenshot, saved);
+          persisted.push(saved);
+        }
+        recorded.screenshots = persisted;
+        recorded.evidencePath = destination;
+        store.write(`qa/browser-round-${round}/${relative}`, JSON.stringify(recorded, null, 2));
+        evidence.push(recorded);
+      } catch { /* Malformed or missing evidence remains non-passing. */ }
+    }
+  }
+  return evidence;
+}
 
 export interface PipelineDeps {
   cwd: string;
@@ -188,6 +243,9 @@ function anySignal(signals: Array<AbortSignal | undefined>): AbortSignal | undef
 
 export class FactoryRun {
   private activity: string[] = [];
+  private readonly workers = new Map<string, { id: string; role: string; model: string; ticket?: string; status: "running"; activity?: string; startedAt: number }>();
+
+  workerSnapshots() { return [...this.workers.values()].map((worker) => ({ ...worker })); }
   /** One prompt at a time, whichever parallel ticket asks. */
   private readonly uiLock = new Mutex();
   /** One merge into the integration branch at a time. */
@@ -211,6 +269,7 @@ export class FactoryRun {
   async run(): Promise<FactoryState> {
     const { ui } = this.deps;
     this.state.status = "running";
+    delete this.state.lastError;
     this.save();
     try {
       while (this.state.phase !== "done") {
@@ -316,7 +375,7 @@ export class FactoryRun {
     const tickets = state.tickets.length ? ` · ${done}/${state.tickets.length} tickets` : "";
     const label = state.status === "running" ? state.phase : `${state.phase} (${state.status})`;
     deps.ui.status(`🏭 ${label}${tickets} · ${this.budgetLine()}`);
-    deps.ui.widget(state.status === "done" ? undefined : boardLines(state, { activity: this.activity, extra }));
+    deps.ui.widget(state.status === "done" ? undefined : boardLines(state, { activity: this.activity, extra, workers: this.workerSnapshots() }));
   }
 
   // -------------------------------------------------------------------------
@@ -404,6 +463,17 @@ Work only inside the current working directory.`;
     });
   }
 
+  private workerIntegrations() {
+    const settings = integrationSettings(this.deps.answers.integrations);
+    const absolute = (files?: string[]) => files?.map((file) => path.resolve(this.deps.cwd, file));
+    for (const bridge of Object.values(settings.design ?? {})) if (bridge) bridge.extensions = absolute(bridge.extensions);
+    if (settings.browser) {
+      settings.browser.extensions = absolute(settings.browser.extensions);
+      if (settings.browser.executablePath) settings.browser.executablePath = path.resolve(this.deps.cwd, settings.browser.executablePath);
+    }
+    return settings;
+  }
+
   async work(
     roleName: string,
     options: { prompt: string; cwd: string; session: string; writeScope: string[]; member?: TeamMember; allowDeploy?: boolean; ticket?: string },
@@ -416,27 +486,38 @@ Work only inside the current working directory.`;
       this.inFlight.size > 1
         ? `building ${[...this.inFlight].join(", ")} in parallel`
         : `${roleName} · ${member.provider}/${member.modelId}${options.ticket ? ` · ${options.ticket}` : ""}`;
+    const workerId = `${this.state.runId}-${options.session}`;
+    const snapshot = { id: workerId, role: roleName, model: `${member.provider}/${member.modelId}`, ticket: options.ticket, status: "running" as const, startedAt: Date.now(), activity: undefined as string | undefined };
+    this.workers.set(workerId, snapshot);
     this.showStatus(label());
-    const result = await this.deps.runner.run({
-      role: roleName,
-      member,
-      tools: this.tools(role),
-      systemPrompt: this.systemPrompt(role),
-      prompt: options.prompt,
-      cwd: options.cwd,
-      sessionId: `${this.state.runId}-${options.session}`,
-      sessionDir: this.deps.store.sessionsDir,
-      writeScope: options.writeScope,
-      sidekick: role.sidekick,
-      allowDeploy: options.allowDeploy,
-      timeoutMs: this.deps.workerTimeoutMs ?? 30 * 60_000,
-      signal: this.signal,
-      onActivity: (line) => {
-        this.activity.push(`${options.ticket ? `${options.ticket} ` : ""}${roleName}: ${line}`);
-        if (this.activity.length > 20) this.activity.shift();
-        this.showStatus(label());
-      },
-    });
+    let result: WorkerResult;
+    try {
+      result = await this.deps.runner.run({
+        role: roleName,
+        member,
+        tools: this.tools(role),
+        systemPrompt: this.systemPrompt(role),
+        prompt: options.prompt,
+        cwd: options.cwd,
+        sessionId: `${this.state.runId}-${options.session}`,
+        sessionDir: this.deps.store.sessionsDir,
+        writeScope: options.writeScope,
+        sidekick: role.sidekick,
+        allowDeploy: options.allowDeploy,
+        integrations: this.workerIntegrations(),
+        timeoutMs: this.deps.workerTimeoutMs ?? 30 * 60_000,
+        signal: this.signal,
+        onActivity: (line) => {
+          snapshot.activity = line;
+          this.activity.push(`${options.ticket ? `${options.ticket} ` : ""}${roleName}: ${line}`);
+          if (this.activity.length > 20) this.activity.shift();
+          this.showStatus(label());
+        },
+      });
+    } finally {
+      this.workers.delete(workerId);
+      this.showStatus();
+    }
     this.state.spentUsd += result.usage.cost.total;
     this.state.spentTokens += result.usage.totalTokens;
     this.save();
@@ -764,6 +845,7 @@ Work only inside the current working directory.`;
 
     for (;;) {
       const spec = deps.store.read("spec/spec.md") ?? "";
+      if (deps.store.read("spec/approved.md") !== spec) fs.rmSync(deps.store.path("spec", "approved.md"), { force: true });
       const ids = requirementIds(spec);
       const validation = this.checkSpec(spec);
       const assumptions = (deps.store.read("spec/assumptions.md") ?? "").split("\n").filter((l) => l.trim().startsWith("-")).length;
@@ -776,8 +858,41 @@ Work only inside the current working directory.`;
         "",
         truncate(spec.split("\n").filter((l) => l.trim() && !l.startsWith("#")).slice(0, 6).join(" "), 400),
       ].join("\n");
-      const choice = await this.approve("Approve the specification?", summary, ["Request changes…"]);
-      if (choice === "Approve") break;
+      // Display the exact draft before every approval, including after amendments.
+      if (deps.ui.viewSpec) await deps.ui.viewSpec(spec);
+      else deps.ui.log("spec", { text: spec });
+      const choice = await this.approve("Approve the specification?", summary, ["View full specification", "Edit draft…", "Request changes…"]);
+      if (choice === "View full specification") continue;
+      if (choice === "Edit draft…") {
+        if (!deps.ui.editSpec) {
+          deps.ui.notify("Draft editor unavailable; use Request changes to amend the specification.", "info");
+          continue;
+        }
+        const edited = await deps.ui.editSpec(spec);
+        if (edited === undefined || edited === spec) continue;
+        if (deps.store.read("spec/spec.md") !== spec) {
+          deps.ui.notify("The specification changed during editing. Review the current draft before applying edits.", "warning");
+          continue;
+        }
+        deps.store.write("spec/spec.md", edited);
+        this.checkSpec(edited);
+        this.markSpecWritten();
+        continue;
+      }
+      if (choice === "Approve") {
+        this.checkAbort();
+        if (deps.store.read("spec/spec.md") !== spec) {
+          deps.ui.notify("The specification changed during review. Review the updated draft before approving.", "warning");
+          continue;
+        }
+        if (!validation?.ok) {
+          deps.ui.notify(`Resolve the specification validation issues before approval: ${validation?.issues.map((issue) => issue.message).join("; ") ?? "validation unavailable"}`, "warning");
+          continue;
+        }
+        deps.store.write("spec/approved.md", spec);
+        deps.store.ledger({ kind: "spec-approved", runId: this.state.runId });
+        break;
+      }
       feedback = await deps.ui.input("What should change in the spec?", "e.g. drop user accounts; add CSV export");
       if (!feedback?.trim()) continue;
       await this.writeSpec(feedback.trim());
@@ -833,7 +948,9 @@ Work only inside the current working directory.`;
   /** validateSpec is a quality gate; when the validator itself cannot run, spec quality is judged at the approval gate instead. */
   private checkSpec(spec: string): SpecValidation | undefined {
     try {
-      return validateSpec(spec);
+      const validation = validateSpec(spec);
+      this.deps.store.write("spec/validation.json", JSON.stringify(validation, null, 2));
+      return validation;
     } catch {
       return undefined;
     }
@@ -844,6 +961,7 @@ Work only inside the current working directory.`;
     let feedback: string | undefined;
     for (;;) {
       await this.designArchitecture(feedback);
+      await this.designInterface();
       if (this.autonomy !== "careful") return;
       const profile = deps.store.loadProfile()!;
       const choice = await this.approve(
@@ -898,8 +1016,38 @@ Work only inside the current working directory.`;
     return profile;
   }
 
+  /** Persist a UI handoff before the planner assigns frontend work. */
+  private async designInterface(): Promise<void> {
+    const { deps, state } = this;
+    const spec = deps.store.read("spec/spec.md") ?? "";
+    if (!this.hasWorker("designer") || !/\b(ui|frontend|dashboard|web app|website|screen|interface|landing page)\b/i.test(`${state.idea} ${spec}`)) return;
+    const artifacts = ["design-system.md", "handoff.md", "preview.html", "evidence.json"];
+    const inputs = JSON.stringify({ spec, profile: deps.store.loadProfile() });
+    if (state.notes.includes("design:written") && deps.store.read("design/inputs.json")?.trim() === inputs && artifacts.every((name) => deps.store.read(`design/${name}`))) return;
+    // Old artifacts cannot fulfill a new design request after changes to the spec or architecture.
+    for (const name of artifacts) fs.rmSync(deps.store.path("design", name), { force: true });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await this.work("designer", {
+        prompt: prompts.designPrompt({ idea: state.idea, settings: deps.answers, spec }) +
+          (attempt ? "\nThe design output was incomplete. Write all four required artifacts before replying." : ""),
+        cwd: deps.cwd,
+        session: "designer",
+        writeScope: [".factory/design/**", ".factory/qa/browser/**"],
+      });
+      if (result.isError) throw new StopRun("failed", `The designer failed: ${result.errorMessage}`);
+      if (artifacts.every((name) => deps.store.read(`design/${name}`))) {
+        deps.store.write("design/inputs.json", inputs);
+        if (!state.notes.includes("design:written")) state.notes.push("design:written");
+        this.save();
+        return;
+      }
+    }
+    throw new StopRun("failed", "The designer did not produce the design system, handoff, preview and evidence. Run /factory resume to retry.");
+  }
+
   private async planning(): Promise<void> {
     const { deps, state } = this;
+    await this.designInterface();
     let feedback: string | undefined;
     for (;;) {
       const profile = deps.store.loadProfile();
@@ -981,6 +1129,27 @@ Work only inside the current working directory.`;
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.writeFileSync(target, text);
     }
+    const design = store.path("design");
+    if (fs.existsSync(design) && !fs.lstatSync(design).isSymbolicLink()) {
+      for (const entry of fs.readdirSync(design, { recursive: true })) {
+        const source = path.join(design, String(entry));
+        const stat = fs.lstatSync(source);
+        if (!stat.isFile() || stat.isSymbolicLink()) continue;
+        const relative = path.relative(fs.realpathSync(design), fs.realpathSync(source));
+        if (relative.startsWith("..") || path.isAbsolute(relative)) continue;
+        const target = path.resolve(worktree, "docs/design", relative);
+        let ancestor = target;
+        while (ancestor !== path.resolve(worktree)) {
+          if (fs.existsSync(ancestor) && fs.lstatSync(ancestor).isSymbolicLink()) {
+            throw new StopRun("failed", "Design handoff destination contains a symbolic link. Remove it before resuming.");
+          }
+          ancestor = path.dirname(ancestor);
+        }
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.copyFileSync(source, target);
+      }
+    }
+
   }
 
   /** File names in a .factory/ subdirectory ([] when it does not exist). */
@@ -1547,19 +1716,33 @@ Work only inside the current working directory.`;
 
     // A red build is the bug; exploratory QA runs on a green one.
     let report: QaReport | undefined;
-    if (gates.ok && settings.exploratoryQa && this.hasWorker("qa")) {
+    const browserRequired = Boolean(deps.answers.integrations?.browser?.enabled);
+    if (gates.ok && browserRequired && !this.hasWorker("qa")) {
+      opened.push(integrationBugTicket("Configured Brave UI verification could not run: no QA worker is available.", [...state.tickets, ...opened], round));
+    }
+    if (gates.ok && (settings.exploratoryQa || browserRequired) && this.hasWorker("qa")) {
       const fixed = state.tickets.filter((t) => t.kind === "bug" && t.status === "done" && t.foundInRound === round - 1);
       const untrackedBefore = new Set(await untrackedFiles(worktree));
+      const browserReviewStarted = Date.now();
       report = await this.tryWorkJson(
         "qa",
         {
           prompt: prompts.exploratoryQaPrompt({ profile, tickets: state.tickets, requirements: this.requirementIdsFromSpec(), round, fixed }),
           cwd: worktree,
           session: `verify-${round}`,
-          writeScope: [],
+          writeScope: deps.answers.integrations?.browser?.enabled ? [".factory/qa/browser/**"] : [],
         },
         normalizeQaReport,
       );
+      if (browserRequired) {
+        const evidenceDir = path.join(worktree, ".factory/qa/browser");
+        const evidence = persistBrowserEvidence(deps.store, evidenceDir, round, browserReviewStarted);
+        const passed = evidence.some(browserEvidencePassed);
+        if (!passed) {
+          opened.push(integrationBugTicket("Configured Brave UI verification has no passing evidence with actions and screenshots. Run browser acceptance checks and save evidence under .factory/qa/browser/.", [...state.tickets, ...opened], round));
+          state.notes.push(`browser QA round ${round}: missing or non-passing evidence`);
+        }
+      }
       // QA must leave the integration tree as it found it.
       const leftovers = await restoreAfter(worktree, untrackedBefore);
       if (leftovers.length) deps.store.ledger({ kind: "verify-cleanup", runId: state.runId, round, removed: leftovers.slice(0, 50) });
