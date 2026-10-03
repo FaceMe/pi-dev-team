@@ -4,8 +4,11 @@
  *   /factory new [idea]      quick setup (prefilled; Enter accepts) → interview → spec → … → release
  *   /factory resume|pause    continue / pause the run in this folder
  *   /factory status|cost     where the run is and what it has spent
+ *   /factory board           the run at a glance: phase, tickets, spend
+ *   /factory trace [id]      the last worker trace for a ticket id or role
  *   /factory doctor [probe]  check the machine and the team, with fixes
  *   /factory team [preset]   show the team, or switch preset (balanced|cheap|best|refresh)
+ *   /factory roles           assign models to roles with the picker
  *   /factory autonomy <p>    auto | balanced | careful
  *   /factory settings        change the quick-setup answers for this folder
  *   /factory run <role> <brief>   run one role once (read-only), e.g. to try a model
@@ -22,10 +25,13 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
+import { pricePerToken } from "../shared/models.js";
 import { truncate } from "../shared/text.js";
 import { renderTraceSteps } from "../shared/trace.js";
 import { formatCost, formatTokens } from "../shared/usage.js";
-import { showModelPicker } from "../picker/model-picker.js";
+import { showFactoryRolePicker, showModelPicker } from "../picker/model-picker.js";
+import { boardLines } from "./board.js";
+import { buildCostReport, renderCostReport } from "./cost.js";
 import { formatDoctor, probeModels, runDoctor } from "./doctor.js";
 import { blockedCommand, inWriteScope } from "./guard.js";
 import { FactoryRun, makeRunId, newState } from "./pipeline.js";
@@ -46,6 +52,7 @@ import { FactoryStore } from "./store.js";
 import { buildTeam, describeTeam } from "./team.js";
 import type { Team } from "./team.js";
 import type { Autonomy, FactoryState, FactoryUI, SetupAnswers, TeamPreset, WorkerRunner } from "./types.js";
+import { runSettings } from "./types.js";
 
 const TAG = "factory";
 const DEMO_IDEA =
@@ -277,8 +284,7 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
         if (!ok) return;
       }
       if (previous) {
-        fs.mkdirSync(store.path("runs"), { recursive: true });
-        fs.renameSync(store.path("state.json"), store.path("runs", `${previous.runId}.json`));
+        store.archiveState(previous.runId);
       }
       const setup = await quickSetup(ctx, cwd, idea, opts.forceDefaults);
       if (!setup) {
@@ -287,6 +293,7 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
       }
       if (opts.autonomy) setup.answers.autonomy = opts.autonomy;
       const state = newState(idea, makeRunId(), setup.answers);
+      state.settings = runSettings(setup.answers);
       store.saveState(state);
       ctx.ui.notify(`Factory started (${AUTONOMY_TEXT[setup.answers.autonomy]}). /factory status any time.`, "info");
       await follow(ctx, startRun(ctx, cwd, setup.answers, state, setup.webAccess));
@@ -314,6 +321,17 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
         loadUserDefaults(),
         project,
       );
+      // The lock's snapshot wins over today's defaults so a resumed run reproduces
+      // its own setup; the team (preset/pins) still follows the user's current defaults.
+      if (state.settings) {
+        const snapshot = state.settings;
+        if (snapshot.autonomy !== undefined) answers.autonomy = snapshot.autonomy;
+        if (snapshot.projectMode !== undefined) answers.projectMode = snapshot.projectMode;
+        if (snapshot.stack !== undefined) answers.stack = snapshot.stack;
+        if (snapshot.research !== undefined) answers.research = snapshot.research;
+        if (snapshot.deploy !== undefined) answers.deploy = snapshot.deploy;
+        if (snapshot.deployTarget !== undefined) answers.deployTarget = snapshot.deployTarget;
+      }
       const webAccess = detectWebAccess(names) || answers.research === "web-access";
       ctx.ui.notify(`Resuming ${state.runId} at ${state.phase}.`, "info");
       await follow(ctx, startRun(ctx, ctx.cwd, answers, state, webAccess));
@@ -342,8 +360,14 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
 
     pi.on("session_start", async (_event, ctx) => {
       const state = new FactoryStore(ctx.cwd).loadState();
-      if (state && state.status !== "done" && ctx.hasUI) {
-        ctx.ui.setStatus(TAG, `🏭 ${state.phase} (${state.status === "running" ? "interrupted" : state.status})`);
+      if (!state || state.status === "done") return;
+      ctx.ui.setStatus(TAG, `🏭 ${state.phase} (${state.status === "running" ? "interrupted" : state.status})`);
+      if (!ctx.hasUI) return;
+      try {
+        const choice = await ctx.ui.select("Factory", ["Resume the run now", "Show status", "Not now"]);
+        if (choice === "Resume the run now") await resume(ctx);
+        else if (choice === "Show status") pi.appendEntry(TAG, { kind: "status", lines: stateSummary(state) });
+      } catch {
         ctx.ui.notify(`A factory run is in progress here (${state.phase}). /factory resume to continue.`, "info");
       }
     });
@@ -369,7 +393,7 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
 
     // -- command ----------------------------------------------------------------
 
-    const SUBCOMMANDS = ["new", "resume", "pause", "status", "cost", "doctor", "team", "autonomy", "settings", "run", "demo", "help"];
+    const SUBCOMMANDS = ["new", "resume", "pause", "status", "board", "cost", "trace", "doctor", "team", "roles", "autonomy", "settings", "run", "demo", "help"];
 
     pi.registerCommand("factory", {
       description: "Software factory: turn an idea into a tested, documented project with a team of models",
@@ -378,6 +402,13 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
         if (second !== undefined) {
           if (first === "autonomy") return ["auto", "balanced", "careful"].filter((v) => v.startsWith(second)).map((v) => ({ value: `autonomy ${v}`, label: v }));
           if (first === "team") return ["balanced", "cheap", "best", "refresh"].filter((v) => v.startsWith(second)).map((v) => ({ value: `team ${v}`, label: v }));
+          if (first === "trace") {
+            // The completion callback has no ctx; the active run's folder, else cwd.
+            const state = new FactoryStore(active?.cwd ?? process.cwd()).loadState();
+            const values = [...(state?.tickets.map((t) => t.id) ?? []), ...rolesFor(active?.cwd ?? process.cwd()).keys()];
+            const items = values.filter((v) => v.startsWith(second)).map((v) => ({ value: `trace ${v}`, label: v }));
+            return items.length ? items : null;
+          }
           return null;
         }
         const items = SUBCOMMANDS.filter((s) => s.startsWith(first ?? "")).map((value) => ({ value, label: value }));
@@ -446,26 +477,61 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
             return;
           }
 
+          case "board": {
+            const state = active?.run.state ?? new FactoryStore(ctx.cwd).loadState();
+            if (!state) {
+              ctx.ui.notify("No factory run in this folder.", "info");
+              return;
+            }
+            pi.appendEntry(TAG, { kind: "status", lines: boardLines(state) });
+            return;
+          }
+
           case "cost": {
             const store = new FactoryStore(ctx.cwd);
-            const ledger = store.readLedger().filter((e) => e.kind === "worker");
-            if (!ledger.length) {
+            const entries = store.readLedger();
+            const runId = (active?.run.state ?? store.loadState())?.runId;
+            const user = loadUserDefaults();
+            const team = teamFor(ctx, { teamPreset: user.teamPreset ?? "balanced", pins: user.pins ?? {} });
+            const frontierModel = team.tiers.frontier;
+            const frontier = frontierModel
+              ? {
+                  inPerToken: (frontierModel.cost?.input ?? 0) / 1e6,
+                  outPerToken: (frontierModel.cost?.output ?? 0) / 1e6,
+                  blendedPerToken: pricePerToken(frontierModel),
+                }
+              : undefined;
+            const report = buildCostReport(entries, { runId, frontier });
+            if (!report.workerRuns) {
               ctx.ui.notify("Nothing spent yet in this folder.", "info");
               return;
             }
-            const rows = new Map<string, { cost: number; tokens: number; runs: number }>();
-            for (const e of ledger) {
-              const key = `${e.role} · ${e.model}`;
-              const row = rows.get(key) ?? { cost: 0, tokens: 0, runs: 0 };
-              row.cost += e.costUsd ?? 0;
-              row.tokens += e.tokens ?? 0;
-              row.runs += 1;
-              rows.set(key, row);
+            const lines = [runId ? `cost for run ${runId}` : "cost, all runs", ...renderCostReport(report)];
+            const hidden = runId ? entries.filter((e) => e.kind === "worker" && e.runId !== runId).length : 0;
+            if (hidden > 0) lines.push(`other runs: ${hidden} worker run(s) not shown (start a run to filter)`);
+            pi.appendEntry(TAG, { kind: "status", lines });
+            return;
+          }
+
+          case "trace": {
+            const arg = rest;
+            const store = new FactoryStore(ctx.cwd);
+            const entries = store.readLedger();
+            const runId = (active?.run.state ?? store.loadState())?.runId;
+            const workers = entries.filter((e) => e.kind === "worker" && (runId === undefined || e.runId === runId));
+            const candidates = arg ? workers.filter((e) => e.ticket === arg || e.role === arg) : workers;
+            const entry = [...candidates].reverse().find((e) => Array.isArray(e.trace) && e.trace.length > 0);
+            if (!entry) {
+              ctx.ui.notify(arg ? `No traced worker run found for "${arg}".` : "No traced worker runs yet.", "info");
+              return;
             }
-            const total = [...rows.values()].reduce((sum, r) => sum + r.cost, 0);
             pi.appendEntry(TAG, {
-              kind: "status",
-              lines: [`total ${formatCost(total)}`, ...[...rows.entries()].map(([k, r]) => `${k}: ${r.runs} run(s) · ${formatTokens(r.tokens)} tok · ${formatCost(r.cost)}`)],
+              kind: "trace",
+              role: entry.role,
+              model: entry.model,
+              ticket: entry.ticket,
+              at: entry.at,
+              steps: entry.trace,
             });
             return;
           }
@@ -491,6 +557,29 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
               ],
             });
             if (active && rest) ctx.ui.notify("The running build keeps its team; the change applies to the next run or resume.", "info");
+            return;
+          }
+
+          case "roles": {
+            const roles = rolesFor(ctx.cwd);
+            const result = await showFactoryRolePicker(ctx, pi, {
+              roles: [...roles.values()].map((r) => ({ name: r.name, description: r.description })),
+            });
+            if (!result?.factoryRole) return;
+            const roleName = result.factoryRole;
+            const pin = { provider: result.model.provider, modelId: result.model.id, effort: result.effort };
+            const store = new FactoryStore(ctx.cwd);
+            const user = loadUserDefaults();
+            const answers = {
+              ...defaultAnswers({ cwd: ctx.cwd, toolNames: [], budget: { usd: 0, tokens: 0, priced: false, size: "small" }, deployTargets: [] }, user, null),
+              ...user,
+            } as SetupAnswers;
+            answers.pins = { ...(answers.pins ?? {}), [roleName]: pin };
+            saveUserDefaults(answers);
+            const project = store.loadProject();
+            if (project) store.saveProject({ ...(project as SetupAnswers), pins: answers.pins } as SetupAnswers);
+            ctx.ui.notify(`Role ${roleName} assigned to ${pin.provider}/${pin.modelId}${pin.effort ? ` (${pin.effort})` : ""}.`, "info");
+            if (active) ctx.ui.notify("The running build keeps its team; the change applies to the next run or resume.", "info");
             return;
           }
 
@@ -607,6 +696,14 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
           const trace = Array.isArray(data.trace) ? data.trace : [];
           if (expanded) for (const line of renderTraceSteps(trace, theme)) box.addChild(new Text(line, 0, 0));
           else if (trace.length) box.addChild(new Text(theme.fg("dim", `${trace.length} trace steps · ${keyHint("app.tools.expand", "to expand")}`), 0, 0));
+          break;
+        }
+        case "trace": {
+          const steps = Array.isArray(data.steps) ? data.steps : [];
+          const meta = [data.role, data.model, data.ticket, data.at].filter(Boolean).join(" · ");
+          box.addChild(new Text(`${head("trace")} ${theme.fg("dim", String(meta))}`, 0, 0));
+          if (expanded) for (const line of renderTraceSteps(steps, theme)) box.addChild(new Text(line, 0, 0));
+          else box.addChild(new Text(theme.fg("dim", `${steps.length} trace steps · ${keyHint("app.tools.expand", "to expand")}`), 0, 0));
           break;
         }
         default: {

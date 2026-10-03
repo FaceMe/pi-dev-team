@@ -71,7 +71,7 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Model } from "@earendil-works/pi-ai";
 import {
   clampThinkingLevel,
@@ -219,23 +219,77 @@ export const FUSION_CONFIG_PATH = fusionConfigPath();
 
 // --- Model Picker Options & Results ---
 
+/** A factory role offered by the role chooser (see ModelPickerOptions.factoryRoles). */
+export interface FactoryRoleChoice {
+  name: string;
+  description?: string;
+}
+
 export interface ModelPickerOptions {
   /** Target selection mode:
    * - "session": normal model picker, switches active session model on Enter (default)
    * - "fusion-main": selects model & effort for Fusion Main agent
    * - "fusion-sidekick": selects model & effort for Fusion Sidekick agent
    * - "select": general selection, returns chosen model and effort
+   * - "factory-role": assign a model to a factory role (never persisted by the
+   *   picker; the caller owns saving). Two modes: `factoryRole` set = direct
+   *   assignment to that single role; `factoryRoles` set instead = chooser —
+   *   the right panel first lists the roles, Enter drills into the model list
+   *   for the chosen role, and the completed result reports `factoryRole`.
    */
-  target?: "session" | "fusion-main" | "fusion-sidekick" | "select";
+  target?: "session" | "fusion-main" | "fusion-sidekick" | "select" | "factory-role";
   title?: string;
   initialModel?: Model<any> | { provider: string; modelId: string };
   initialEffort?: ThinkingLevel;
   applyToSession?: boolean;
+  /** Direct factory-role mode: assign a model to this single role (skips the role list). */
+  factoryRole?: string;
+  /** Chooser factory-role mode: roles listed before the model list. */
+  factoryRoles?: FactoryRoleChoice[];
 }
 
 export interface ModelPickerResult {
   model: Model<any>;
   effort: ThinkingLevel;
+  /** Set only for target "factory-role": the role the model was assigned to. */
+  factoryRole?: string;
+}
+
+/** One rendered row of the factory role chooser (plain text; themes applied at render). */
+export interface FactoryRoleRow {
+  name: string;
+  description: string;
+}
+
+/**
+ * Build the right-panel rows for the factory role chooser: each role's name
+ * followed by its description, truncated so the pair fits maxWidth visible
+ * columns. Rows are plain text (ANSI-free) so the renderer can theme them.
+ */
+export function buildFactoryRoleRows(roles: FactoryRoleChoice[], maxWidth: number): FactoryRoleRow[] {
+  return (roles ?? []).map((role) => {
+    const name = role.name ?? "";
+    const description = role.description ?? "";
+    const avail = maxWidth - visibleWidth(name) - 1;
+    const trimmed =
+      description && avail > 0
+        ? stripTerminalSequences(truncateToWidth(description, avail))
+        : "";
+    return { name, description: trimmed };
+  });
+}
+
+/**
+ * The factory role a completed selection refers to for the given options: the
+ * role chosen in this session wins over the direct-mode role. Targets other
+ * than "factory-role" never resolve to a factory role.
+ */
+export function resolveFactoryRole(
+  options: Pick<ModelPickerOptions, "target" | "factoryRole">,
+  state: { activeFactoryRole?: string } = {}
+): string | undefined {
+  if (options.target !== "factory-role") return undefined;
+  return state.activeFactoryRole ?? options.factoryRole;
 }
 
 /**
@@ -431,6 +485,10 @@ export class SplitModelPickerComponent {
   private effortPickerLevels: ThinkingLevel[] = [];
   private effortPickerIndex: number = 0;
 
+  // Factory role chooser sub-state ("factory-role" target)
+  private activeFactoryRole?: string;
+  private factoryRoleIndex: number = 0;
+
   constructor(
     tui: any,
     theme: any,
@@ -445,6 +503,7 @@ export class SplitModelPickerComponent {
     this.ctx = ctx;
     this.pi = pi;
     this.options = options ?? { target: "session" };
+    this.activeFactoryRole = this.options.target === "factory-role" ? this.options.factoryRole : undefined;
 
     this.rolesState = loadRolesState();
     this.fusionConfig = loadFusionConfig();
@@ -499,12 +558,28 @@ export class SplitModelPickerComponent {
     this.ensureScrollVisibility();
   }
 
+  /** True when target "factory-role" runs as chooser (no single role given). */
+  private get isFactoryChooserMode(): boolean {
+    return (
+      this.options.target === "factory-role" &&
+      !this.options.factoryRole &&
+      (this.options.factoryRoles?.length ?? 0) > 0
+    );
+  }
+
+  /** True while the chooser's role list (not the model list) is on screen. */
+  private get isRoleListActive(): boolean {
+    return this.isFactoryChooserMode && !this.activeFactoryRole;
+  }
+
   private completeSelection(selectedModel: Model<any>, effort?: ThinkingLevel): void {
     const finalEffort = effort ?? this.getModelEffort(selectedModel);
     const result = Object.assign({}, selectedModel, {
       model: selectedModel,
       effort: finalEffort,
     }) as ModelPickerResult & Model<any>;
+    const factoryRole = resolveFactoryRole(this.options, { activeFactoryRole: this.activeFactoryRole });
+    if (factoryRole) result.factoryRole = factoryRole;
     this.done(result);
   }
 
@@ -775,14 +850,53 @@ export class SplitModelPickerComponent {
       return;
     }
 
+    // --- Factory Role Chooser (role list) Input Handling ---
+    if (this.isRoleListActive) {
+      const roles = this.options.factoryRoles ?? [];
+
+      if (matchesKey(data, Key.escape)) {
+        this.done(null);
+        return;
+      }
+      if (matchesKey(data, Key.up) && roles.length > 0) {
+        this.factoryRoleIndex = this.factoryRoleIndex > 0 ? this.factoryRoleIndex - 1 : roles.length - 1;
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.down) && roles.length > 0) {
+        this.factoryRoleIndex = this.factoryRoleIndex < roles.length - 1 ? this.factoryRoleIndex + 1 : 0;
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.enter)) {
+        const role = roles[this.factoryRoleIndex];
+        if (role) {
+          this.activeFactoryRole = role.name;
+          this.focusedPanel = "models";
+          this.tui.requestRender();
+        }
+        return;
+      }
+
+      // No other actions while the role list is on screen
+      return;
+    }
+
     // --- Normal Two-Panel Picker Input Handling ---
 
-    // 1. ESC: Clear search or exit
+    // 1. ESC: Clear search, return to the role list (chooser), or exit
     if (matchesKey(data, Key.escape)) {
       if (this.isSearchMode || this.searchQuery.length > 0) {
         this.searchQuery = "";
         this.isSearchMode = false;
         this.updateFilter();
+        this.tui.requestRender();
+        return;
+      }
+      if (this.isFactoryChooserMode && this.activeFactoryRole) {
+        const idx = (this.options.factoryRoles ?? []).findIndex((r) => r.name === this.activeFactoryRole);
+        if (idx >= 0) this.factoryRoleIndex = idx;
+        this.activeFactoryRole = undefined;
         this.tui.requestRender();
         return;
       }
@@ -1155,7 +1269,9 @@ export class SplitModelPickerComponent {
         ? this.theme.fg("accent", "● ")
         : this.theme.fg("dim", "○ ");
       let titleLabel = "MODELS";
-      if (this.options.title) {
+      if (this.isRoleListActive) {
+        titleLabel = "ASSIGN MODELS TO FACTORY ROLES";
+      } else if (this.options.title) {
         titleLabel = this.options.title.toUpperCase();
       } else if (this.options.target === "fusion-main") {
         titleLabel = "FUSION MAIN AGENT";
@@ -1163,15 +1279,22 @@ export class SplitModelPickerComponent {
         titleLabel = "FUSION SIDEKICK AGENT";
       } else if (this.options.target === "select") {
         titleLabel = "SELECT MODEL";
+      } else if (this.options.target === "factory-role") {
+        const role = this.activeFactoryRole ?? this.options.factoryRole;
+        titleLabel = role ? `MODEL FOR THE ${role.toUpperCase()} ROLE` : "FACTORY ROLE";
       }
 
       const mTitleText = mIsFocused
         ? this.theme.fg("accent", bold(titleLabel))
         : this.theme.fg("text", titleLabel);
-      const pNameTag = currentProvider
-        ? ` : ${this.theme.fg("accent", currentProvider.displayName)}`
-        : "";
-      const mCountBadge = this.theme.fg("muted", ` (${currentModels.length})`);
+      const pNameTag =
+        !this.isRoleListActive && currentProvider
+          ? ` : ${this.theme.fg("accent", currentProvider.displayName)}`
+          : "";
+      const listCount = this.isRoleListActive
+        ? (this.options.factoryRoles?.length ?? 0)
+        : currentModels.length;
+      const mCountBadge = this.theme.fg("muted", ` (${listCount})`);
       rightHeader = ` ${mDot}${mTitleText}${pNameTag}${mCountBadge}`;
     }
 
@@ -1212,6 +1335,10 @@ export class SplitModelPickerComponent {
     lines.push("├" + "─".repeat(leftWidth) + "┼" + "─".repeat(rightWidth) + "┤");
 
     // Split body rows
+    const factoryRoleRows = this.isRoleListActive
+      ? buildFactoryRoleRows(this.options.factoryRoles ?? [], rightWidth - 3)
+      : [];
+
     for (let i = 0; i < this.visibleRows; i++) {
       // --- Left Column: Provider row ---
       let leftCell = "";
@@ -1262,10 +1389,31 @@ export class SplitModelPickerComponent {
         }
       }
 
-      // --- Right Column: Model row OR Effort Picker rows ---
+      // --- Right Column: Factory Role rows OR Effort Picker rows OR Model row ---
       let rightCell = "";
 
-      if (this.isEffortPickerOpen && this.effortPickerModel) {
+      if (this.isRoleListActive) {
+        // Factory role chooser view
+        if (i < factoryRoleRows.length) {
+          const row = factoryRoleRows[i];
+          const isSelected = i === this.factoryRoleIndex;
+
+          let pointer = "  ";
+          if (isSelected && mIsFocused) {
+            pointer = this.theme.fg("accent", "› ");
+          } else if (isSelected) {
+            pointer = this.theme.fg("muted", "▸ ");
+          }
+
+          let nameText = row.name;
+          if (isSelected && mIsFocused) {
+            nameText = this.theme.fg("accent", bold(nameText));
+          }
+
+          const desc = row.description ? ` ${this.theme.fg("dim", row.description)}` : "";
+          rightCell = ` ${pointer}${nameText}${desc}`;
+        }
+      } else if (this.isEffortPickerOpen && this.effortPickerModel) {
         // Effort Picker View
         const currentEff = this.getModelEffort(this.effortPickerModel);
 
@@ -1382,7 +1530,13 @@ export class SplitModelPickerComponent {
     }
 
     // Detail spec card
-    if (this.isEffortPickerOpen && this.effortPickerModel) {
+    if (this.isRoleListActive) {
+      // Factory role chooser detail card
+      const role = (this.options.factoryRoles ?? [])[this.factoryRoleIndex];
+      const detail1 = ` ${bold("Factory Role")}: ${this.theme.fg("accent", role?.name ?? "—")}${role?.description ? ` · ${this.theme.fg("dim", role.description)}` : ""}`;
+      lines.push("│" + pad(detail1, innerWidth) + "│");
+      lines.push("│" + pad(` ${this.theme.fg("dim", "Enter to pick the model for this role · Esc to cancel")}`, innerWidth) + "│");
+    } else if (this.isEffortPickerOpen && this.effortPickerModel) {
       // Effort picker detail card
       const hoveredLevel = this.effortPickerLevels[this.effortPickerIndex] || "off";
       const desc = EFFORT_DESCRIPTIONS[hoveredLevel] || "";
@@ -1418,8 +1572,12 @@ export class SplitModelPickerComponent {
         : isFSide
         ? ` ${this.theme.fg("warning", "[⚡ Fusion Sidekick]")}`
         : "";
+      const factoryRole = resolveFactoryRole(this.options, { activeFactoryRole: this.activeFactoryRole });
+      const factoryRoleTag = factoryRole
+        ? ` ${this.theme.fg("muted", `[role: ${factoryRole}]`)}`
+        : "";
 
-      const detail1 = ` ${bold(selectedModel.name || selectedModel.id)}${activeBadge}${fusionTag} · Provider: ${this.theme.fg("accent", selectedModel.provider)} · Auth: ${authStatus}`;
+      const detail1 = ` ${bold(selectedModel.name || selectedModel.id)}${activeBadge}${fusionTag}${factoryRoleTag} · Provider: ${this.theme.fg("accent", selectedModel.provider)} · Auth: ${authStatus}`;
       lines.push("│" + pad(detail1, innerWidth) + "│");
 
       const costText = formatCost(selectedModel.cost);
@@ -1451,7 +1609,11 @@ export class SplitModelPickerComponent {
         : this.theme.fg("dim", "All Providers");
 
       let helpBar = "";
-      if (this.options.target === "fusion-main") {
+      if (this.isRoleListActive) {
+        helpBar = ` [↑/↓] Move  [Enter] Choose Role  [Esc] Cancel`;
+      } else if (this.options.target === "factory-role") {
+        helpBar = ` [←/→] Panel  [↑/↓] Move  [Enter] Assign to Role  [e] Effort  [/] Search  [Tab] ${filterState}  [Esc] ${this.isFactoryChooserMode ? "Back to Roles" : "Cancel"}`;
+      } else if (this.options.target === "fusion-main") {
         helpBar = ` [←/→] Panel  [↑/↓] Move  [Enter] Select Main  [e] Effort  [Space] Select with Effort  [/] Search  [Tab] ${filterState}  [Esc] Cancel`;
       } else if (this.options.target === "fusion-sidekick") {
         helpBar = ` [←/→] Panel  [↑/↓] Move  [Enter] Select Sidekick  [e] Effort  [Space] Select with Effort  [/] Search  [Tab] ${filterState}  [Esc] Cancel`;
@@ -1483,7 +1645,28 @@ export async function showModelPicker(
     }
   );
 
-  return result ? { model: result.model ?? result, effort: result.effort ?? "off" } : null;
+  if (!result) return null;
+  const picked: ModelPickerResult = { model: result.model ?? result, effort: result.effort ?? "off" };
+  if (result.factoryRole) picked.factoryRole = result.factoryRole;
+  return picked;
+}
+
+/**
+ * Assign a model to a factory role. With `role` set the picker targets that
+ * single role directly; otherwise it first offers the role list. The picker
+ * never persists factory roles — the caller owns saving the result.
+ */
+export async function showFactoryRolePicker(
+  ctx: ExtensionContext | ExtensionCommandContext,
+  pi: ExtensionAPI,
+  opts: { roles: FactoryRoleChoice[]; role?: string }
+): Promise<(ModelPickerResult & { factoryRole?: string }) | undefined> {
+  const options: ModelPickerOptions =
+    opts.role !== undefined && opts.role !== ""
+      ? { target: "factory-role", factoryRole: opts.role }
+      : { target: "factory-role", factoryRoles: opts.roles };
+  const result = await showModelPicker(ctx, pi, options);
+  return result ?? undefined;
 }
 
 async function fallbackModelPicker(
@@ -1498,12 +1681,34 @@ async function fallbackModelPicker(
     ctx.ui.notify("No models with configured auth are available.", "error");
     return null;
   }
+
+  // Factory-role fallback: choose the role first when no single role was given.
+  let factoryRole: string | undefined;
+  if (options?.target === "factory-role") {
+    if (options.factoryRole) {
+      factoryRole = options.factoryRole;
+    } else {
+      const roles = options.factoryRoles ?? [];
+      if (roles.length === 0) {
+        ctx.ui.notify("No factory roles are configured.", "error");
+        return null;
+      }
+      const roleChoices = roles.map((r) => (r.description ? `${r.name} - ${r.description}` : r.name));
+      const pickedRole = await ctx.ui.select("Assign models to factory roles", roleChoices);
+      if (!pickedRole) return null;
+      factoryRole = roles[roleChoices.indexOf(pickedRole)]?.name;
+      if (!factoryRole) return null;
+    }
+  }
+
   const title =
     options?.title ||
     (options?.target === "fusion-main"
       ? "Pick Fusion Main Model"
       : options?.target === "fusion-sidekick"
       ? "Pick Fusion Sidekick Model"
+      : options?.target === "factory-role"
+      ? `Model for the ${factoryRole} role`
       : "Select Model");
   const choices = available.map((m) => `${m.provider}/${m.id}`);
   const picked = await ctx.ui.select(title, choices);
@@ -1511,7 +1716,9 @@ async function fallbackModelPicker(
   const model = available[choices.indexOf(picked)];
   if (!model) return null;
   const effort = getEffectiveModelEffort(model);
-  return { model, effort };
+  const result: ModelPickerResult = { model, effort };
+  if (factoryRole) result.factoryRole = factoryRole;
+  return result;
 }
 
 async function openModelPicker(ctx: ExtensionContext | ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {

@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { truncate } from "../shared/text.js";
 import { formatCost, formatTokens } from "../shared/usage.js";
+import { boardLines } from "./board.js";
 import { outOfScope } from "./guard.js";
 import { describeGateFailure, gatesPassed, normalizeProfile, runGates, summarizeGates } from "./gates.js";
 import {
@@ -243,10 +244,7 @@ export class FactoryRun {
     const tickets = state.tickets.length ? ` · ${done}/${state.tickets.length} tickets` : "";
     const label = state.status === "running" ? state.phase : `${state.phase} (${state.status})`;
     deps.ui.status(`🏭 ${label}${tickets} · ${this.budgetLine()}`);
-    const lines = [`🏭 factory · ${label}${tickets} · ${this.budgetLine()}`];
-    if (extra) lines.push(extra);
-    for (const line of this.activity.slice(-3)) lines.push(`   ${line}`);
-    deps.ui.widget(state.status === "done" ? undefined : lines);
+    deps.ui.widget(state.status === "done" ? undefined : boardLines(state, { activity: this.activity, extra }));
   }
 
   // -------------------------------------------------------------------------
@@ -335,15 +333,19 @@ Work only inside the current working directory.`;
     this.save();
     this.deps.store.ledger({
       kind: "worker",
+      runId: this.state.runId,
       phase: this.state.phase,
       role: roleName,
       model: `${member.provider}/${member.modelId}`,
       ticket: options.ticket,
       turns: result.turns,
       tokens: result.usage.totalTokens,
+      tokensIn: result.usage.input,
+      tokensOut: result.usage.output,
       costUsd: result.usage.cost.total,
       ok: !result.isError,
       error: result.errorMessage,
+      trace: result.trace.length ? result.trace : undefined,
     });
     this.checkAbort();
     return result;
@@ -654,16 +656,26 @@ Work only inside the current working directory.`;
     this.showStatus("running gates");
     const results = await runGates(profile, worktree, { skipInstall: options.skipInstall, timeoutMs: this.deps.gateTimeoutMs });
     const ok = gatesPassed(results, profile, options.skipInstall);
-    this.deps.store.ledger({ kind: "gates", phase: this.state.phase, ok, summary: summarizeGates(results) });
+    this.deps.store.ledger({ kind: "gates", runId: this.state.runId, phase: this.state.phase, ok, summary: summarizeGates(results) });
     this.deps.ui.log("gates", { ok, summary: summarizeGates(results) });
     return { ok, results };
   }
 
   private async skeleton(): Promise<void> {
     const { deps } = this;
+    // Probe before ensureWorkspace(): it creates the worktree, which would make
+    // a resumed run indistinguishable from a first run.
+    const resuming = fs.existsSync(this.state.worktree ?? deps.store.path("worktrees", this.state.runId));
     const worktree = await this.ensureWorkspace();
     this.copyDocsInto(worktree);
     const profile = this.profile();
+    if (resuming) {
+      const gates = await this.gates(worktree);
+      if (gates.ok) {
+        await commitAll(worktree, "chore: project skeleton");
+        return;
+      }
+    }
     const member = this.member("devops");
     const ladder: TeamMember[] = [member];
     for (let next = escalate(deps.team, this.role("devops"), member); next; next = escalate(deps.team, this.role("devops"), ladder.at(-1)!)) {
