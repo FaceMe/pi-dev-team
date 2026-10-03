@@ -1,0 +1,1336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pi dev team — extension guide</title>
+<style>
+  :root{
+    --bg:#0b0f14; --bg2:#0d1117; --panel:#121820; --panel2:#161d26;
+    --border:#232b36; --border2:#2e3946;
+    --text:#e6edf3; --muted:#8b949e; --faint:#6e7681;
+    --amber:#f0883e; --amber-dim:rgba(240,136,62,.13);
+    --blue:#58a6ff; --blue-dim:rgba(88,166,255,.12);
+    --violet:#bc8cff; --violet-dim:rgba(188,140,255,.12);
+    --green:#3fb950; --green-dim:rgba(63,185,80,.12);
+    --red:#f85149; --red-dim:rgba(248,81,73,.12);
+    --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--bg); color:var(--text); font-family:var(--sans);
+    font-size:15px; line-height:1.6; -webkit-font-smoothing:antialiased;
+  }
+  body::before{
+    content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+    background:
+      radial-gradient(600px 300px at 15% -5%, rgba(240,136,62,.07), transparent 70%),
+      radial-gradient(700px 350px at 85% 0%, rgba(188,140,255,.06), transparent 70%),
+      radial-gradient(700px 400px at 50% 110%, rgba(88,166,255,.05), transparent 70%);
+  }
+  main,nav{position:relative;z-index:1}
+
+  /* ---------- nav ---------- */
+  nav{
+    position:sticky; top:0; z-index:50;
+    display:flex; align-items:center; gap:20px;
+    padding:10px 24px;
+    background:rgba(11,15,20,.82); backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--border);
+  }
+  .brand{font-family:var(--mono); font-weight:700; font-size:14px; white-space:nowrap}
+  .brand .gear{color:var(--amber)}
+  .navlinks{display:flex; gap:4px; flex-wrap:wrap; margin-left:auto}
+  .navlinks a{
+    color:var(--muted); text-decoration:none; font-size:13px;
+    padding:5px 11px; border-radius:6px; transition:.15s;
+  }
+  .navlinks a:hover{color:var(--text); background:var(--panel2)}
+  .navlinks a.active{color:var(--amber); background:var(--amber-dim)}
+
+  main{max-width:1120px; margin:0 auto; padding:0 24px 90px}
+
+  /* ---------- hero ---------- */
+  .hero{padding:72px 0 40px; text-align:left}
+  .hero-badges{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:18px}
+  .badge{
+    font-family:var(--mono); font-size:11.5px; padding:3px 10px;
+    border:1px solid var(--border2); border-radius:99px; color:var(--muted);
+  }
+  .badge.accent{color:var(--amber); border-color:rgba(240,136,62,.4); background:var(--amber-dim)}
+  .hero h1{font-size:44px; line-height:1.1; letter-spacing:-.02em; margin-bottom:14px}
+  .hero h1 .grad{
+    background:linear-gradient(90deg,var(--amber),var(--violet) 55%,var(--blue));
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+  }
+  .hero p.lede{font-size:17px; color:var(--muted); max-width:720px; margin-bottom:26px}
+  .hero p.lede b{color:var(--text); font-weight:600}
+  .install{
+    display:inline-flex; align-items:center; gap:14px;
+    font-family:var(--mono); font-size:13.5px;
+    background:var(--panel); border:1px solid var(--border2); border-radius:10px;
+    padding:12px 16px; margin-bottom:8px;
+  }
+  .install .ps1{color:var(--green)}
+  .install button{
+    background:var(--panel2); color:var(--muted); border:1px solid var(--border2);
+    border-radius:6px; font-family:var(--mono); font-size:11.5px;
+    padding:5px 10px; cursor:pointer; transition:.15s;
+  }
+  .install button:hover{color:var(--text); border-color:var(--faint)}
+  .install-note{font-size:12.5px; color:var(--faint); margin-bottom:34px}
+
+  .pillars{display:grid; grid-template-columns:repeat(3,1fr); gap:14px}
+  .pillar{
+    background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    padding:20px; text-decoration:none; color:var(--text); transition:.15s;
+    display:block;
+  }
+  .pillar:hover{transform:translateY(-2px); border-color:var(--border2)}
+  .pillar .icon{font-size:22px; margin-bottom:10px}
+  .pillar h3{font-size:15.5px; margin-bottom:6px}
+  .pillar p{font-size:13px; color:var(--muted); line-height:1.55}
+  .pillar.p1 h3{color:var(--amber)} .pillar.p1{border-top:2px solid var(--amber)}
+  .pillar.p2 h3{color:var(--blue)}  .pillar.p2{border-top:2px solid var(--blue)}
+  .pillar.p3 h3{color:var(--violet)}.pillar.p3{border-top:2px solid var(--violet)}
+
+  /* ---------- sections ---------- */
+  section{padding:54px 0 8px}
+  .kicker{
+    font-family:var(--mono); font-size:11.5px; letter-spacing:.14em;
+    text-transform:uppercase; margin-bottom:8px;
+  }
+  .k-amber{color:var(--amber)} .k-blue{color:var(--blue)} .k-violet{color:var(--violet)} .k-green{color:var(--green)}
+  section h2{font-size:27px; letter-spacing:-.01em; margin-bottom:10px}
+  section p.lead{color:var(--muted); max-width:760px; margin-bottom:28px; font-size:15px}
+  section p.lead b{color:var(--text); font-weight:600}
+  h3.sub{font-size:18px; margin:36px 0 14px}
+  h3.sub .hash{color:var(--faint); font-weight:400}
+
+  .card{
+    background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    padding:22px;
+  }
+
+  /* ---------- terminal mockups ---------- */
+  .term{
+    background:#0a0e13; border:1px solid var(--border2); border-radius:12px;
+    overflow:hidden; margin:16px 0;
+    box-shadow:0 8px 30px rgba(0,0,0,.35);
+  }
+  .term-bar{
+    display:flex; align-items:center; gap:7px;
+    padding:9px 14px; background:var(--panel); border-bottom:1px solid var(--border);
+  }
+  .term-bar .dot{width:10px;height:10px;border-radius:50%}
+  .dot.r{background:#ff5f57}.dot.y{background:#febc2e}.dot.g{background:#28c840}
+  .term-bar .title{
+    font-family:var(--mono); font-size:11.5px; color:var(--faint); margin-left:8px;
+  }
+  .term pre{
+    font-family:var(--mono); font-size:12.8px; line-height:1.65;
+    padding:16px 18px; overflow-x:auto; color:#c9d1d9;
+  }
+  .t-dim{color:var(--faint)} .t-green{color:var(--green)} .t-amber{color:var(--amber)}
+  .t-blue{color:var(--blue)} .t-violet{color:var(--violet)} .t-red{color:var(--red)}
+  .t-bold{font-weight:700; color:var(--text)}
+
+  /* ---------- inline code / kbd / chips ---------- */
+  code{
+    font-family:var(--mono); font-size:.88em;
+    background:var(--panel2); border:1px solid var(--border);
+    border-radius:5px; padding:1px 6px; color:#e2c08d; white-space:nowrap;
+  }
+  kbd{
+    font-family:var(--mono); font-size:11.5px; color:var(--text);
+    background:linear-gradient(180deg,#1c232d,#141a22);
+    border:1px solid var(--border2); border-bottom-width:2px;
+    border-radius:5px; padding:2px 7px; white-space:nowrap;
+  }
+  .filechip{
+    font-family:var(--mono); font-size:11.5px;
+    background:var(--panel2); border:1px solid var(--border);
+    border-radius:6px; padding:3px 8px; color:var(--blue); white-space:nowrap;
+    display:inline-block; margin:2px 3px 2px 0;
+  }
+  .rolechip{
+    font-family:var(--mono); font-size:11px; padding:2px 9px;
+    border-radius:99px; border:1px solid; display:inline-block; margin:2px 3px 2px 0;
+  }
+  .rc-amber{color:var(--amber); border-color:rgba(240,136,62,.45); background:var(--amber-dim)}
+  .rc-blue{color:var(--blue); border-color:rgba(88,166,255,.45); background:var(--blue-dim)}
+  .rc-violet{color:var(--violet); border-color:rgba(188,140,255,.45); background:var(--violet-dim)}
+  .rc-green{color:var(--green); border-color:rgba(63,185,80,.45); background:var(--green-dim)}
+
+  /* ---------- phase explorer ---------- */
+  .explorer{display:grid; grid-template-columns:390px 1fr; gap:26px; align-items:start; margin-top:8px}
+  .stepper{position:relative}
+  .stepper::before{
+    content:""; position:absolute; left:19px; top:22px; bottom:22px;
+    width:2px; background:linear-gradient(180deg,var(--amber),var(--violet),var(--blue));
+    opacity:.35;
+  }
+  .step{
+    position:relative; display:flex; gap:14px; align-items:flex-start;
+    padding:10px 10px 10px 4px; border-radius:10px; cursor:pointer;
+    border:1px solid transparent; transition:.15s; margin-bottom:2px;
+  }
+  .step:hover{background:var(--panel)}
+  .step.active{background:var(--panel); border-color:var(--border2)}
+  .step .n{
+    flex:0 0 32px; height:32px; border-radius:50%; z-index:1;
+    display:flex; align-items:center; justify-content:center;
+    font-family:var(--mono); font-size:12.5px; font-weight:700;
+    background:var(--panel2); border:2px solid var(--border2); color:var(--muted);
+    transition:.15s;
+  }
+  .step.active .n{background:var(--amber-dim); border-color:var(--amber); color:var(--amber)}
+  .step .lbl b{display:block; font-size:14px; margin-bottom:1px}
+  .step .lbl span{font-size:12px; color:var(--muted)}
+  .step .approve-tag{
+    font-family:var(--mono); font-size:9.5px; letter-spacing:.08em;
+    color:var(--green); border:1px solid rgba(63,185,80,.4);
+    border-radius:4px; padding:1px 5px; margin-left:6px; vertical-align:1px;
+  }
+  .phase-detail{
+    position:sticky; top:74px;
+    background:var(--panel); border:1px solid var(--border); border-radius:14px;
+    padding:26px; min-height:420px;
+  }
+  .pd{display:none}
+  .pd.active{display:block; animation:fade .25s ease}
+  @keyframes fade{from{transform:translateY(5px)} to{transform:none}}
+  .pd .phase-no{font-family:var(--mono); font-size:11.5px; color:var(--amber); letter-spacing:.12em; margin-bottom:6px}
+  .pd h4{font-size:20px; margin-bottom:12px}
+  .pd .who{margin-bottom:14px}
+  .pd .who .wlbl, .pd .artifacts .wlbl{
+    font-family:var(--mono); font-size:10.5px; letter-spacing:.12em;
+    text-transform:uppercase; color:var(--faint); display:block; margin-bottom:6px;
+  }
+  .pd ul{margin:0 0 14px 18px; color:var(--muted); font-size:13.5px}
+  .pd ul li{margin-bottom:6px}
+  .pd ul li b{color:var(--text); font-weight:600}
+  .pd .approve-note{
+    display:flex; gap:10px; align-items:flex-start;
+    background:var(--green-dim); border:1px solid rgba(63,185,80,.35);
+    border-radius:9px; padding:10px 14px; font-size:13px; margin-bottom:14px;
+  }
+  .pd .approve-note.auto{background:var(--blue-dim); border-color:rgba(88,166,255,.3)}
+  .pd .approve-note .ic{flex:0 0 auto}
+  .pd .approve-note b{color:var(--text)}
+
+  /* ---------- ticket loop ---------- */
+  .loop{margin:20px 0 6px}
+  .loop-row{display:flex; align-items:stretch; gap:0; flex-wrap:wrap}
+  .loop-node{
+    flex:1 1 150px; min-width:140px;
+    background:var(--panel); border:1px solid var(--border2); border-radius:10px;
+    padding:12px 14px; position:relative; margin:0 26px 14px 0;
+  }
+  .loop-node:last-child{margin-right:0}
+  .loop-node .ln-t{font-weight:700; font-size:13px; margin-bottom:3px}
+  .loop-node .ln-d{font-size:11.5px; color:var(--muted); line-height:1.45}
+  .loop-node.ok{border-top:2px solid var(--green)}
+  .loop-node.warn{border-top:2px solid var(--amber)}
+  .loop-node.bad{border-top:2px solid var(--red)}
+  .loop-arrow{
+    position:absolute; right:-22px; top:50%; transform:translateY(-50%);
+    color:var(--faint); font-size:16px; z-index:1;
+  }
+  .loop-node:last-child .loop-arrow{display:none}
+  .fail-branch{
+    margin-top:4px; border:1px dashed rgba(248,81,73,.45); border-radius:10px;
+    padding:14px 18px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+    background:rgba(248,81,73,.05); font-size:13px; color:var(--muted);
+  }
+  .fail-branch .fb-step{
+    font-family:var(--mono); font-size:11.5px; color:var(--red);
+    border:1px solid rgba(248,81,73,.4); border-radius:6px; padding:4px 10px;
+    background:var(--red-dim);
+  }
+  .fail-branch .fa{color:var(--faint)}
+
+  /* ---------- tables ---------- */
+  .tbl-wrap{overflow-x:auto; border:1px solid var(--border); border-radius:12px; margin:16px 0}
+  table{width:100%; border-collapse:collapse; font-size:13.5px; background:var(--panel)}
+  th{
+    text-align:left; font-family:var(--mono); font-size:10.5px; letter-spacing:.1em;
+    text-transform:uppercase; color:var(--faint); font-weight:600;
+    padding:10px 16px; border-bottom:1px solid var(--border2); background:var(--panel2);
+  }
+  td{padding:10px 16px; border-bottom:1px solid var(--border); vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  td .cmd{font-family:var(--mono); font-size:12.5px; color:var(--amber); white-space:nowrap}
+  td .cmd.blue{color:var(--blue)} td .cmd.violet{color:var(--violet)}
+  td .desc{color:var(--muted)} td .desc b{color:var(--text); font-weight:600}
+
+  /* ---------- tier ladder ---------- */
+  .ladder{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:14px 0}
+  .tier{
+    font-family:var(--mono); font-size:12.5px; padding:8px 18px; border-radius:9px;
+    border:1px solid var(--border2); background:var(--panel); text-align:center;
+  }
+  .tier small{display:block; font-size:10px; color:var(--faint); margin-top:1px}
+  .tier.t-small{color:#7ee2b8; border-color:rgba(126,226,184,.35)}
+  .tier.t-daily{color:var(--blue); border-color:rgba(88,166,255,.4)}
+  .tier.t-frontier{color:var(--violet); border-color:rgba(188,140,255,.45)}
+  .ladder .arr{color:var(--faint); font-size:15px}
+
+  /* ---------- autonomy cards ---------- */
+  .auto-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin:16px 0}
+  .auto-card{background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px 20px}
+  .auto-card h4{font-family:var(--mono); font-size:14px; margin-bottom:8px}
+  .auto-card ul{margin-left:16px; font-size:12.5px; color:var(--muted)}
+  .auto-card ul li{margin-bottom:4px}
+  .auto-card .tag{font-family:var(--mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase; display:block; margin-bottom:6px; color:var(--faint)}
+  .auto-card.c1 h4{color:var(--green)} .auto-card.c2 h4{color:var(--amber)} .auto-card.c3 h4{color:var(--red)}
+  .auto-card.recommended{border-color:rgba(240,136,62,.5)}
+
+  /* ---------- guard rails ---------- */
+  .guard-grid{display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:16px 0}
+  .guard{
+    background:var(--panel); border:1px solid var(--border); border-radius:10px;
+    padding:14px 18px; display:flex; gap:12px; align-items:flex-start;
+  }
+  .guard .gi{flex:0 0 auto; font-size:16px}
+  .guard b{display:block; font-size:13.5px; margin-bottom:2px}
+  .guard p{font-size:12.5px; color:var(--muted); line-height:1.5}
+
+  /* ---------- picker mockup ---------- */
+  .picker{
+    background:#0a0e13; border:1px solid var(--border2); border-radius:12px;
+    overflow:hidden; margin:16px 0; box-shadow:0 8px 30px rgba(0,0,0,.35);
+  }
+  .picker-head{
+    padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--border);
+    display:flex; justify-content:space-between; align-items:center;
+    font-family:var(--mono); font-size:12px;
+  }
+  .picker-head .ftab{color:var(--amber)}
+  .picker-body{display:grid; grid-template-columns:1fr 1.3fr; font-family:var(--mono); font-size:12.5px}
+  .pk-col{padding:14px 0; min-height:290px}
+  .pk-col + .pk-col{border-left:1px solid var(--border)}
+  .pk-title{
+    font-size:10px; letter-spacing:.14em; color:var(--faint);
+    padding:0 16px 8px; text-transform:uppercase;
+  }
+  .pk-item{padding:4px 16px; color:var(--muted); display:flex; justify-content:space-between; gap:8px}
+  .pk-item .sel{color:var(--text)}
+  .pk-item.cursor{background:var(--blue-dim); color:var(--text); box-shadow:inset 2px 0 0 var(--blue)}
+  .pk-item .meta{color:var(--faint); font-size:11px}
+  .pk-spec{
+    margin:10px 14px 4px; border:1px solid var(--border2); border-radius:8px;
+    padding:10px 12px; font-size:11px; color:var(--muted); line-height:1.7;
+  }
+  .pk-spec .spec-t{color:var(--faint); font-size:9.5px; letter-spacing:.14em}
+  .pk-foot{
+    border-top:1px solid var(--border); padding:8px 16px;
+    display:flex; gap:14px; flex-wrap:wrap; font-family:var(--mono); font-size:10.5px; color:var(--faint);
+  }
+
+  /* ---------- fusion diagram ---------- */
+  .fus{display:grid; grid-template-columns:1fr 130px 1fr; gap:0; align-items:center; margin:20px 0}
+  .fus-box{background:var(--panel); border:1px solid var(--border2); border-radius:12px; padding:18px; position:relative}
+  .fus-box.main{border-top:2px solid var(--violet)}
+  .fus-box.side{border-top:2px solid var(--green)}
+  .fus-box .fb-t{font-family:var(--mono); font-weight:700; font-size:14px; margin-bottom:2px}
+  .fus-box.main .fb-t{color:var(--violet)} .fus-box.side .fb-t{color:var(--green)}
+  .fus-box .fb-s{font-size:11.5px; color:var(--faint); margin-bottom:10px}
+  .fus-box ul{margin-left:16px; font-size:12px; color:var(--muted)}
+  .fus-box ul li{margin-bottom:3px}
+  .fus-mid{display:flex; flex-direction:column; align-items:center; gap:2px; font-family:var(--mono); font-size:10.5px; color:var(--muted); padding:0 8px; text-align:center}
+  .fus-mid .fa{font-size:19px; color:var(--faint)}
+  .fus-mid .lbl-a{color:var(--violet)} .fus-mid .lbl-b{color:var(--green)}
+  .fus-verify{
+    margin:0 0 18px; grid-column:1 / -1;
+    border:1px dashed var(--border2); border-radius:10px; padding:12px 18px;
+    font-size:12.5px; color:var(--muted); display:flex; gap:10px; align-items:baseline; flex-wrap:wrap;
+  }
+  .fus-verify b{color:var(--text)}
+  .fus-verify .vtag{font-family:var(--mono); font-size:11px; border-radius:5px; padding:2px 8px}
+  .v-pass{color:var(--green); border:1px solid rgba(63,185,80,.45); background:var(--green-dim)}
+  .v-fail{color:var(--red); border:1px solid rgba(248,81,73,.45); background:var(--red-dim)}
+
+  /* ---------- mode tabs ---------- */
+  .mode-tabs{display:flex; gap:8px; margin:18px 0 0}
+  .mode-tab{
+    font-family:var(--mono); font-size:12.5px; padding:8px 18px; cursor:pointer;
+    background:var(--panel); border:1px solid var(--border2); border-radius:9px;
+    color:var(--muted); transition:.15s;
+  }
+  .mode-tab:hover{color:var(--text)}
+  .mode-tab.active{color:var(--violet); border-color:rgba(188,140,255,.55); background:var(--violet-dim)}
+  .mode-panel{display:none}
+  .mode-panel.active{display:block; animation:fade .25s ease}
+  .mode-grid{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:14px}
+  .mode-col{background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px 20px}
+  .mode-col h5{font-family:var(--mono); font-size:12px; letter-spacing:.1em; text-transform:uppercase; margin-bottom:10px}
+  .mode-col.mc-main h5{color:var(--violet)} .mode-col.mc-side h5{color:var(--green)}
+  .mode-col ul{margin-left:16px; font-size:12.5px; color:var(--muted)}
+  .mode-col ul li{margin-bottom:5px}
+  .mode-col ul li b{color:var(--text); font-weight:600}
+
+  /* ---------- tree ---------- */
+  .tree{font-family:var(--mono); font-size:12px; line-height:1.75; color:var(--muted); overflow-x:auto; white-space:pre}
+  .tree .d{color:var(--blue)} .tree .f{color:var(--text)} .tree .c{color:var(--faint)}
+
+  /* ---------- footer ---------- */
+  footer{
+    border-top:1px solid var(--border); padding:28px 24px; text-align:center;
+    color:var(--faint); font-size:12.5px; position:relative; z-index:1;
+  }
+  footer .fl{display:flex; gap:18px; justify-content:center; margin-top:8px; flex-wrap:wrap}
+  footer a{color:var(--muted); text-decoration:none}
+  footer a:hover{color:var(--text)}
+
+  .two-col{display:grid; grid-template-columns:1fr 1fr; gap:18px; align-items:start}
+  .note{
+    background:var(--blue-dim); border:1px solid rgba(88,166,255,.3); border-radius:10px;
+    padding:12px 16px; font-size:13px; color:var(--muted); margin:14px 0;
+  }
+  .note b{color:var(--text)}
+  .note.warn{background:var(--amber-dim); border-color:rgba(240,136,62,.35)}
+
+  @media (max-width:920px){
+    .explorer{grid-template-columns:1fr}
+    .phase-detail{position:static; min-height:0}
+    .pillars{grid-template-columns:1fr}
+    .auto-grid,.mode-grid,.guard-grid,.two-col{grid-template-columns:1fr}
+    .fus{grid-template-columns:1fr; gap:10px}
+    .fus-mid{flex-direction:row; justify-content:center; padding:6px 0}
+    .picker-body{grid-template-columns:1fr}
+    .pk-col + .pk-col{border-left:none; border-top:1px solid var(--border)}
+    .hero h1{font-size:34px}
+    .navlinks{display:none}
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="brand"><span class="gear">⚙</span> pi dev team</div>
+  <div class="navlinks">
+    <a href="#overview">Overview</a>
+    <a href="#factory">Factory</a>
+    <a href="#flow">Process flow</a>
+    <a href="#roles">Roles &amp; team</a>
+    <a href="#picker">Model picker</a>
+    <a href="#fusion">Fusion</a>
+    <a href="#state">Files &amp; state</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============ HERO ============ -->
+<header class="hero">
+  <div class="hero-badges">
+    <span class="badge accent">v2.2.0</span>
+    <span class="badge">pi extension package</span>
+    <span class="badge">3 extensions · load independently</span>
+    <span class="badge">MIT</span>
+  </div>
+  <h1>A software factory for the<br><span class="grad">pi coding agent</span></h1>
+  <p class="lede">
+    <b>pi dev team</b> turns pi into a full engineering team: a <b>role-specialised agent factory</b>
+    that interviews you, specs, designs, builds test-first, reviews and documents your project —
+    a <b>two-panel model picker</b> with roles and reasoning-effort control — and <b>Fusion</b>, a
+    frontier-main + cheap-sidekick harness with dynamic mid-session routing.
+  </p>
+  <div class="install">
+    <span><span class="ps1">$</span> pi install git:github.com/FaceMe/pi-dev-team</span>
+    <button onclick="copyInstall(this)">copy</button>
+  </div>
+  <div class="install-note">Works with any model pi supports — any provider, including custom and local models.</div>
+
+  <div class="pillars">
+    <a class="pillar p1" href="#factory">
+      <div class="icon">🏭</div>
+      <h3>Software factory — /factory</h3>
+      <p>Analyst, researcher, architect, planner, backend, frontend, devops, reviewer and docs agents run your idea through an 8-phase pipeline with gates, guard rails, budgets and resumes.</p>
+    </a>
+    <a class="pillar p2" href="#picker">
+      <div class="icon">🎛️</div>
+      <h3>Model picker &amp; roles</h3>
+      <p>A two-panel TUI over every provider you're logged in to, three switchable roles (daily / small / frontier), and a reasoning-effort picker clamped to each model's real capabilities.</p>
+    </a>
+    <a class="pillar p3" href="#fusion">
+      <div class="icon">⚛️</div>
+      <h3>Fusion harness</h3>
+      <p>A frontier main agent keeps the plan and the judgement; a persistent cheap sidekick does the mechanical work. Delegation is enforced, verified with real commands, and routed dynamically.</p>
+    </a>
+  </div>
+</header>
+
+<!-- ============ OVERVIEW ============ -->
+<section id="overview">
+  <div class="kicker k-amber">overview</div>
+  <h2>Three extensions, one package</h2>
+  <p class="lead">
+    Everything ships together and loads independently. The pieces share the model tier system:
+    the picker defines <b>daily / small / frontier</b> roles, the factory builds its team from them,
+    and Fusion routes along the same ladder.
+  </p>
+
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>Extension</th><th>Entry point</th><th>What it adds to pi</th><th>Open with</th></tr>
+      <tr>
+        <td><b>model-picker</b></td>
+        <td><span class="filechip">extensions/model-picker/index.ts</span></td>
+        <td class="desc">Two-panel provider/model picker, role manager, reasoning-effort controller, exit command</td>
+        <td><code>/models</code> · <kbd>Ctrl+Shift+M</kbd></td>
+      </tr>
+      <tr>
+        <td><b>fusion</b></td>
+        <td><span class="filechip">extensions/fusion/index.ts</span></td>
+        <td class="desc">Main/sidekick two-agent harness, the <code>sidekick</code> tool, delegation policy, routing, live meters</td>
+        <td><code>/fusion</code> · <kbd>Ctrl+Shift+D</kbd></td>
+      </tr>
+      <tr>
+        <td><b>factory</b></td>
+        <td><span class="filechip">extensions/factory/index.ts</span></td>
+        <td class="desc">The 8-phase software pipeline, worker subprocesses, guard rails, board, cost ledger</td>
+        <td><code>/factory</code></td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="two-col">
+    <div class="term">
+      <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">quick start</span></div>
+      <pre><span class="t-dim"># start pi in an empty project folder</span>
+<span class="t-green">$</span> mkdir habit-tracker && cd habit-tracker && pi
+
+<span class="t-dim"># give the factory your idea</span>
+<span class="t-green">❯</span> <span class="t-amber">/factory new</span> a habit tracker with a web UI and a REST API
+
+<span class="t-dim"># … or take Fusion for a spin with your own models</span>
+<span class="t-green">❯</span> <span class="t-violet">/fusion</span>          <span class="t-dim">→ pick main + sidekick → /fusion on</span></pre>
+    </div>
+    <div>
+      <h3 class="sub" style="margin-top:6px">How the factory runs workers</h3>
+      <p style="color:var(--muted); font-size:13.5px">
+        Workers are <b style="color:var(--text)">real <code>pi --mode json</code> subprocesses</b> with a persistent
+        session per role and ticket — so they reuse context and prompt cache, load your providers and
+        extensions, and a crash never takes down your session. Every tool call they make passes the
+        factory's guard: writes outside the ticket's scope are blocked, dangerous commands are refused,
+        and gates are run by the factory itself — never claimed by an agent.
+      </p>
+      <div class="note">
+        <b>Headless too.</b> Without a UI (print / JSON / RPC mode), <code>/factory new</code> accepts the
+        prefilled answers and runs to completion — so the factory works from scripts and CI.
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FACTORY ============ -->
+<section id="factory">
+  <div class="kicker k-amber">software factory</div>
+  <h2>/factory — from idea to merged branch</h2>
+  <p class="lead">
+    One command walks your project through <b>eight phases</b>, persisting to <code>.factory/</code> between every
+    step. You stay in control through a quick-setup screen, a bounded interview, and approval gates —
+    the factory handles team assembly, test-first builds, reviews, gates and the merge.
+  </p>
+
+  <h3 class="sub"><span class="hash">§</span> Quick setup — one screen</h3>
+  <p style="color:var(--muted); font-size:13.5px; margin-bottom:12px">
+    <code>/factory new [idea]</code> opens a single screen of prefilled answers. Press <kbd>Enter</kbd> to accept
+    them all, or open any line to change it. Your answers are remembered — team, autonomy and research for
+    every project; the rest per folder.
+  </p>
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>Question</th><th>Prefilled default</th></tr>
+      <tr><td><b>Team</b></td><td class="desc">Built automatically from the models you're logged in to; presets <code>balanced</code> / <code>cheap</code> / <code>best</code>, or pin any role to a model with the picker</td></tr>
+      <tr><td><b>Autonomy</b></td><td class="desc"><code>balanced</code> — you approve the spec and one build plan (<code>auto</code>: spec only · <code>careful</code>: every phase and ticket)</td></tr>
+      <tr><td><b>Project</b></td><td class="desc">New project, or "add to the existing project" when the folder already has code</td></tr>
+      <tr><td><b>Stack</b></td><td class="desc">Let the architect choose (or keep the detected stack of an existing project)</td></tr>
+      <tr><td><b>Web research</b></td><td class="desc">pi-web-access (<code>web_search</code>, <code>fetch_content</code>); offered for install if missing</td></tr>
+      <tr><td><b>Deployment</b></td><td class="desc">Run locally · generate deploy config · deploy with a detected, logged-in CLI (always asks first)</td></tr>
+      <tr><td><b>Budget</b></td><td class="desc">Estimated from your team's prices and the size of the idea; pauses at 80%</td></tr>
+    </table>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> The interview</h3>
+  <div class="two-col">
+    <div class="card">
+      <ul style="margin-left:18px; color:var(--muted); font-size:13.5px">
+        <li style="margin-bottom:8px"><b style="color:var(--text)">At most 4 questions per round</b>, each with a recommended answer and a "use your defaults" option; small ideas get one round.</li>
+        <li style="margin-bottom:8px"><b style="color:var(--text)">Readiness checklist</b> ends the interview as soon as every topic is known or assumed — unresolved topics become explicit assumptions in the spec.</li>
+        <li style="margin-bottom:8px"><b style="color:var(--text)">Multi-model brainstorm</b> for contested questions: the analyst fans out to several of your models — divergent, critical and pragmatic stances — then synthesises the options (≤ 2 per run).</li>
+        <li><b style="color:var(--text)">Machine-checked spec</b> — requirements with Given/When/Then, measurable non-functional requirements and traceability are validated <i>before</i> you see it.</li>
+      </ul>
+    </div>
+    <div class="term">
+      <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">discovery — interview round</span></div>
+      <pre><span class="t-amber">analyst</span> <span class="t-dim">· round 1 of ? · 3 questions</span>
+
+<span class="t-bold">1.</span> Who creates habits?
+   <span class="t-dim">→ recommended: single user, no accounts</span>
+<span class="t-bold">2.</span> What counts as "streak"?
+   <span class="t-dim">→ recommended: consecutive days with all habits</span>
+<span class="t-bold">3.</span> REST only, or also a small SSR page?
+   <span class="t-dim">→ recommended: REST API + minimal web UI</span>
+
+<span class="t-blue">[use your defaults]</span>  <span class="t-dim">·  answer 1–3, or ask me anything</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FLOW ============ -->
+<section id="flow">
+  <div class="kicker k-amber">process flow</div>
+  <h2>The eight-phase pipeline</h2>
+  <p class="lead">
+    Click any phase to see who runs it, what it writes, and where you're asked.
+    Green tags mark phases that stop for your approval — always for the spec; the rest depends on your
+    <a href="#roles" style="color:var(--amber)">autonomy preset</a>.
+  </p>
+
+  <div class="explorer">
+    <div class="stepper" id="stepper">
+      <div class="step active" data-p="0">
+        <div class="n">1</div>
+        <div class="lbl"><b>discovery</b><span>analyst interviews you · researcher adds notes</span></div>
+      </div>
+      <div class="step" data-p="1">
+        <div class="n">2</div>
+        <div class="lbl"><b>spec</b> <span class="approve-tag">YOU APPROVE</span><span>FR/NFR spec with Given/When/Then, validated first</span></div>
+      </div>
+      <div class="step" data-p="2">
+        <div class="n">3</div>
+        <div class="lbl"><b>architecture</b><span>ADR + stack profile with gate commands</span></div>
+      </div>
+      <div class="step" data-p="3">
+        <div class="n">4</div>
+        <div class="lbl"><b>planning</b> <span class="approve-tag">BUILD PLAN</span><span>dependency-ordered tickets with scopes &amp; tests</span></div>
+      </div>
+      <div class="step" data-p="4">
+        <div class="n">5</div>
+        <div class="lbl"><b>skeleton</b><span>worktree + walking skeleton that passes the gates</span></div>
+      </div>
+      <div class="step" data-p="5">
+        <div class="n">6</div>
+        <div class="lbl"><b>build</b> <span class="approve-tag" id="build-tag">PER TICKET*</span><span>test-first tickets, gates, cross-family reviews</span></div>
+      </div>
+      <div class="step" data-p="6">
+        <div class="n">7</div>
+        <div class="lbl"><b>docs</b><span>README, architecture notes, AGENTS.md, CHANGELOG</span></div>
+      </div>
+      <div class="step" data-p="7">
+        <div class="n">8</div>
+        <div class="lbl"><b>release</b> <span class="approve-tag" id="release-tag">MERGE*</span><span>final gates, merge, deploy ask, report</span></div>
+      </div>
+    </div>
+
+    <div class="phase-detail" id="phase-detail">
+      <div class="pd active" data-p="0">
+        <div class="phase-no">PHASE 1 / 8</div>
+        <h4>Discovery</h4>
+        <div class="who"><span class="wlbl">Run by</span>
+          <span class="rolechip rc-amber">analyst</span><span class="rolechip rc-blue">researcher</span>
+        </div>
+        <ul>
+          <li>The <b>analyst</b> interviews you — at most 4 questions per round, each with a recommended answer and a "use your defaults" option. Small ideas get one round.</li>
+          <li>A <b>readiness checklist</b> scores every topic; the interview ends as soon as nothing is unknown — unresolved topics become explicit assumptions.</li>
+          <li>Contested questions can fan a <b>brainstorm</b> out to several of your models (divergent / critical / pragmatic stances), then synthesise the options.</li>
+          <li>If web research is on, the <b>researcher</b> adds prior-art, library and licence notes.</li>
+        </ul>
+        <div class="artifacts"><span class="wlbl">Writes</span>
+          <span class="filechip">.factory/brief.md</span><span class="filechip">spec/decisions.md</span><span class="filechip">spec/readiness.md</span><span class="filechip">research/notes.md</span>
+        </div>
+        <div class="approve-note"><span class="ic">💬</span><span><b>You:</b> answer the interview rounds — or hit "use your defaults" and let the assumptions log carry the rest.</span></div>
+      </div>
+
+      <div class="pd" data-p="1">
+        <div class="phase-no">PHASE 2 / 8</div>
+        <h4>Spec</h4>
+        <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-amber">analyst</span></div>
+        <ul>
+          <li>Writes <b>.factory/spec/spec.md</b> — functional and non-functional requirements with <b>FR/NFR IDs</b> and <b>Given/When/Then</b> acceptance criteria.</li>
+          <li>A <b>spec validator</b> machine-checks it first: requirement structure, measurable NFRs, traceability — problems are fed back to the analyst before you ever see the draft.</li>
+          <li>Explicit <b>assumptions.md</b> carries everything the interview left open.</li>
+        </ul>
+        <div class="artifacts"><span class="wlbl">Writes</span>
+          <span class="filechip">.factory/spec/spec.md</span><span class="filechip">spec/assumptions.md</span>
+        </div>
+        <div class="approve-note"><span class="ic">✅</span><span><b>You approve the spec</b> in every autonomy preset — approve it, or request changes and the analyst revises.</span></div>
+      </div>
+
+      <div class="pd" data-p="2">
+        <div class="phase-no">PHASE 3 / 8</div>
+        <h4>Architecture</h4>
+        <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-amber">architect</span></div>
+        <ul>
+          <li>Writes an <b>ADR</b> (architecture decision record) capturing the stack choice and its rationale.</li>
+          <li>Produces a <b>stack profile</b> — the machine-readable contract the rest of the run uses: gate commands (install, build, typecheck, lint, test), dependency manifests and conventions.</li>
+        </ul>
+        <div class="artifacts"><span class="wlbl">Writes</span>
+          <span class="filechip">.factory/adr/0001-architecture.md</span><span class="filechip">.factory/profile.json</span>
+        </div>
+        <div class="approve-note auto"><span class="ic">🤖</span><span><b>Approval:</b> automatic in <code>auto</code> and <code>balanced</code>; the architecture screen is a gate in <code>careful</code>.</span></div>
+      </div>
+
+      <div class="pd" data-p="3">
+        <div class="phase-no">PHASE 4 / 8</div>
+        <h4>Planning</h4>
+        <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-amber">planner</span></div>
+        <ul>
+          <li>Breaks the spec into a <b>dependency-ordered ticket list</b> — each ticket carries a write scope, acceptance tests and its role assignment.</li>
+          <li>Tickets are small and contract-first, so parallel builds can arrive without rework.</li>
+        </ul>
+        <div class="artifacts"><span class="wlbl">Writes</span><span class="filechip">.factory/tickets.json</span></div>
+        <div class="approve-note"><span class="ic">✅</span><span><b>You approve one build-plan screen</b> (stack, tickets, budget) in <code>balanced</code> and <code>careful</code> — this is the second stop in the default preset.</span></div>
+      </div>
+
+      <div class="pd" data-p="4">
+        <div class="phase-no">PHASE 5 / 8</div>
+        <h4>Skeleton</h4>
+        <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-blue">devops</span></div>
+        <ul>
+          <li>Creates a <b>git worktree</b> on branch <code>factory/&lt;run&gt;</code> — your working tree is never touched during the build.</li>
+          <li>The devops role builds a <b>walking skeleton</b>: scaffold, tooling, CI, and a trivial end-to-end path that must pass the profile's gates before any ticket starts.</li>
+        </ul>
+        <div class="artifacts"><span class="wlbl">Writes</span>
+          <span class="filechip">worktrees/&lt;run&gt;</span><span class="filechip">factory/&lt;run&gt; branch</span><span class="filechip">Dockerfile / CI</span>
+        </div>
+        <div class="approve-note auto"><span class="ic">🤖</span><span><b>Fast path:</b> if a resumed run finds the worktree already passing the gates, the skeleton counts as done — no rebuild.</span></div>
+      </div>
+
+      <div class="pd" data-p="5">
+        <div class="phase-no">PHASE 6 / 8</div>
+        <h4>Build</h4>
+        <div class="who"><span class="wlbl">Run by</span>
+          <span class="rolechip rc-blue">backend</span><span class="rolechip rc-blue">frontend</span><span class="rolechip rc-violet">reviewer</span>
+        </div>
+        <ul>
+          <li>Each ticket is built <b>test-first</b> by its role's worker inside the worktree.</li>
+          <li><b>Gates are run by the factory</b> — install / build / typecheck / lint / test from the profile — never claimed by the agent. Out-of-scope changes are reverted before the gates.</li>
+          <li>A <b>reviewer from a different model family</b> approves each ticket's diff.</li>
+          <li>Failures retry with feedback, then escalate up the role's model ladder, then ask you.</li>
+        </ul>
+        <div class="artifacts"><span class="wlbl">Writes</span>
+          <span class="filechip">ticket commits</span><span class="filechip">reviews/*.json</span><span class="filechip">ledger.jsonl</span>
+        </div>
+        <div class="approve-note"><span class="ic">🛑</span><span><b>Stops for you:</b> budget breaker at 80%, a blocked ticket (every model tried), and — in <code>careful</code> — every ticket commit.</span></div>
+      </div>
+
+      <div class="pd" data-p="6">
+        <div class="phase-no">PHASE 7 / 8</div>
+        <h4>Docs</h4>
+        <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-blue">docs</span></div>
+        <ul>
+          <li>The tech-writer role produces the <b>README</b>, architecture notes, <b>AGENTS.md</b> for future agents, and a <b>CHANGELOG</b>.</li>
+          <li>Everything is written from the actual code and spec — the reviewer's already approved the diff it documents.</li>
+        </ul>
+        <div class="artifacts"><span class="wlbl">Writes</span>
+          <span class="filechip">README.md</span><span class="filechip">docs/</span><span class="filechip">AGENTS.md</span><span class="filechip">CHANGELOG.md</span>
+        </div>
+        <div class="approve-note auto"><span class="ic">🤖</span><span><b>Approval:</b> automatic in all presets — docs land in the worktree and go through the final gates with the rest.</span></div>
+      </div>
+
+      <div class="pd" data-p="7">
+        <div class="phase-no">PHASE 8 / 8</div>
+        <h4>Release</h4>
+        <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-amber">factory</span></div>
+        <ul>
+          <li><b>Final gates</b> run one last time over the whole branch.</li>
+          <li>The branch is <b>merged into yours</b> when they pass — only if you're on the branch you started on and your tree is clean (in <code>careful</code>, you approve the merge itself).</li>
+          <li>An optional <b>deploy</b> always asks first — the deploy worker writes <code>.env.example</code>, never your <code>.env</code>.</li>
+          <li>The run finishes with <b>.factory/report.md</b>: every ticket, the cost by role, and notes.</li>
+        </ul>
+        <div class="artifacts"><span class="wlbl">Writes</span>
+          <span class="filechip">merge to your branch</span><span class="filechip">.factory/report.md</span>
+        </div>
+        <div class="approve-note"><span class="ic">✅</span><span><b>The merge is yours:</b> gates + clean tree + your branch, and your explicit approval in <code>careful</code>.</span></div>
+      </div>
+    </div>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Inside the build phase — the per-ticket loop</h3>
+  <div class="card loop">
+    <div class="loop-row">
+      <div class="loop-node"><span class="loop-arrow">→</span>
+        <div class="ln-t">1 · Assign</div>
+        <div class="ln-d">ticket → its role's worker (persistent session, prompt cache reused)</div>
+      </div>
+      <div class="loop-node"><span class="loop-arrow">→</span>
+        <div class="ln-t">2 · Build test-first</div>
+        <div class="ln-d">worker writes tests + code, edits confined to the ticket's write scope</div>
+      </div>
+      <div class="loop-node ok"><span class="loop-arrow">→</span>
+        <div class="ln-t">3 · Gates</div>
+        <div class="ln-d">install · build · typecheck · lint · test — run by the factory, real exit codes</div>
+      </div>
+      <div class="loop-node ok"><span class="loop-arrow">→</span>
+        <div class="ln-t">4 · Review</div>
+        <div class="ln-d">reviewer from a different model family checks the diff against the spec</div>
+      </div>
+      <div class="loop-node ok">
+        <div class="ln-t">5 · Commit ✓</div>
+        <div class="ln-d">ticket done — board widget and ledger update live</div>
+      </div>
+    </div>
+    <div class="fail-branch">
+      <span class="fb-step">✗ gates fail or review rejects</span><span class="fa">→</span>
+      <span class="fb-step">retry with reviewer feedback</span><span class="fa">→</span>
+      <span class="fb-step">escalate model ladder (daily → frontier)</span><span class="fa">→</span>
+      <span class="fb-step">ask you: retry strongest · skip · pause</span>
+    </div>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Watching a run</h3>
+  <div class="two-col">
+    <div class="term">
+      <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">live board widget — above the footer</span></div>
+      <pre><span class="t-amber">🏭 factory · build · 3/7 tickets · $1.24/$5.00</span>
+  <span class="t-blue">▶ T-004 backend — persist habits to SQLite (attempt 2)</span>
+  <span class="t-dim">· T-007 todo — weekly streak view</span>
+  <span class="t-green">✓ 3 done</span>
+  <span class="t-dim">backend: edit src/db/habits.ts</span>
+  <span class="t-dim">backend: $ npm test -- habits</span></pre>
+    </div>
+    <div class="term">
+      <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">/factory status</span></div>
+      <pre><span class="t-dim">run run-20260921-093000 ·</span> <span class="t-amber">build · paused</span>
+<span class="t-dim">idea:</span> a habit tracker with a web UI and a REST API
+<span class="t-dim">spent:</span> $1.24 of $5.00 · 412.3k tokens
+<span class="t-dim">tickets: 3/7 done</span>
+  <span class="t-green">✓ T-001 repo and tooling</span>
+  <span class="t-amber">… T-004 persist habits to SQLite</span>
+  <span class="t-dim">· T-007 weekly streak view</span>
+<span class="t-dim">branch: factory/run-20260921-093000</span></pre>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>Pause and resume, across restarts.</b> Every phase transition, ticket status and spend update is written to
+    <code>.factory/factory.lock.json</code> <i>before</i> the factory moves on. Reopen the project and pi offers
+    <i>Resume the run now · Show status · Not now</i>. A resumed run reproduces its own settings from a snapshot
+    — but the team is deliberately re-derived from the models you're logged in to <i>now</i> (picker pins are kept).
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Cost transparency</h3>
+  <p style="color:var(--muted); font-size:13.5px; margin-bottom:10px">
+    Every worker run appends role, model, ticket, tokens, cost and a bounded trace to <code>.factory/ledger.jsonl</code>.
+    <code>/factory cost</code> breaks spend down by phase, role, model and ticket — and estimates what an all-frontier
+    team would have cost, so you can see what the mixed team saved.
+  </p>
+  <div class="term">
+    <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">/factory cost</span></div>
+    <pre><span class="t-dim">cost for run run-20260921-093000</span>
+total <span class="t-bold">$1.24</span> · 412.3k tokens · 19 worker run(s)
+<span class="t-green">savings vs all-frontier: $2.10 (62.9%, estimate)</span>
+<span class="t-dim">by phase:</span>  build 10 runs · $0.73   discovery 4 runs · $0.20
+<span class="t-dim">by role:</span>   backend $0.58 · analyst $0.24 · devops $0.19 · reviewer $0.15
+<span class="t-dim">by model:</span>  acme/era-2-flash 14 runs · $1.05   orion/sol-2 5 runs · $0.19
+<span class="t-dim">by ticket:</span> T-004 $0.44 · T-005 $0.29 · (no ticket) $0.51</pre>
+  </div>
+</section>
+
+<!-- ============ ROLES ============ -->
+<section id="roles">
+  <div class="kicker k-amber">roles &amp; team</div>
+  <h2>The team, and how models are chosen</h2>
+  <p class="lead">
+    Each role is a Markdown file with a tier, effort, tools, write scope and prompt. The factory assembles a team
+    from the models you're actually logged in to, assigns roles by tier, and enforces <b>model-family diversity</b>
+    for reviews.
+  </p>
+
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>Role</th><th>What it does</th><th>Default tier / effort</th></tr>
+      <tr><td><b>analyst</b></td><td class="desc">Runs the interview, keeps the assumption log, writes the spec and acceptance criteria</td><td><span class="rolechip rc-violet">frontier</span> high</td></tr>
+      <tr><td><b>researcher</b></td><td class="desc">Prior art, library comparisons, API docs, licence checks — sourced notes</td><td><span class="rolechip rc-blue">daily</span> medium</td></tr>
+      <tr><td><b>architect</b></td><td class="desc">Stack choice (ADRs), module boundaries, API contracts, data model, conventions</td><td><span class="rolechip rc-violet">frontier</span> high</td></tr>
+      <tr><td><b>planner</b></td><td class="desc">Breaks the spec into a dependency-ordered ticket graph with scopes and acceptance tests</td><td><span class="rolechip rc-violet">frontier</span> medium</td></tr>
+      <tr><td><b>backend</b></td><td class="desc">Services, APIs, persistence, domain logic, unit and integration tests</td><td><span class="rolechip rc-blue">daily</span> medium · escalates</td></tr>
+      <tr><td><b>frontend</b></td><td class="desc">UI components, state, API client from contracts, component tests, accessibility</td><td><span class="rolechip rc-blue">daily</span> medium · escalates</td></tr>
+      <tr><td><b>devops</b></td><td class="desc">Scaffold, build/lint/test tooling, Dockerfile, CI workflows, env templates</td><td><span class="rolechip rc-amber">small→daily</span> low</td></tr>
+      <tr><td><b>reviewer</b></td><td class="desc">Reviews each ticket diff for correctness, spec conformance, security — from a <b>different model family</b> than the author</td><td><span class="rolechip rc-violet">frontier</span> high · read-only</td></tr>
+      <tr><td><b>docs</b></td><td class="desc">README, architecture overview, CHANGELOG, AGENTS.md for future agents</td><td><span class="rolechip rc-amber">small→daily</span> low</td></tr>
+    </table>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> The capability ladder</h3>
+  <p style="color:var(--muted); font-size:13.5px">One ladder drives everything — factory escalation, team presets, and Fusion routing:</p>
+  <div class="ladder">
+    <div class="tier t-small">small<small>fast · cheap</small></div>
+    <span class="arr">→</span>
+    <div class="tier t-daily">daily<small>the workhorse</small></div>
+    <span class="arr">→</span>
+    <div class="tier t-frontier">frontier<small>deep reasoning</small></div>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Team presets</h3>
+  <div class="auto-grid">
+    <div class="auto-card c2">
+      <span class="tag">preset</span><h4>balanced</h4>
+      <ul><li>Each role keeps its natural tier (the table above)</li><li>The default team when you accept quick setup</li></ul>
+    </div>
+    <div class="auto-card c1">
+      <span class="tag">preset</span><h4>cheap</h4>
+      <ul><li>Shifts every role one tier down</li><li>Judgement roles never drop below <code>daily</code></li></ul>
+    </div>
+    <div class="auto-card c3">
+      <span class="tag">preset</span><h4>best</h4>
+      <ul><li>Everything on <code>frontier</code></li><li>Maximum quality, maximum cost</li></ul>
+    </div>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> How a role's model is resolved</h3>
+  <div class="card" style="margin-top:14px">
+    <div class="ladder" style="margin-top:0">
+      <div class="tier" style="color:var(--green); border-color:rgba(63,185,80,.4)">pin <small>/factory roles → picker</small></div>
+      <span class="arr">›</span><span class="arr" style="font-size:11px">wins over</span>
+      <div class="tier" style="color:var(--amber); border-color:rgba(240,136,62,.4)">role .md override <small>~/.pi/agent/factory/roles/</small></div>
+      <span class="arr">›</span><span class="arr" style="font-size:11px">wins over</span>
+      <div class="tier" style="color:var(--blue); border-color:rgba(88,166,255,.4)">preset × tier <small>balanced / cheap / best</small></div>
+    </div>
+    <p style="color:var(--muted); font-size:13px; margin-top:8px">
+      A running build keeps its team; preset and pin changes apply to the next run or resume.
+      Role overrides can also change effort, tools, escalation ladder or the whole prompt.
+    </p>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Autonomy presets — how often the factory stops</h3>
+  <div class="auto-grid">
+    <div class="auto-card c1">
+      <span class="tag">autonomy</span><h4>auto</h4>
+      <ul><li>You approve: <b style="color:var(--text)">the spec</b></li><li>Everything else runs through to release</li></ul>
+    </div>
+    <div class="auto-card c2 recommended">
+      <span class="tag">default</span><h4>balanced</h4>
+      <ul><li>You approve: <b style="color:var(--text)">the spec</b></li><li>+ one <b style="color:var(--text)">build-plan screen</b> (stack, tickets, budget)</li></ul>
+    </div>
+    <div class="auto-card c3">
+      <span class="tag">autonomy</span><h4>careful</h4>
+      <ul><li>Every gate: spec, architecture, build plan,</li><li>each ticket commit, and the merge</li></ul>
+    </div>
+  </div>
+  <p style="color:var(--muted); font-size:13px">
+    In every preset the budget breaker and genuine blockers still stop and ask you, and <code>/factory pause</code> works at any time.
+    Switch presets mid-run with <code>/factory autonomy &lt;preset&gt;</code>.
+  </p>
+
+  <h3 class="sub"><span class="hash">§</span> Guard rails</h3>
+  <div class="guard-grid">
+    <div class="guard"><span class="gi">✏️</span><div><b>Write scopes</b><p><code>edit</code>/<code>write</code> outside the ticket's scope are blocked; an empty scope means read-only; <code>.git/</code> is never writable. Anything that slips through is reverted before gates run.</p></div></div>
+    <div class="guard"><span class="gi">🚫</span><div><b>Blocked commands</b><p><code>git push</code>/commit, history rewrites, <code>sudo</code>, publishing, piped remote scripts, <code>rm -rf</code> outside the project, fork bombs, and deploy CLIs — unless you approved a deploy.</p></div></div>
+    <div class="guard"><span class="gi">🧪</span><div><b>Gates run by the factory</b><p>Install/build/typecheck/lint/test come from the stack profile and are executed by the harness with real exit codes — "done" is never claimed by an agent.</p></div></div>
+    <div class="guard"><span class="gi">👀</span><div><b>Cross-family review</b><p>Each ticket is approved by a reviewer from a different model family than the author's — catching the errors a family tends to share.</p></div></div>
+    <div class="guard"><span class="gi">🔐</span><div><b>No secrets stored</b><p>Deploy CLIs reuse their own logins; the deploy worker writes <code>.env.example</code>, never your <code>.env</code>; the reviewer is instructed to flag secrets in code.</p></div></div>
+    <div class="guard"><span class="gi">🌿</span><div><b>The merge is yours</b><p>Release merges only when the final gates pass, you're on the branch you started on, and your tree is clean — and in <code>careful</code>, only after you approve.</p></div></div>
+  </div>
+</section>
+
+<!-- ============ PICKER ============ -->
+<section id="picker">
+  <div class="kicker k-blue">model picker</div>
+  <h2>Two-panel picker, roles &amp; reasoning effort</h2>
+  <p class="lead">
+    Open with <code>/models</code>, <code>/mp</code>, <code>/picker</code> or <kbd>Ctrl+Shift+M</kbd>. Left panel: providers
+    with auth indicators. Right panel: models with context window, thinking badges and vision markers. The same
+    picker powers factory role assignment through its <b>Factory tab</b>.
+  </p>
+
+  <div class="picker">
+    <div class="picker-head">
+      <span>Model Picker <span class="t-dim">— two panels</span></span>
+      <span class="ftab">🏭 factory tab · ASSIGN MODELS TO FACTORY ROLES</span>
+    </div>
+    <div class="picker-body">
+      <div class="pk-col">
+        <div class="pk-title">Providers <span class="t-dim">(← →) focus</span></div>
+        <div class="pk-item"><span class="sel">▸ anthropic</span><span class="meta">12 models · ✓auth</span></div>
+        <div class="pk-item"><span class="sel">▸ openai</span><span class="meta">9 models · ✓auth</span></div>
+        <div class="pk-item cursor"><span>▸ zai</span><span class="meta">4 models · ✓auth</span></div>
+        <div class="pk-item"><span>▸ google-vertex</span><span class="meta">18 models</span></div>
+        <div class="pk-item"><span>▸ ollama <span class="t-dim">(local)</span></span><span class="meta">7 models · ✓auth</span></div>
+        <div class="pk-item"><span>▸ openrouter</span><span class="meta">321 models</span></div>
+        <div class="pk-spec">
+          <span class="spec-t">SPEC — zai/glm-5.3</span><br>
+          context 200k · max out 32k<br>
+          thinking <span class="t-violet">🧠 off→high</span> · vision ✓ · cost $in/$out<br>
+          effort now: <span class="t-amber">high</span>
+        </div>
+      </div>
+      <div class="pk-col">
+        <div class="pk-title">Models <span class="t-dim">(↑ ↓) navigate · "/" filter</span></div>
+        <div class="pk-item"><span>glm-5.3-flash</span><span class="meta">128k · 🧠 low · ⚡sidekick</span></div>
+        <div class="pk-item"><span>glm-5.3-air</span><span class="meta">128k · 🧠 med</span></div>
+        <div class="pk-item cursor"><span class="sel">● glm-5.3</span><span class="meta">200k · 🧠 high · 👁 vision</span></div>
+        <div class="pk-item"><span>glm-4.7</span><span class="meta">128k · 🧠 low→high</span></div>
+        <div class="pk-spec">
+          <span class="spec-t">REASONING EFFORT — press e</span><br>
+          <span class="t-dim">off</span> · <span class="t-dim">minimal</span> · <span class="t-dim">low</span> · <span class="t-dim">medium</span> · <span class="t-violet">▸ high</span><br>
+          <span class="t-dim">only levels this model actually supports — clamped, never guessed</span>
+        </div>
+      </div>
+    </div>
+    <div class="pk-foot">
+      <span><kbd>Enter</kbd> switch</span><span><kbd>e</kbd> effort</span><span><kbd>d</kbd>/<kbd>s</kbd>/<kbd>f</kbd> assign role</span>
+      <span><kbd>m</kbd>/<kbd>k</kbd> fusion main/sidekick</span><span><kbd>1</kbd>–<kbd>5</kbd> quick-switch</span>
+      <span><kbd>Tab</kbd> configured only</span><span><kbd>/</kbd> search</span><span><kbd>Esc</kbd> exit</span>
+    </div>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Roles — three slots you switch between instantly</h3>
+  <div class="auto-grid">
+    <div class="auto-card c2"><span class="tag">role</span><h4>daily</h4><ul><li>The workhorse — also the startup default</li><li><code>/role daily</code> · <code>/daily</code> · <kbd>1</kbd></li></ul></div>
+    <div class="auto-card c1"><span class="tag">role</span><h4>small</h4><ul><li>Fast, lightweight model for tiny tasks</li><li><code>/role small</code> · <code>/small</code> · <code>/tiny</code> · <kbd>2</kbd></li></ul></div>
+    <div class="auto-card c3"><span class="tag">role</span><h4>frontier</h4><ul><li>Advanced reasoning for complex tasks</li><li><code>/role frontier</code> · <code>/frontier</code> · <kbd>3</kbd></li></ul></div>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Reasoning effort, clamped to reality</h3>
+  <p style="color:var(--muted); font-size:13.5px; margin-bottom:12px">
+    Effort levels are validated against each model's actual capabilities via pi-ai's
+    <code>getSupportedThinkingLevels</code> / <code>clampThinkingLevel</code> — unsupported levels like
+    <code>xhigh</code> on a <code>high</code>-capped model are prevented or clamped gracefully.
+  </p>
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>Command</th><th>Action</th></tr>
+      <tr><td><span class="cmd blue">/effort</span></td><td class="desc">Interactive prompt showing <b>only the levels the active model supports</b></td></tr>
+      <tr><td><span class="cmd blue">/effort &lt;level&gt;</span></td><td class="desc">Set effort directly — clamped to capabilities. Tier aliases: <code>min</code> <code>med</code> <code>mid</code> <code>hi</code> <code>max</code> <code>0</code>–<code>6</code></td></tr>
+      <tr><td><span class="cmd blue">/effort &lt;model&gt;</span></td><td class="desc">Interactive prompt for a specific model</td></tr>
+      <tr><td><span class="cmd blue">/effort &lt;model&gt; &lt;level&gt;</span></td><td class="desc">Set and persist the default effort for any model</td></tr>
+      <tr><td><span class="cmd blue">/think</span></td><td class="desc">Alias of <code>/effort</code> (<code>/thinking</code> is pi's own built-in, left alone)</td></tr>
+      <tr><td><span class="cmd blue">/default [model]</span></td><td class="desc">Set the startup default model in <code>settings.json</code></td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ FUSION ============ -->
+<section id="fusion">
+  <div class="kicker k-violet">fusion</div>
+  <h2>The main / sidekick harness</h2>
+  <p class="lead">
+    Instead of one model for the whole session, a frontier <b>main agent</b> keeps the plan, the ambiguity and the
+    final review — and delegates well-scoped mechanical work to a persistent, cheap <b>sidekick</b> with its own
+    transcript, tools and prompt cache. Enable with <code>/fusion on</code> — Fusion always starts <b>off</b>, even
+    on resume. Open the menu with <code>/fusion</code> or <kbd>Ctrl+Shift+D</kbd>.
+  </p>
+
+  <div class="fus">
+    <div class="fus-box main">
+      <div class="fb-t">🔮 main agent — frontier</div>
+      <div class="fb-s">this pi session · keeps the expensive prefix warm</div>
+      <ul>
+        <li>owns the <b>plan</b> (numbered, each step <i>(you)</i> or <i>(sidekick)</i>)</li>
+        <li>resolves ambiguity, makes the calls</li>
+        <li>writes delegation <b>specs as data</b>: acceptance criteria + verify commands</li>
+        <li><b>reviews</b> the sidekick's changes before a run settles</li>
+      </ul>
+    </div>
+    <div class="fus-mid">
+      <span class="fa">⇄</span>
+      <span><span class="lbl-a">sidekick(</span>task, context, files,<br>acceptance, verify<span class="lbl-a">)</span></span>
+      <span class="fa">⇄</span>
+      <span><span class="lbl-b">verdict first:</span><br>PASSED (checks 2/2 ·<br>acceptance 3/3)</span>
+    </div>
+    <div class="fus-box side">
+      <div class="fb-t">⚡ sidekick — cheap</div>
+      <div class="fb-s">persistent in-process agent · own tools &amp; context</div>
+      <ul>
+        <li>targeted reads / greps, mechanical edits</li>
+        <li>runs tests, builds, installs — collects verbose output</li>
+        <li>answers every acceptance criterion in a checklist</li>
+        <li>tools: <code>read, grep, find, ls, bash</code> (+ edit/write optionally)</li>
+      </ul>
+    </div>
+    <div class="fus-verify">
+      <b>The harness verifies — not the model:</b> after the sidekick finishes, it runs the <code>verify</code> commands itself
+      (≤ 5) and puts a verdict first in the result, with exit codes, output tails, the acceptance tally, and the files
+      changed (<span style="font-family:var(--mono)">+12 −3</span> from git)&nbsp;
+      <span class="vtag v-pass">PASSED (checks 2/2 · acceptance 3/3)</span>&nbsp;
+      <span class="vtag v-fail">FAILED (1 check failed)</span>
+    </div>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Delegation modes — enforced, not just suggested</h3>
+  <p style="color:var(--muted); font-size:13.5px">
+    Telling a frontier model to "delegate by default" isn't enough when it holds bash and edit.
+    <code>delegation.mode</code> makes delegation structural — switch anytime with
+    <code>/fusion mode strict|balanced|advisory</code>:
+  </p>
+  <div class="mode-tabs">
+    <button class="mode-tab" data-m="0">balanced · default</button>
+    <button class="mode-tab active" data-m="1">strict</button>
+    <button class="mode-tab" data-m="2">advisory</button>
+  </div>
+  <div class="mode-panel" data-m="0">
+    <div class="mode-grid">
+      <div class="mode-col mc-main"><h5>Main agent may</h5>
+        <ul><li>read, edit, write, run commands</li>
+        <li>a test/build/lint/typecheck/install command <b>runs directly the first time</b></li>
+        <li>once a command proved slow (≥ 60 s) or verbose (&gt; 8k chars) it's <b>redirected with a ready-made sidekick call</b></li>
+        <li>direct output &gt; 8k chars gets <b>condensed by the sidekick's model</b> (full log kept on disk)</li>
+        <li>nudged after <b>6 direct calls in a row</b>, or direct edits to <b>4 files</b> in a run</li></ul>
+      </div>
+      <div class="mode-col mc-side"><h5>Goes to the sidekick</h5>
+        <ul><li>everything slow or verbose once proven so</li>
+        <li>mechanical edits and repetitive reads</li>
+        <li>anything the main agent's plan marks <i>(sidekick)</i></li>
+        <li><b>plan first</b>: anything beyond a one-step change needs a numbered plan before action</li></ul>
+      </div>
+    </div>
+  </div>
+  <div class="mode-panel active" data-m="1">
+    <div class="mode-grid">
+      <div class="mode-col mc-main"><h5>Main agent may</h5>
+        <ul><li><b>read-only</b>: <code>read</code>, <code>grep</code>, <code>find</code>, <code>ls</code></li>
+        <li><code>bash</code> limited to inspection — <code>git diff/status/log/show</code>, <code>head</code>, <code>wc</code>, <code>grep</code></li>
+        <li>everything that executes or edits <b>must go through the sidekick</b> — Devin's "minimal direct action"</li></ul>
+      </div>
+      <div class="mode-col mc-side"><h5>Goes to the sidekick</h5>
+        <ul><li>all execution and editing</li>
+        <li>with <code>edit</code>/<code>write</code> enabled in sidekick tools, it makes the changes; otherwise it reports what to change</li>
+        <li>relax rule: after <b>2 failed delegations</b> the main agent's bash/edit come back — never stuck; strict returns with the next user prompt after a success</li></ul>
+      </div>
+    </div>
+  </div>
+  <div class="mode-panel" data-m="2">
+    <div class="mode-grid">
+      <div class="mode-col mc-main"><h5>Main agent may</h5>
+        <ul><li>everything — full tools, no enforcement</li>
+        <li>the delegation discipline is advisory only (the old behaviour)</li></ul>
+      </div>
+      <div class="mode-col mc-side"><h5>Goes to the sidekick</h5>
+        <ul><li>only what the model <b>chooses</b> to delegate</li>
+        <li>verification, caps and guard rails still apply to every delegation that happens</li></ul>
+      </div>
+    </div>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Guard rails in every mode</h3>
+  <div class="guard-grid">
+    <div class="guard"><span class="gi">⏳</span><div><b>Commands that never exit are refused</b><p>Dev servers, <code>--watch</code>, <code>tail -f</code>, <code>docker compose up</code> without <code>-d</code> — refused with advice to use a one-shot variant or background with a log file.</p></div></div>
+    <div class="guard"><span class="gi">⏱️</span><div><b>Default timeouts</b><p>Test, build and install commands without a timeout get one (<code>commandTimeoutSec</code>, 600 s).</p></div></div>
+    <div class="guard"><span class="gi">✂️</span><div><b>Lean results</b><p>A sidekick result over 4k chars is capped; the full text is saved to a file the main agent can read.</p></div></div>
+    <div class="guard"><span class="gi">📋</span><div><b>Better briefs</b><p>Every brief automatically lists the files the main agent has read (with line ranges) and <code>git status</code> — because the sidekick can't see the conversation.</p></div></div>
+    <div class="guard"><span class="gi">🔒</span><div><b>No edit collisions</b><p>While a background delegation is changing a file, the main agent's edits to that file are blocked until it finishes.</p></div></div>
+    <div class="guard"><span class="gi">🪜</span><div><b>Escalation &amp; review gate</b><p>Two consecutive failed delegations escalate the sidekick one tier (small → daily → frontier). If the sidekick changed files the main agent hasn't reviewed, the run is held once for review.</p></div></div>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Dynamic mid-session routing</h3>
+  <div class="two-col">
+    <div>
+      <p style="color:var(--muted); font-size:13.5px">
+        A lightweight classifier scores the running task at each <b>compaction boundary</b> — where the prompt cache is
+        invalidated anyway, so switching is free — and moves the main and/or sidekick model up or down the
+        <code>small → daily → frontier</code> ladder. Routing is <b>skipped</b> in any session where you picked the model
+        yourself (<code>/model</code>, <kbd>Ctrl+P</kbd>, <code>--model</code>).
+      </p>
+      <ul style="margin:12px 0 0 18px; color:var(--muted); font-size:13px">
+        <li style="margin-bottom:5px"><b style="color:var(--text)">llm mode</b> — a cheap model scores the task, falls back to heuristic on failure</li>
+        <li style="margin-bottom:5px"><b style="color:var(--text)">heuristic mode</b> — keyword/regex signals only, no extra model call</li>
+        <li><b style="color:var(--text)">auto-apply or suggest-only</b> — suggested routes wait for <code>/fusion route</code></li>
+      </ul>
+    </div>
+    <div class="term">
+      <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">live widget — above the footer</span></div>
+      <pre><span class="t-violet">⚛ fusion strict · 3 delegated · 1 running · $0.64</span>
+  <span class="t-dim">main</span>  glm-5.3        <span class="t-dim">↑</span>456.2k  <span class="t-green">90% cached</span>  <span class="t-dim">↓</span>3.1k  $0.61
+  <span class="t-dim">side</span>  glm-5.3-flash  <span class="t-dim">↑</span>119.4k  <span class="t-green">80% cached</span>  <span class="t-dim">↓</span>1.8k  <span class="t-green">$0.03</span>
+
+<span class="t-dim">footer: ⚛ fusion strict · $0.64</span>
+<span class="t-dim">status: ⚛ fusion &lt;sidekick&gt; · 27% saved ($0.23)</span></pre>
+    </div>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> A typical first Fusion session</h3>
+  <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:56px">Step</th><th>Action</th></tr>
+      <tr><td><b>1</b></td><td class="desc"><code>/fusion</code> or <kbd>Ctrl+Shift+D</kbd> — open the interactive menu</td></tr>
+      <tr><td><b>2</b></td><td class="desc"><code>/fusion main</code> — pick the frontier model via the Model Picker (also switches the session to it immediately)</td></tr>
+      <tr><td><b>3</b></td><td class="desc"><code>/fusion sidekick</code> — pick the cheap model (default: your <code>small</code> role) and its tools in the menu</td></tr>
+      <tr><td><b>4</b></td><td class="desc"><code>/fusion on</code> — the <code>sidekick</code> tool activates, the system prompt gains the delegation discipline, the footer syncs to the main slot</td></tr>
+      <tr><td><b>5</b></td><td class="desc"><b>Use pi normally.</b> The main agent plans and verifies; mechanical work streams to the sidekick with live model · turns · tokens · cost. Full logs stay collapsed — expand the tool row or run <code>/fusion trace</code></td></tr>
+      <tr><td><b>6</b></td><td class="desc"><b>Routing (optional)</b> — pick <code>llm</code> / <code>heuristic</code> and auto-apply vs suggest-only in the menu</td></tr>
+      <tr><td><b>7</b></td><td class="desc"><code>/fusion stats</code> — delegation counts, sidekick vs estimated main-only cost, savings %, every routing decision</td></tr>
+      <tr><td><b>8</b></td><td class="desc"><code>/fusion reset</code> — clear sidekick context and session stats · <code>/fusion off</code> — restore your pre-Fusion model</td></tr>
+    </table>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> The <code>sidekick</code> tool</h3>
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>Parameter</th><th>Description</th></tr>
+      <tr><td><span class="cmd violet">task</span></td><td class="desc">The subtask as a <b>standalone brief</b> — exact paths, acceptance criteria (the sidekick can't see the conversation)</td></tr>
+      <tr><td><span class="cmd violet">context</span></td><td class="desc">Extra context the sidekick can't discover itself</td></tr>
+      <tr><td><span class="cmd violet">files</span></td><td class="desc">Files to focus on</td></tr>
+      <tr><td><span class="cmd violet">expect</span></td><td class="desc"><code>summary</code> | <code>diff</code> | <code>evidence</code> | <code>raw</code> — shape of the answer</td></tr>
+      <tr><td><span class="cmd violet">acceptance</span></td><td class="desc">Done-conditions, one per item; the sidekick answers each and the harness tallies them</td></tr>
+      <tr><td><span class="cmd violet">verify</span></td><td class="desc">Up to 5 commands the <b>harness</b> runs after the sidekick finishes (e.g. <code>npm test -- parser</code>) — exit codes decide the verdict</td></tr>
+      <tr><td><span class="cmd violet">background</span></td><td class="desc"><code>true</code> runs in parallel; result delivered when finished. <code>sidekick_wait</code> collects results; a run never settles with background work outstanding</td></tr>
+    </table>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Fusion command reference</h3>
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>Command</th><th>Action</th></tr>
+      <tr><td><span class="cmd violet">/fusion</span></td><td class="desc">Interactive menu: models, sidekick tools, routing, state, stats, task history</td></tr>
+      <tr><td><span class="cmd violet">/fusion main [model]</span> · <span class="cmd violet">/fusion sidekick [model]</span></td><td class="desc">Set the main (frontier) or sidekick (cheap) slot via the Model Picker</td></tr>
+      <tr><td><span class="cmd violet">/fusion mode [strict|balanced|advisory]</span></td><td class="desc">Show or set how strongly the main agent is made to delegate</td></tr>
+      <tr><td><span class="cmd violet">/fusion widget [compact|full|off]</span></td><td class="desc">Compact live meters (default), the detailed view, or hidden</td></tr>
+      <tr><td><span class="cmd violet">/fusion tasks</span> · <span class="cmd violet">/fusion cancel [id|all]</span></td><td class="desc">List background delegations (status, elapsed, files) · cancel them</td></tr>
+      <tr><td><span class="cmd violet">/fusion history [all|main|sidekick]</span></td><td class="desc">Every main-agent request and delegation on the session's branch — survives Fusion off, reset and reload</td></tr>
+      <tr><td><span class="cmd violet">/fusion on</span> · <span class="cmd violet">/fusion off</span></td><td class="desc">Enable (idempotent, re-syncs the session model) · disable and restore your pre-Fusion model</td></tr>
+      <tr><td><span class="cmd violet">/fusion stats</span></td><td class="desc">Session + lifetime cost/savings report with a per-agent token table</td></tr>
+      <tr><td><span class="cmd violet">/fusion trace</span> · <span class="cmd violet">/fusion route</span></td><td class="desc">Dump the latest delegation's log · classify the current task now and apply the routing decision</td></tr>
+      <tr><td><span class="cmd violet">/fusion reset</span></td><td class="desc">Drop the sidekick's context and reset session stats, keeping task history</td></tr>
+      <tr><td><kbd>Ctrl+Shift+D</kbd></td><td class="desc">Open the Fusion menu (rebindable via <code>"shortcut"</code> in <code>~/.pi/agent/fusion.json</code>)</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- ============ STATE ============ -->
+<section id="state">
+  <div class="kicker k-green">reference</div>
+  <h2>Where everything lives</h2>
+  <p class="lead">
+    Per-user configuration lives under <code>~/.pi/agent/</code>; a factory run's artifacts live in the project under
+    <code>.factory/</code> and are meant to be committed with your project.
+  </p>
+
+  <div class="two-col">
+    <div class="card">
+      <h3 class="sub" style="margin-top:0">User-level — <span class="filechip">~/.pi/agent/</span></h3>
+      <div class="tbl-wrap" style="margin:10px 0 0">
+      <table>
+        <tr><th>File</th><th>Holds</th></tr>
+        <tr><td><span class="filechip">model-roles.json</span></td><td class="desc">Role assignments and startup defaults</td></tr>
+        <tr><td><span class="filechip">settings.json</span></td><td class="desc">Default provider/model, per-model reasoning efforts</td></tr>
+        <tr><td><span class="filechip">fusion.json</span></td><td class="desc">Fusion config — main/sidekick slots, routing, limits, delegation policy</td></tr>
+        <tr><td><span class="filechip">fusion-stats.json</span></td><td class="desc">Fusion lifetime cost/savings ledger</td></tr>
+        <tr><td><span class="filechip">factory.json</span></td><td class="desc">Factory answers remembered across projects (team preset, pins, autonomy, research)</td></tr>
+        <tr><td><span class="filechip">factory/roles/*.md</span></td><td class="desc">Optional role overrides — tier, effort, tools, ladder, prompt</td></tr>
+      </table>
+      </div>
+    </div>
+    <div class="card">
+      <h3 class="sub" style="margin-top:0">Project-level — <span class="filechip">&lt;project&gt;/.factory/</span></h3>
+      <div class="tree" style="margin-top:8px">
+├── <span class="f">factory.lock.json</span>   <span class="c"># run lock: phase, tickets, spend, snapshot</span><br>
+├── <span class="f">runs/&lt;runId&gt;.json</span>  <span class="c"># archived runs</span><br>
+├── <span class="f">project.json</span>       <span class="c"># this folder's quick-setup answers</span><br>
+├── <span class="f">brief.md</span>           <span class="c"># your idea, verbatim</span><br>
+├── <span class="d">spec/</span>              <span class="c"># spec.md · decisions · readiness · assumptions</span><br>
+├── <span class="d">research/</span>          <span class="c"># notes.md · brainstorm-&lt;n&gt;.md</span><br>
+├── <span class="d">adr/</span>               <span class="c"># 0001-architecture.md</span><br>
+├── <span class="f">profile.json</span>       <span class="c"># stack, gate commands, manifests</span><br>
+├── <span class="f">tickets.json</span>       <span class="c"># the plan, dependency-ordered</span><br>
+├── <span class="d">reviews/</span>           <span class="c"># reviewer verdicts per ticket attempt</span><br>
+├── <span class="f">report.md</span>          <span class="c"># final report: tickets, cost by role</span><br>
+├── <span class="f">ledger.jsonl</span>       <span class="c"># append-only worker/gate log + traces</span><br>
+├── <span class="d">sessions/</span>          <span class="c"># worker pi sessions — git-ignored</span><br>
+└── <span class="d">worktrees/</span>         <span class="c"># the build worktree — git-ignored</span>
+      </div>
+    </div>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Factory command reference</h3>
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>Command</th><th>Action</th></tr>
+      <tr><td><span class="cmd">/factory new [idea]</span></td><td class="desc">Quick setup, then run the whole flow</td></tr>
+      <tr><td><span class="cmd">/factory status</span> · <span class="cmd">/factory cost</span></td><td class="desc">Where the run is · spend by phase, role, ticket and model, with savings vs an all-frontier team</td></tr>
+      <tr><td><span class="cmd">/factory board</span></td><td class="desc">Ticket board: running, blocked and done</td></tr>
+      <tr><td><span class="cmd">/factory trace [ticket|role]</span></td><td class="desc">Expandable trace of the last worker run — thinking, tool calls, output excerpts</td></tr>
+      <tr><td><span class="cmd">/factory pause</span> · <span class="cmd">/factory resume</span></td><td class="desc">Pause after the current step · continue (also offered automatically when you reopen the project)</td></tr>
+      <tr><td><span class="cmd">/factory doctor [probe]</span></td><td class="desc">Check git, pi, models, team, pi-web-access, toolchains, deploy CLIs — with fixes; probe sends one tool call to each team model</td></tr>
+      <tr><td><span class="cmd">/factory team [balanced|cheap|best|refresh]</span></td><td class="desc">Show or change the team · re-derive from the models you're logged in to now</td></tr>
+      <tr><td><span class="cmd">/factory roles</span></td><td class="desc">Assign a model to any role with the picker's Factory tab</td></tr>
+      <tr><td><span class="cmd">/factory autonomy &lt;preset&gt;</span></td><td class="desc">Switch at any time, even mid-run</td></tr>
+      <tr><td><span class="cmd">/factory settings</span></td><td class="desc">Change the quick-setup answers for this folder</td></tr>
+      <tr><td><span class="cmd">/factory run &lt;role&gt; &lt;brief&gt;</span></td><td class="desc">Run one role once, read-only — try a model, ask the architect</td></tr>
+      <tr><td><span class="cmd">/factory demo</span></td><td class="desc">Build a tiny to-do CLI in a temp folder on <code>auto</code></td></tr>
+    </table>
+  </div>
+
+  <h3 class="sub"><span class="hash">§</span> Under the hood</h3>
+  <div class="tbl-wrap">
+    <table>
+      <tr><th>Module</th><th>Role in the codebase</th></tr>
+      <tr><td><span class="filechip">src/factory/pipeline.ts</span></td><td class="desc">The phase machine driving the 8-phase run</td></tr>
+      <tr><td><span class="filechip">src/factory/runner.ts</span></td><td class="desc">pi worker subprocesses (<code>pi --mode json</code>), persistent sessions per role + ticket</td></tr>
+      <tr><td><span class="filechip">src/factory/guard.ts</span> · <span class="filechip">gates.ts</span> · <span class="filechip">git.ts</span></td><td class="desc">Tool-call guard, gate runner, worktree/branch/merge handling</td></tr>
+      <tr><td><span class="filechip">src/factory/team.ts</span> · <span class="filechip">roles.ts</span></td><td class="desc">Team assembly: tiers, presets, pins, role Markdown, escalation ladders</td></tr>
+      <tr><td><span class="filechip">src/factory/spec-validator.ts</span> · <span class="filechip">readiness.ts</span></td><td class="desc">Machine-checks the spec · readiness checklist scoring for the interview</td></tr>
+      <tr><td><span class="filechip">src/fusion/engine.ts</span></td><td class="desc">The Fusion engine — sidekick lifecycle, verification, routing</td></tr>
+      <tr><td><span class="filechip">src/fusion/policy.ts</span> · <span class="filechip">checks.ts</span></td><td class="desc">Delegation modes, nudges, relax rule · verify-command execution</td></tr>
+      <tr><td><span class="filechip">src/picker/model-picker.ts</span></td><td class="desc">Two-panel TUI, roles, effort picker</td></tr>
+      <tr><td><span class="filechip">src/shared/tiers.ts</span> · <span class="filechip">usage.ts</span></td><td class="desc">Capability ladder · token/cost accounting for every agent</td></tr>
+    </table>
+  </div>
+
+  <div class="note">
+    <b>Developing:</b> <code>npm install</code> → <code>npm run check</code> (typecheck + tests, including real pi workers against a
+    mock model) → run pi with
+    <code>pi -e ./extensions/model-picker/index.ts -e ./extensions/fusion/index.ts -e ./extensions/factory/index.ts</code>.
+    Pi core packages are peer dependencies supplied by pi itself.
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div><span style="font-family:var(--mono)">pi dev team</span> · v2.2.0 · MIT — a factory, a model picker and a Fusion harness for the pi coding agent</div>
+  <div class="fl">
+    <a href="https://github.com/FaceMe/pi-dev-team">github.com/FaceMe/pi-dev-team</a>
+    <a href="https://github.com/badlogic/pi-mono">the pi coding agent</a>
+  </div>
+</footer>
+
+<script>
+  // ---- copy install command ----
+  function copyInstall(btn){
+    const txt = 'pi install git:github.com/FaceMe/pi-dev-team';
+    (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject())
+      .catch(()=>{}).finally(()=>{ btn.textContent='copied ✓'; setTimeout(()=>btn.textContent='copy',1400); });
+  }
+
+  // ---- phase explorer ----
+  const steps = document.querySelectorAll('.step');
+  const panels = document.querySelectorAll('.pd');
+  steps.forEach(s => s.addEventListener('click', () => {
+    const p = s.dataset.p;
+    steps.forEach(x => x.classList.toggle('active', x === s));
+    panels.forEach(x => x.classList.toggle('active', x.dataset.p === p));
+  }));
+
+  // ---- fusion mode tabs ----
+  const tabs = document.querySelectorAll('.mode-tab');
+  const mps = document.querySelectorAll('.mode-panel');
+  tabs.forEach(t => t.addEventListener('click', () => {
+    const m = t.dataset.m;
+    tabs.forEach(x => x.classList.toggle('active', x === t));
+    mps.forEach(x => x.classList.toggle('active', x.dataset.m === m));
+  }));
+
+  // ---- nav active state ----
+  const navLinks = document.querySelectorAll('.navlinks a');
+  const sections = [...navLinks].map(a => document.querySelector(a.getAttribute('href'))).filter(Boolean);
+  const io = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (e.isIntersecting){
+        navLinks.forEach(a => a.classList.toggle('active', a.getAttribute('href') === '#' + e.target.id));
+      }
+    });
+  }, { rootMargin: '-20% 0px -70% 0px' });
+  sections.forEach(s => io.observe(s));
+
+  // ---- autonomy preset contextualises the flow tags ----
+  // default: balanced (spec + build plan approve; build/release show "*")
+</script>
+</body>
+</html>

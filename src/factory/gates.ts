@@ -97,11 +97,16 @@ export function normalizeProfile(raw: any): { profile?: Profile; error?: string 
   }
   if (!gates.some((g) => g.name === "test")) return { error: 'profile needs a "test" gate' };
   const manifests = Array.isArray(raw.manifests) ? raw.manifests.filter((m: unknown) => typeof m === "string") : [];
-  return {
-    profile: {
-      stack: typeof raw.stack === "string" ? raw.stack : "unspecified",
-      gates,
-      manifests: manifests.length > 0 ? manifests : ["package.json", "pyproject.toml", "requirements.txt", "go.mod", "Cargo.toml", "Gemfile", "pom.xml", "build.gradle", "build.gradle.kts", "composer.json"],
-    },
+  const fileNames = (value: unknown): string[] =>
+    Array.isArray(value) ? value.filter((v: unknown) => typeof v === "string" && v.trim() !== "").map((v: string) => v.trim()) : [];
+  const contracts = fileNames(raw.contracts);
+  const adrs = fileNames(raw.adrs);
+  const profile: Profile = {
+    stack: typeof raw.stack === "string" ? raw.stack : "unspecified",
+    gates,
+    manifests: manifests.length > 0 ? manifests : ["package.json", "pyproject.toml", "requirements.txt", "go.mod", "Cargo.toml", "Gemfile", "pom.xml", "build.gradle", "build.gradle.kts", "composer.json"],
   };
+  if (contracts.length > 0) profile.contracts = contracts;
+  if (adrs.length > 0) profile.adrs = adrs;
+  return { profile };
 }

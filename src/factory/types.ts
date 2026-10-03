@@ -174,6 +174,10 @@ export interface Profile {
   gates: GateSpec[];
   /** Files whose change means dependencies must be reinstalled. */
   manifests: string[];
+  /** Contract files under .factory/contracts/ (e.g. "openapi.yaml") that pin the interfaces. */
+  contracts?: string[];
+  /** ADR files under .factory/adr/ ("0001-architecture.md" plus any later decisions). */
+  adrs?: string[];
 }
 
 export interface WorkerRequest {
