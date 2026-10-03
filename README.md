@@ -53,13 +53,20 @@ mkdir habit-tracker && cd habit-tracker && pi
    options. The spec is machine-checked (requirements with Given/When/Then,
    measurable non-functional requirements, traceability) before you see it.
 3. **Spec → architecture → plan** — `.factory/spec/spec.md` (FR/NFR IDs with
-   Given/When/Then), an ADR, a stack profile with gate commands, and a ticket
-   list. You approve per the autonomy preset.
+   Given/When/Then), an ADR and a stack profile with gate commands, plus
+   machine-readable contracts under `.factory/contracts/` (OpenAPI, schema,
+   shared types) as the source of truth for every interface, and a ticket
+   plan recorded as a traceability matrix (`.factory/traceability.json`
+   links every requirement to the tickets covering it). You approve per the
+   autonomy preset.
 4. **Build** — a walking skeleton first, then each ticket test-first in a git
    worktree (`factory/<run>` branch). Gates (install/build/typecheck/lint/test)
    are run by the factory, not claimed by the agent; a reviewer from a
    different model family approves each ticket. Failures retry with feedback,
-   then escalate to a stronger model, then ask you.
+   then escalate to a stronger model, then ask you. The plan also gives
+   tickets that could run at the same time disjoint write scopes, so
+   independent tickets can build in parallel without touching each other's
+   files.
 5. **Docs and release** — README, architecture notes, `AGENTS.md`, CHANGELOG;
    the branch is merged into yours when the gates pass; `.factory/report.md`
    lists tickets and cost by role.
@@ -88,17 +95,18 @@ How it works:
 - **Guard rails inside every worker**: `edit`/`write` outside the ticket's
   write scope are blocked, and so are `git push`/commit, `sudo`, publishing,
   piped remote scripts, and deploy commands (unless you approved a deploy).
-  The factory also reverts any out-of-scope change before running gates.
+  The factory also reverts any out-of-scope change before running gates, and
+  planning itself keeps parallel tickets' write scopes disjoint.
 - **Headless**: without a UI (print/JSON/RPC mode) `/factory new` accepts the
   prefilled answers and runs to completion.
 - **Roles are Markdown** — override any role (tier, effort, tools, prompt) in
   `~/.pi/agent/factory/roles/<role>.md`.
 
 Project state lives in `.factory/` (the run lock `factory.lock.json`, spec,
-ADRs, profile, tickets, reviews, ledger, report; worker sessions and the
-worktree are git-ignored). A paused run survives a pi restart: the lock carries
-the phase, tickets, spend and a settings snapshot, and pi offers to resume when
-you open the project. See
+contracts, ADRs, profile, tickets, traceability matrix, reviews, ledger,
+report; worker sessions and the worktree are git-ignored). A paused run
+survives a pi restart: the lock carries the phase, tickets, spend and a
+settings snapshot, and pi offers to resume when you open the project. See
 [docs/software-factory-plan.md](docs/software-factory-plan.md) for the design
 and roadmap.
 

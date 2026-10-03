@@ -15,11 +15,22 @@ the [plan](software-factory-plan.md).
    ideas get one round), then the researcher adds notes if web research is on.
 2. **spec** — the analyst writes `.factory/spec/spec.md` (FR/NFR IDs with
    Given/When/Then); you approve it or request changes.
-3. **architecture** — the architect writes an ADR and a stack profile
-   (`.factory/profile.json`) with the gate commands (install, build,
-   typecheck, lint, test).
+3. **architecture** — the architect writes `.factory/adr/0001-architecture.md`
+   and a stack profile (`.factory/profile.json`) with the gate commands
+   (install, build, typecheck, lint, test), starting from the closest of the
+   built-in stack templates (`node-ts-api`, `react-vite`, `python-fastapi`)
+   rather than inventing commands. Significant standalone decisions (storage,
+   auth, a new runtime dependency) get their own numbered ADR
+   (`0002-<slug>.md`, …), and when the spec describes an API, UI or data
+   surface the architect must also write machine-readable contracts under
+   `.factory/contracts/` (`openapi.yaml` or a typed `api.ts`, `schema.sql`,
+   shared types) as the source of truth for every interface — the factory
+   verifies each listed contract and ADR file actually exists.
 4. **planning** — the planner produces a dependency-ordered ticket list
-   (`.factory/tickets.json`).
+   (`.factory/tickets.json`) whose graph must pass machine checks (every FR
+   covered, dependencies acyclic, parallel tickets' write scopes disjoint),
+   and a requirement → tickets matrix (`.factory/traceability.json`). See
+   [Planning and traceability](#planning-and-traceability).
 5. **skeleton** — a git worktree on branch `factory/<run>`, where the devops
    role builds a walking skeleton that must pass the gates.
 6. **build** — each ticket is built test-first by its role's worker; the
@@ -38,11 +49,125 @@ the [plan](software-factory-plan.md).
 | Preset | You approve |
 |---|---|
 | `auto` | The spec. Everything else runs through to release. |
-| `balanced` (default) | The spec, then one build-plan screen (stack, tickets, budget). |
+| `balanced` (default) | The spec, then one build-plan screen (stack, contracts, tickets, traceability, budget). |
 | `careful` | Every gate: spec, architecture, build plan, each ticket commit, and the merge. |
 
 In every preset the budget breaker and genuine blockers still stop and ask
 you, and `/factory pause` works at any time.
+
+## Planning and traceability
+
+The architecture and the plan are data the factory verifies, not prose it
+hopes is right.
+
+**Contracts before code.** When the spec describes an API, UI or data
+surface, the architect must write at least one machine-readable contract
+under `.factory/contracts/` — an API spec (`openapi.yaml` or a typed
+`api.ts`), a data schema (`schema.sql` or typed models), shared types — the
+smallest set that pins every interface. The profile lists those files under
+`contracts` (and its ADRs under `adrs`), and the factory rejects the
+architect's reply if a listed file was not actually written (plain file names
+only). The skeleton step copies the spec, every ADR and every contract into
+the build worktree as `docs/spec.md`, `docs/adr/` and `docs/contracts/`, and
+the planner is told to schedule foundation tickets that implement the
+contracts first, so dependent tickets build against them instead of guessing
+interfaces.
+
+**The ticket graph.** The planner's reply is validated by the factory; every
+error goes back to the planner (in the same session) until the plan passes:
+
+- every functional requirement in the spec is covered by at least one ticket
+  — `requirements not covered by any ticket: FR-004` is an error; an
+  uncovered NFR is only a warning;
+- dependencies point at earlier tickets that exist, are listed once, and form
+  no cycle — `ticket dependency cycle: T-002 → T-003 → T-002` (or
+  `T-003 depends on itself`) is an error;
+- **parallel tickets never share a write scope.** Two tickets neither of
+  which transitively depends on the other could run at the same time, so
+  their `writeScope` globs must be disjoint — identical globs, a `**`
+  catch-all, or one glob being a path prefix of the other (after stripping a
+  trailing `/**`) all conflict: `T-004 and T-006 run in parallel but share
+  write scope web/src/** (make scopes disjoint or add a dependency)` is an
+  error that forces a re-plan. Disjoint scopes are what let independent
+  tickets build in parallel, each worker certain no other ticket touches its
+  files; tickets that must touch the same files are sequenced with a
+  dependency instead;
+- duplicate ticket ids, missing briefs or write scopes, and dependencies
+  that do not exist or point at later tickets are errors; unknown roles,
+  repeated dependency listings, tickets covering no requirement ids and
+  plans over 40 tickets are warnings.
+
+**The build-plan screen** (`balanced` and `careful`; skipped on `auto`) puts
+the whole plan on one screen before any code is written — the stack, the
+contract files, every gate with its exact command, the tickets in execution
+order, a traceability line, the planner's warnings, the spend so far and
+where the architecture lives:
+
+```text
+Stack: TypeScript 5 + Node 22 (Express) + Vitest
+Contracts: .factory/contracts/openapi.yaml, .factory/contracts/schema.sql
+Gates: install (`npm install`), build (`npm run build`), typecheck (`npx tsc --noEmit`), lint (`npx eslint .`), test (`npm test -- --run`)
+4 tickets:
+  T-001 habits REST API + SQLite schema [backend]
+  T-002 habit board web UI [frontend]
+  T-003 weekly streak view [frontend]
+  T-004 README and API reference [docs]
+traceability: 3/3 functional requirements covered
+! T-004 covers no requirement ids
+! non-functional requirements not covered by any ticket: NFR-002
+Budget: $0.42/$5.00 spent so far.
+Architecture: .factory/adr/0001-architecture.md
+```
+
+Approve it, *Change the tickets…*, or *Change the architecture…* (which
+re-runs the architect and re-plans against the updated ADR).
+
+**The traceability matrix.** Planning writes `.factory/traceability.json` —
+one row per requirement in the spec (FRs first, then NFRs, in numeric
+order), each listing the tickets that cover it, plus a `complete` flag that
+is true when every functional requirement has a ticket:
+
+```json
+{
+  "version": 1,
+  "complete": true,
+  "requirements": [
+    {
+      "requirement": "FR-001",
+      "tickets": [
+        "T-001"
+      ]
+    },
+    {
+      "requirement": "FR-002",
+      "tickets": [
+        "T-001",
+        "T-002"
+      ]
+    },
+    {
+      "requirement": "FR-003",
+      "tickets": [
+        "T-003"
+      ]
+    },
+    {
+      "requirement": "NFR-001",
+      "tickets": [
+        "T-001"
+      ]
+    },
+    {
+      "requirement": "NFR-002",
+      "tickets": []
+    }
+  ]
+}
+```
+
+`complete` tracks functional requirements only — an NFR with no tickets
+(the `NFR-002` row above) is the planner warning on the build-plan screen,
+not a broken matrix.
 
 ## Commands
 
@@ -261,9 +386,11 @@ Pins, presets and role files combine like this:
 ├── brief.md             # your idea, verbatim
 ├── spec/                # spec.md, decisions.md (interview), assumptions.md
 ├── research/            # notes.md from the researcher
-├── adr/                 # 0001-architecture.md
-├── profile.json         # stack, gate commands, dependency manifests
+├── adr/                 # 0001-architecture.md, then 0002-<slug>.md … per decision
+├── contracts/           # openapi.yaml, schema.sql, shared types — interface source of truth
+├── profile.json         # stack, gate commands, dependency manifests, contract/ADR lists
 ├── tickets.json         # the plan, dependency-ordered
+├── traceability.json    # requirement → tickets matrix, written at planning
 ├── reviews/             # reviewer verdicts per ticket attempt
 ├── report.md            # final report: tickets, cost by role, notes
 ├── ledger.jsonl         # append-only worker/gate log (usage, cost, traces)
@@ -273,8 +400,8 @@ Pins, presets and role files combine like this:
 ```
 
 Everything except `sessions/`, `worktrees/` and `*.tmp` is meant to be
-committed with your project — spec, tickets, reviews, ledger and report are
-part of the run's history. Remembered *answers* live outside the repo:
+committed with your project — spec, contracts, tickets, reviews, ledger and
+report are part of the run's history. Remembered *answers* live outside the repo:
 team preset, pins, autonomy and research in `~/.pi/agent/factory.json` (every
 project), the rest per folder in `project.json`.
 

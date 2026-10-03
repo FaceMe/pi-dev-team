@@ -11,7 +11,7 @@ It builds on the ideas in Cognition's
 [Devin Fusion](https://cognition.com/blog/devin-fusion) post, which the existing
 `fusion` extension already implements in part.
 
-- Status: **M0–M3 implemented** (see [Implementation status](#implementation-status)); M4–M7 planned
+- Status: **M0–M4 implemented** (see [Implementation status](#implementation-status)); M5–M7 planned
 - Scope: this repository (pi extension package)
 - Last updated: 2026-10-03
 
@@ -25,9 +25,10 @@ It builds on the ideas in Cognition's
 | M1 quick-start slice | Done | `/factory` with quick setup, automatic team from any provider, interview, spec, architecture, plan, skeleton, test-first build with gates and cross-family review, escalation, docs, merge, report, budget breaker, pause/resume, doctor, demo, headless mode |
 | M2 resume, board and cost | Done | Run state moved to `.factory/factory.lock.json` (M1's `state.json` is migrated on first load) with normalization of damaged state, an archived-runs folder (`runs/`), and a run-scoped settings snapshot applied on resume (the team still follows current logins). Session start offers to resume. Live board widget, `/factory board`, `/factory trace [ticket\|role]`, `/factory roles` (picker Factory tab), `/factory cost` per phase/role/ticket/model with an estimated all-frontier savings line. Ledger entries carry `runId`, input/output token split and bounded traces; skeleton phase resumes without re-prompting a worker when the gates already pass |
 | M3 discovery depth | Done | Readiness checklist scoring (§9.3) ends the interview when no topic is unknown; `spec/readiness.md` and pipeline-derived `spec/assumptions.md`; `factory_brainstorm`-style multi-model fan-out (analyst-triggered, ≤2 per run, distinct families, divergent/critical/pragmatic stances + synthesis into `research/brainstorm-<n>.md`); spec validator (§9.4) fed back into the analyst at the spec gate |
-| M4–M7 | Planned | Profile templates, QA role, parallel tickets (planning exists; parallel build arrives in M5), deploy hardening, benchmarks |
+| M4 architecture, contracts, planning | Done | Stack-profile template library (`node-ts-api`, `react-vite`, `python-fastapi`) the architect starts from; contracts under `.factory/contracts/` as the interface source of truth (required for API/UI specs, validated, copied into the build worktree next to all ADRs; numbered ADRs supported); planner hardening — dependency cycles rejected, write scopes of parallel tickets must be disjoint, FR coverage enforced, NFR coverage warned; `.factory/traceability.json` and a coverage line on the build-plan screen |
+| M5–M7 | Planned | Parallel ticket execution with the scheduler, QA role, deploy hardening, benchmarks |
 
-Verification: 248 tests across 19 files, including the whole pipeline with
+Verification: 284 tests across 21 files, including the whole pipeline with
 **real `pi` worker processes** against a mock OpenAI-compatible model, and the
 real `/factory new` command run headless in a pi session.
 
@@ -49,6 +50,25 @@ M3 decisions (discovery depth):
   measurable NFRs, traceability) runs after each analyst attempt and its issues
   are fed back as feedback; a persistently failing spec continues to the
   approval gate with a warning rather than killing the run.
+
+M4 decisions (architecture, contracts, planning):
+
+- **Templates are prompts, not overrides.** The profile template library
+  (`src/factory/profiles.ts`) is injected into the architect's brief to start
+  from; the architect still owns the final profile and the gates remain
+  whatever it wrote and the pipeline validated.
+- **Contracts are validated, not trusted.** The architect's reply lists the
+  contract and ADR files it wrote; the pipeline checks they exist (plain file
+  names only) and demands at least one contract when the spec describes an
+  API/UI/data surface. Contracts and all ADRs are copied into the build
+  worktree (`docs/contracts/`, `docs/adr/`) so builders implement against them.
+- **Scope disjointness is a planning error.** Two tickets that could run in
+  parallel (no transitive dependency either way) may not have overlapping write
+  scopes — the overlap is detected on the globs and forces a re-plan, which is
+  what will make M5's parallel scheduler safe. Cycles, nonexistent dependencies
+  and uncovered FRs are likewise errors; NFR coverage and duplicate deps are
+  warnings. `.factory/traceability.json` (requirement → tickets) is written at
+  planning and its coverage line appears on the build-plan screen.
 
 Decisions made while building M2:
 

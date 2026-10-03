@@ -34,6 +34,7 @@ import {
 } from "./git.js";
 import { extractJson } from "./json-reply.js";
 import { requirementIds, validatePlan } from "./plan.js";
+import { matchProfileTemplates, templatesForPrompt } from "./profiles.js";
 import type { BrainstormStance } from "./prompts.js";
 import * as prompts from "./prompts.js";
 import { READINESS_LABELS, isReady, normalizeReadiness, readinessMarkdown } from "./readiness.js";
@@ -44,6 +45,7 @@ import type { SpecValidation } from "./spec-validator.js";
 import type { FactoryStore } from "./store.js";
 import { escalate } from "./team.js";
 import type { Team } from "./team.js";
+import { buildTraceability, traceabilityJson, traceabilitySummary } from "./traceability.js";
 import type {
   Answer,
   FactoryState,
@@ -736,22 +738,39 @@ Work only inside the current working directory.`;
 
   private async designArchitecture(feedback?: string): Promise<Profile> {
     const { deps } = this;
+    const spec = deps.store.read("spec/spec.md") ?? "";
+    const templateBlock = templatesForPrompt(matchProfileTemplates(deps.answers.stack === "auto" ? "" : deps.answers.stack, spec));
     const profile = await this.workJson<Profile>(
       "architect",
       {
         prompt: prompts.architecturePrompt({
           settings: deps.answers,
+          specPath: ".factory/spec/spec.md",
           researchPath: deps.store.read("research/notes.md") ? ".factory/research/notes.md" : undefined,
+          templates: templateBlock || undefined,
           feedback,
         }),
         cwd: deps.cwd,
         session: "architect",
-        writeScope: [".factory/adr/**"],
+        writeScope: [".factory/adr/**", ".factory/contracts/**"],
       },
       (value) => {
         const res = normalizeProfile(value);
         if (res.error) return { error: res.error };
+        if (!res.profile) return { error: "profile is not an object" };
         if (!deps.store.read("adr/0001-architecture.md")) return { error: "write .factory/adr/0001-architecture.md before replying" };
+        const badName = (name: string) => !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name);
+        const contracts = res.profile.contracts ?? [];
+        if (contracts.some(badName)) return { error: "contracts must be plain file names under .factory/contracts/ (no paths)" };
+        const missingContracts = contracts.filter((name) => !deps.store.read(`contracts/${name}`));
+        if (missingContracts.length) return { error: `the reply lists contract files you did not write: ${missingContracts.join(", ")}` };
+        const adrs = (res.profile.adrs ?? []).filter((name) => name !== "0001-architecture.md");
+        if (adrs.some(badName)) return { error: "adrs must be plain file names under .factory/adr/ (no paths)" };
+        const missingAdrs = adrs.filter((name) => !deps.store.read(`adr/${name}`));
+        if (missingAdrs.length) return { error: `the reply lists ADR files you did not write: ${missingAdrs.join(", ")}` };
+        if (!contracts.length && /\b(api|rest|graphql|endpoint|http|web app|web ui|frontend|database|schema)\b/i.test(spec)) {
+          return { error: 'the spec describes an API/UI/data surface: write at least one contract file under .factory/contracts/ and list it as "contracts"' };
+        }
         return { value: res.profile };
       },
     );
@@ -765,28 +784,36 @@ Work only inside the current working directory.`;
     for (;;) {
       const profile = deps.store.loadProfile();
       if (!profile) throw new StopRun("failed", "No stack profile found; run the architecture phase again.");
+      let planWarnings: string[] = [];
       if (state.tickets.length === 0 || feedback) {
         const ids = requirementIds(deps.store.read("spec/spec.md") ?? "");
         const tickets = await this.workJson<Ticket[]>(
           "planner",
-          { prompt: prompts.planningPrompt({ profile, feedback }), cwd: deps.cwd, session: "planner", writeScope: [] },
+          { prompt: prompts.planningPrompt({ profile, feedback, contracts: profile.contracts }), cwd: deps.cwd, session: "planner", writeScope: [] },
           (value) => {
             const check = validatePlan(value, ids);
+            planWarnings = check.warnings;
             return check.errors.length ? { error: check.errors.join("; ") } : { value: check.tickets };
           },
         );
         state.tickets = orderTickets(tickets);
         deps.store.write("tickets.json", JSON.stringify(state.tickets, null, 2));
+        deps.store.write("traceability.json", traceabilityJson(buildTraceability(state.tickets, ids)));
         this.save();
       }
       if (this.autonomy === "auto") return;
 
+      const coverage = traceabilitySummary(buildTraceability(state.tickets, requirementIds(deps.store.read("spec/spec.md") ?? "")));
       const summary = [
         `Stack: ${profile.stack}`,
+        profile.contracts?.length ? `Contracts: ${profile.contracts.map((c) => `.factory/contracts/${c}`).join(", ")}` : "",
         `Gates: ${profile.gates.map((g) => `${g.name} (\`${g.command}\`)`).join(", ")}`,
         `${state.tickets.length} tickets:`,
         ...state.tickets.slice(0, 15).map((t) => `  ${t.id} [${t.role}] ${t.title}`),
         state.tickets.length > 15 ? `  … and ${state.tickets.length - 15} more (.factory/tickets.json)` : "",
+        coverage,
+        ...planWarnings.slice(0, 4).map((w) => `! ${w}`),
+        planWarnings.length > 4 ? `! … and ${planWarnings.length - 4} more planner warnings` : "",
         `Budget: ${this.budgetLine()} spent so far.`,
         "Architecture: .factory/adr/0001-architecture.md",
       ].filter(Boolean).join("\n");
@@ -824,16 +851,24 @@ Work only inside the current working directory.`;
 
   private copyDocsInto(worktree: string): void {
     const { store } = this.deps;
-    const copies: Array<[string, string]> = [
-      ["spec/spec.md", "docs/spec.md"],
-      ["adr/0001-architecture.md", "docs/adr/0001-architecture.md"],
-    ];
+    const copies: Array<[string, string]> = [["spec/spec.md", "docs/spec.md"]];
+    for (const name of this.listFiles("adr")) copies.push([`adr/${name}`, `docs/adr/${name}`]);
+    for (const name of this.listFiles("contracts")) copies.push([`contracts/${name}`, `docs/contracts/${name}`]);
     for (const [from, to] of copies) {
       const text = store.read(from);
       if (!text) continue;
       const target = path.join(worktree, to);
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.writeFileSync(target, text);
+    }
+  }
+
+  /** File names in a .factory/ subdirectory ([] when it does not exist). */
+  private listFiles(rel: string): string[] {
+    try {
+      return fs.readdirSync(this.deps.store.path(rel)).filter((name) => !name.startsWith("."));
+    } catch {
+      return [];
     }
   }
 

@@ -218,8 +218,21 @@ FR-xxx and NFR-xxx id whose requirement is not itself the problem. Write the
 corrected .factory/spec/spec.md, then reply with a short summary.`;
 }
 
-export function architecturePrompt(args: { settings: SetupAnswers; researchPath?: string; feedback?: string }): string {
+export function architecturePrompt(args: {
+  settings: SetupAnswers;
+  /** Path to the approved spec; defaults to .factory/spec/spec.md. */
+  specPath?: string;
+  /** Block from templatesForPrompt; omit when no template fits. */
+  templates?: string;
+  researchPath?: string;
+  feedback?: string;
+}): string {
   const existing = args.settings.projectMode === "existing";
+  const specPath = args.specPath ?? ".factory/spec/spec.md";
+  const templateBlock = args.templates?.trim() ?? "";
+  const templates = templateBlock
+    ? `${templateBlock}\n\nIf one of these fits the chosen stack, start from its gates and manifests and adjust them to the project rather than inventing commands.\n`
+    : "";
   const base = args.feedback
     ? `The user asked for changes to the architecture:
 
@@ -227,17 +240,29 @@ export function architecturePrompt(args: { settings: SetupAnswers; researchPath?
 ${args.feedback}
 </feedback>
 
-Update .factory/adr/0001-architecture.md and reply with the full updated JSON profile.`
-    : `Design the architecture for the project specified in .factory/spec/spec.md.
+Update .factory/adr/0001-architecture.md — and the contracts under
+.factory/contracts/ or any later ADR the feedback affects — then reply with
+the full updated JSON profile (including "contracts" and "adrs").`
+    : `Design the architecture for the project specified in ${specPath}.
 ${args.researchPath ? `Research notes are in ${args.researchPath}.\n` : ""}
 ${existing ? "This is an EXISTING codebase in the working directory: inspect it first and keep its stack, layout, tooling and scripts unless the spec requires otherwise." : "The working directory is a new, empty project."}
 Stack preference: ${args.settings.stack === "auto" ? "none — choose what fits best" : args.settings.stack}
 Deployment: ${args.settings.deploy === "none" ? "local only" : args.settings.deploy === "config" ? "include a Dockerfile and CI; the user deploys" : `will be deployed to ${args.settings.deployTarget}`}
 
-Write .factory/adr/0001-architecture.md with: Context, Decision (stack with
+${templates}Write .factory/adr/0001-architecture.md with: Context, Decision (stack with
 versions, directory layout, module boundaries, data model, API/CLI surface,
 error handling, logging, testing approach), Conventions (naming, structure),
-Consequences, and Alternatives considered.`;
+Consequences, and Alternatives considered. Record any further significant
+standalone decision (storage, auth, a new runtime dependency) as its own
+numbered ADR under .factory/adr/ — 0002-<slug>.md, 0003-<slug>.md, … — rather
+than growing 0001.
+
+When the project has an API, data or shared-type surface, write the contract
+files under .factory/contracts/ as the source of truth the builders implement
+against: an API spec (openapi.yaml or a typed api.ts), a data schema
+(schema.sql or typed models), shared types — the smallest set that pins every
+interface. When it has no such surface (for example a pure CLI), write no
+contracts.`;
 
   return `${base}
 
@@ -254,14 +279,19 @@ non-interactive, and must exit non-zero on failure:
     "lint": "npm run lint",
     "test": "npm test"
   },
-  "manifests": ["package.json"]
+  "manifests": ["package.json"],
+  "contracts": ["openapi.yaml"],
+  "adrs": ["0001-architecture.md"]
 }
 \`\`\`
 Include only gates the stack actually has; "install" and "test" are required.
-"manifests" lists the dependency files whose change requires re-running install.`;
+"manifests" lists the dependency files whose change requires re-running install.
+"contracts" lists the exact file names you wrote under .factory/contracts/;
+omit it when there are none. "adrs" lists every ADR file name under
+.factory/adr/, starting with 0001-architecture.md.`;
 }
 
-export function planningPrompt(args: { profile: Profile; feedback?: string; errors?: string[] }): string {
+export function planningPrompt(args: { profile: Profile; contracts?: string[]; feedback?: string; errors?: string[] }): string {
   if (args.errors?.length) {
     return `Your ticket plan had problems:
 ${bullet(args.errors)}
@@ -269,11 +299,14 @@ ${bullet(args.errors)}
 Reply again with the corrected complete plan as one fenced json block.`;
   }
   const feedback = args.feedback ? `\nThe user asked for these changes to the previous plan:\n<feedback>\n${args.feedback}\n</feedback>\n` : "";
+  const contracts = args.contracts?.length
+    ? `\nContracts (source of truth for every interface): ${args.contracts.map((c) => `.factory/contracts/${c}`).join(", ")}. Foundation tickets implement these contracts first; dependent tickets build against them rather than guessing interfaces.\n`
+    : "";
   return `Plan the build for the project in .factory/spec/spec.md, following the
 architecture in .factory/adr/0001-architecture.md.
 Stack: ${args.profile.stack}
 Gates: ${args.profile.gates.map((g) => `${g.name}: \`${g.command}\``).join("; ")}
-${feedback}
+${contracts}${feedback}
 A separate skeleton step already creates the project scaffold, tooling, CI and
 a passing empty test suite — do not plan that. Plan the feature work as small,
 ordered tickets. Each ticket must leave every gate passing.
