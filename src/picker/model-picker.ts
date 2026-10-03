@@ -61,7 +61,14 @@
  *        Press '5' : Quick-switch to Fusion Sidekick model.
  *    - Full two-panel picker with in-picker effort picking replaces separate selectors.
  *
- * 5. Clean Shutdown (/exit):
+ * 5. Quick Slots (top 8 popular / recently used models):
+ *    - Alt+1 … Alt+8 (anywhere in pi, and inside the picker): switch straight to quick
+ *      slot N with the reasoning effort last used with that model.
+ *    - Picker shows a "Quick" ribbon with the slots; /quick [n] lists or switches.
+ *    - Ranking is frecency (use count decayed with a one-week half-life), padded with
+ *      roles, Fusion slots and the default model. Stored in model-usage.json.
+ *
+ * 6. Clean Shutdown (/exit):
  *    - /exit : Gracefully shuts down Pi via ctx.shutdown().
  *             (/quit is a pi built-in and is intentionally not re-registered here.)
  */
@@ -96,6 +103,14 @@ import {
   updateFusionConfig,
 } from "../shared/config.js";
 import type { FusionConfig, FusionSlot, ModelRolesState, RoleConfig } from "../shared/config.js";
+import {
+  loadModelUsage,
+  QUICK_SLOT_COUNT,
+  rankQuickModels,
+  recordModelEffort,
+  recordModelUse,
+} from "../shared/recents.js";
+import { refKey } from "../shared/models.js";
 
 export {
   getModelThinkingLevel,
@@ -363,6 +378,70 @@ export function getEffectiveModelEffort(
   return clampThinkingLevel(model, "medium") as ThinkingLevel;
 }
 
+// --- Quick Slots (Alt+1 … Alt+8) ---
+
+export interface QuickSlot {
+  model: Model<any>;
+  effort: ThinkingLevel;
+}
+
+/**
+ * The top QUICK_SLOT_COUNT models by frecency (then roles / Fusion / default),
+ * each with the effort last used with it, clamped to what the model supports.
+ */
+export function resolveQuickSlots(
+  ctx: ExtensionContext | ExtensionCommandContext,
+  rolesState: ModelRolesState = loadRolesState(),
+  fusionConfig: FusionConfig = loadFusionConfig()
+): QuickSlot[] {
+  const usage = loadModelUsage().models;
+  const refs = rankQuickModels((ref) => !!ctx.modelRegistry.find(ref.provider, ref.modelId));
+  return refs.map((ref) => {
+    const model = ctx.modelRegistry.find(ref.provider, ref.modelId)!;
+    const lastEffort = usage[refKey(ref)]?.effort ?? ref.effort;
+    const effort = !isReasoningModel(model)
+      ? "off"
+      : lastEffort
+      ? (clampThinkingLevel(model, lastEffort as any) as ThinkingLevel)
+      : getEffectiveModelEffort(model, undefined, undefined, rolesState, fusionConfig);
+    return { model, effort };
+  });
+}
+
+/** Switch the session to a quick slot's model and effort. Returns false when nothing switched. */
+export async function switchToQuickSlot(
+  ctx: ExtensionContext | ExtensionCommandContext,
+  pi: ExtensionAPI,
+  slot: QuickSlot | undefined,
+  index: number
+): Promise<boolean> {
+  if (!slot) {
+    ctx.ui.notify(
+      `Quick slot ${index + 1} is empty. Switch models a few times (or set roles in /models) to fill it.`,
+      "warning"
+    );
+    return false;
+  }
+  const { model, effort } = slot;
+  const ok = await pi.setModel(model);
+  if (!ok) {
+    ctx.ui.notify(`Failed to switch to ${model.provider}/${model.id}: No valid authentication found.`, "error");
+    return false;
+  }
+  if (isReasoningModel(model)) {
+    pi.setThinkingLevel(effort);
+    saveModelThinkingLevel(model.provider, model.id, effort);
+    recordModelEffort(model.provider, model.id, effort);
+  }
+  const effortText = isReasoningModel(model) ? ` (effort: ${effort.toUpperCase()})` : "";
+  ctx.ui.notify(`Switched to [Quick ${index + 1}]: ${model.provider}/${model.id}${effortText}`, "info");
+  return true;
+}
+
+function formatQuickSlot(slot: QuickSlot): string {
+  return isReasoningModel(slot.model) ? `${slot.model.id} (${slot.effort})` : slot.model.id;
+}
+
 // --- Text & Formatting Helpers ---
 
 function bold(text: string): string {
@@ -472,6 +551,7 @@ export class SplitModelPickerComponent {
   private isSearchMode: boolean = false;
 
   private rolesState: ModelRolesState;
+  private quickSlots: QuickSlot[] = [];
   private statusFlash: string = "";
   private flashTimeout?: NodeJS.Timeout;
 
@@ -507,6 +587,7 @@ export class SplitModelPickerComponent {
 
     this.rolesState = loadRolesState();
     this.fusionConfig = loadFusionConfig();
+    this.quickSlots = resolveQuickSlots(ctx, this.rolesState, this.fusionConfig);
 
     const currentModel = ctx.model;
     this.allProviders = buildProviderGroups(ctx, currentModel);
@@ -884,6 +965,14 @@ export class SplitModelPickerComponent {
 
     // --- Normal Two-Panel Picker Input Handling ---
 
+    // 0. Alt+1 … Alt+8: jump straight to a quick slot (works in search mode too)
+    for (let i = 0; i < QUICK_SLOT_COUNT; i++) {
+      if (matchesKey(data, Key.alt(String(i + 1) as "1"))) {
+        void this.selectQuickSlot(i);
+        return;
+      }
+    }
+
     // 1. ESC: Clear search, return to the role list (chooser), or exit
     if (matchesKey(data, Key.escape)) {
       if (this.isSearchMode || this.searchQuery.length > 0) {
@@ -1139,6 +1228,23 @@ export class SplitModelPickerComponent {
     }
   }
 
+  private async selectQuickSlot(index: number): Promise<void> {
+    const slot = this.quickSlots[index];
+    if (!slot) {
+      this.setFlash(`Quick slot ${index + 1} is empty. It fills up as you switch models.`);
+      this.tui.requestRender();
+      return;
+    }
+    if (this.options.target === "session" || this.options.applyToSession) {
+      if (!(await switchToQuickSlot(this.ctx, this.pi, slot, index))) {
+        this.setFlash(`Failed to switch to ${slot.model.id}: No API key configured.`);
+        this.tui.requestRender();
+        return;
+      }
+    }
+    this.completeSelection(slot.model, slot.effort);
+  }
+
   private async quickSwitchRole(roleKey: "daily" | "small" | "frontier"): Promise<void> {
     const role = this.rolesState.roles[roleKey];
     if (!role) {
@@ -1323,6 +1429,17 @@ export class SplitModelPickerComponent {
 
     const fusionRibbon = ` ${this.theme.fg("muted", "Fusion:")} ${fusionStateStr}  ${this.theme.fg("warning", "[m/4: 🔮 Main]")} ${fMainStr}  ${this.theme.fg("accent", "[k/5: ⚡ Sidekick]")} ${fSideStr}`;
     lines.push("│" + pad(fusionRibbon, innerWidth) + "│");
+
+    // Quick Slots Ribbon row (Alt+1 … Alt+8)
+    const quickItems = this.quickSlots.map((slot, i) => {
+      const isActive = activeModel && modelsAreEqual(activeModel, slot.model);
+      const label = formatQuickSlot(slot);
+      return `${this.theme.fg("accent", `⌥${i + 1}`)} ${isActive ? this.theme.fg("success", label) : label}`;
+    });
+    const quickRibbon = ` ${this.theme.fg("muted", "Quick:")} ${
+      quickItems.length > 0 ? quickItems.join("  ") : this.theme.fg("dim", "fills up as you switch models")
+    }`;
+    lines.push("│" + pad(quickRibbon, innerWidth) + "│");
 
     // Search bar if search mode or active query
     if (this.isSearchMode || this.searchQuery.length > 0) {
@@ -1618,7 +1735,7 @@ export class SplitModelPickerComponent {
       } else if (this.options.target === "fusion-sidekick") {
         helpBar = ` [←/→] Panel  [↑/↓] Move  [Enter] Select Sidekick  [e] Effort  [Space] Select with Effort  [/] Search  [Tab] ${filterState}  [Esc] Cancel`;
       } else {
-        helpBar = ` [←/→] Panel  [↑/↓] Move  [Enter] Select  [e] Effort  [d/s/f] Role  [m/k] Fusion  [1-5] Switch  [/] Search  [Tab] ${filterState}  [Esc] Close`;
+        helpBar = ` [←/→] Panel  [↑/↓] Move  [Enter] Select  [e] Effort  [d/s/f] Role  [m/k] Fusion  [1-5] Switch  [Alt+1-8] Quick  [/] Search  [Tab] ${filterState}  [Esc] Close`;
       }
       lines.push("│" + pad(this.theme.fg("dim", helpBar), innerWidth) + "│");
     }
@@ -2133,6 +2250,17 @@ export default function (pi: ExtensionAPI) {
   // Track model switches to provide accurate argument completions
   pi.on("model_select", (event) => {
     activeModelTracked = event.model;
+    // Only explicit switches count towards the quick slots: session restores are
+    // not a choice, and Ctrl+P cycling would count every model it passes through.
+    if (event.source === "set") {
+      const effort = isReasoningModel(event.model) ? (pi.getThinkingLevel() as ThinkingLevel) : undefined;
+      recordModelUse(event.model.provider, event.model.id, effort);
+    }
+  });
+
+  pi.on("thinking_level_select", (event, ctx) => {
+    const model = ctx.model ?? activeModelTracked;
+    if (model && isReasoningModel(model)) recordModelEffort(model.provider, model.id, event.level as ThinkingLevel);
   });
 
   // 1. /exit command to exit Pi cleanly.
@@ -2320,4 +2448,60 @@ export default function (pi: ExtensionAPI) {
       await openModelPicker(ctx, pi);
     },
   });
+
+  // 7. Quick slots: Alt+1 … Alt+8 and /quick [n]
+  for (let i = 0; i < QUICK_SLOT_COUNT; i++) {
+    pi.registerShortcut(Key.alt(String(i + 1) as "1"), {
+      description: `Switch to quick model slot ${i + 1}`,
+      handler: async (ctx) => {
+        await switchToQuickSlot(ctx, pi, resolveQuickSlots(ctx)[i], i);
+      },
+    });
+  }
+
+  pi.registerCommand("quick", {
+    description: "Switch to one of your top 8 popular / recently used models (also Alt+1 … Alt+8)",
+    getArgumentCompletions: (prefix: string) => {
+      const p = prefix.trim();
+      const list = Array.from({ length: QUICK_SLOT_COUNT }, (_, i) => String(i + 1))
+        .filter((n) => n.startsWith(p))
+        .map((n) => ({ value: n, label: `${n} - quick slot ${n} (Alt+${n})` }));
+      return list.length > 0 ? list : null;
+    },
+    handler: async (args, ctx) => {
+      activeModelTracked = ctx.model;
+      await handleQuickCommand(args, ctx, pi);
+    },
+  });
+}
+
+async function handleQuickCommand(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
+  const slots = resolveQuickSlots(ctx);
+  const trimmed = args.trim();
+  if (trimmed) {
+    const n = Number.parseInt(trimmed, 10);
+    if (!Number.isInteger(n) || n < 1 || n > QUICK_SLOT_COUNT) {
+      ctx.ui.notify(`Usage: /quick [1-${QUICK_SLOT_COUNT}]`, "error");
+      return;
+    }
+    await switchToQuickSlot(ctx, pi, slots[n - 1], n - 1);
+    return;
+  }
+
+  if (slots.length === 0) {
+    ctx.ui.notify("No quick models yet. They fill up as you switch models (or set roles in /models).", "info");
+    return;
+  }
+  const choices = slots.map((slot, i) => {
+    const active = ctx.model && modelsAreEqual(ctx.model, slot.model) ? " (active)" : "";
+    return `${i + 1}. ${slot.model.provider}/${formatQuickSlot(slot)}${active}`;
+  });
+  if (!ctx.hasUI) {
+    ctx.ui.notify(`Quick models (Alt+1 … Alt+${slots.length}):\n${choices.join("\n")}`, "info");
+    return;
+  }
+  const choice = await ctx.ui.select("Quick switch (Alt+1 … Alt+8 work anywhere):", choices);
+  if (!choice) return;
+  const index = choices.indexOf(choice);
+  await switchToQuickSlot(ctx, pi, slots[index], index);
 }
