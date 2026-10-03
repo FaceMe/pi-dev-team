@@ -240,6 +240,7 @@ export const FUSION_CONFIG_PATH = fusionConfigPath();
 export interface FactoryRoleChoice {
   name: string;
   description?: string;
+  assignment?: { provider: string; modelId: string; effort?: ThinkingLevel };
 }
 
 export interface ModelPickerOptions {
@@ -263,6 +264,8 @@ export interface ModelPickerOptions {
   factoryRole?: string;
   /** Chooser factory-role mode: roles listed before the model list. */
   factoryRoles?: FactoryRoleChoice[];
+  /** Keep the chooser open after assigning a role; caller stages/persists each result. */
+  onFactoryAssign?: (result: ModelPickerResult) => void;
 }
 
 export interface ModelPickerResult {
@@ -286,7 +289,7 @@ export interface FactoryRoleRow {
 export function buildFactoryRoleRows(roles: FactoryRoleChoice[], maxWidth: number): FactoryRoleRow[] {
   return (roles ?? []).map((role) => {
     const name = role.name ?? "";
-    const description = role.description ?? "";
+    const description = [role.assignment ? `${role.assignment.provider}/${role.assignment.modelId}${role.assignment.effort ? ` · ${role.assignment.effort}` : ""}` : "", role.description ?? ""].filter(Boolean).join(" — ");
     const avail = maxWidth - visibleWidth(name) - 1;
     const trimmed =
       description && avail > 0
@@ -717,7 +720,15 @@ export class SplitModelPickerComponent {
     }) as ModelPickerResult & Model<any>;
     const factoryRole = resolveFactoryRole(this.options, { activeFactoryRole: this.activeFactoryRole });
     if (factoryRole) result.factoryRole = factoryRole;
-    this.done(result);
+    if (this.isFactoryChooserMode && this.options.onFactoryAssign && factoryRole) {
+      this.options.onFactoryAssign(result);
+      const role = this.options.factoryRoles?.find((item) => item.name === factoryRole);
+      if (role) role.assignment = { provider: selectedModel.provider, modelId: selectedModel.id, effort: finalEffort };
+      this.activeFactoryRole = undefined;
+      this.tui.requestRender();
+    } else {
+      this.done(result);
+    }
   }
 
   private setFlash(msg: string): void {
@@ -1009,6 +1020,19 @@ export class SplitModelPickerComponent {
         const role = roles[this.factoryRoleIndex];
         if (role) {
           this.activeFactoryRole = role.name;
+          if (role.assignment) {
+            this.options.initialModel = role.assignment;
+            this.options.initialEffort = role.assignment.effort;
+            const providerIndex = this.filteredProviders.findIndex((provider) => provider.id === role.assignment!.provider);
+            if (providerIndex >= 0) {
+              this.providerIndex = providerIndex;
+              const modelIndex = this.getCurrentModels().findIndex((model) => model.id === role.assignment!.modelId);
+              if (modelIndex >= 0) this.modelIndex = modelIndex;
+            }
+          } else {
+            this.options.initialModel = undefined;
+            this.options.initialEffort = undefined;
+          }
           this.focusedPanel = "models";
           this.tui.requestRender();
         }
@@ -1837,12 +1861,15 @@ export async function showModelPicker(
 export async function showFactoryRolePicker(
   ctx: ExtensionContext | ExtensionCommandContext,
   pi: ExtensionAPI,
-  opts: { roles: FactoryRoleChoice[]; role?: string }
+  opts: { roles: FactoryRoleChoice[]; role?: string; initialModel?: ModelPickerOptions["initialModel"]; initialEffort?: ThinkingLevel; onAssign?: (result: ModelPickerResult) => void }
 ): Promise<(ModelPickerResult & { factoryRole?: string }) | undefined> {
   const options: ModelPickerOptions =
     opts.role !== undefined && opts.role !== ""
       ? { target: "factory-role", factoryRole: opts.role }
       : { target: "factory-role", factoryRoles: opts.roles };
+  options.initialModel = opts.initialModel;
+  options.initialEffort = opts.initialEffort;
+  options.onFactoryAssign = opts.onAssign;
   const result = await showModelPicker(ctx, pi, options);
   return result ?? undefined;
 }
@@ -1871,11 +1898,17 @@ async function fallbackModelPicker(
         ctx.ui.notify("No factory roles are configured.", "error");
         return null;
       }
-      const roleChoices = roles.map((r) => (r.description ? `${r.name} - ${r.description}` : r.name));
+      const roleChoices = roles.map((r) => {
+        const detail = [r.assignment ? `${r.assignment.provider}/${r.assignment.modelId}${r.assignment.effort ? ` · ${r.assignment.effort}` : ""}` : "", r.description].filter(Boolean).join(" — ");
+        return detail ? `${r.name} - ${detail}` : r.name;
+      });
       const pickedRole = await ctx.ui.select("Assign models to factory roles", roleChoices);
       if (!pickedRole) return null;
       factoryRole = roles[roleChoices.indexOf(pickedRole)]?.name;
       if (!factoryRole) return null;
+      const role = roles.find((item) => item.name === factoryRole);
+      options.initialModel = role?.assignment;
+      options.initialEffort = role?.assignment?.effort;
     }
   }
 
@@ -1890,12 +1923,21 @@ async function fallbackModelPicker(
       : "Select Model");
   const choices = available.map((m) => `${m.provider}/${m.id}`);
   const picked = await ctx.ui.select(title, choices);
-  if (!picked) return null;
+  if (!picked) {
+    if (options?.target === "factory-role" && !options.factoryRole && options.onFactoryAssign) return fallbackModelPicker(ctx, options);
+    return null;
+  }
   const model = available[choices.indexOf(picked)];
   if (!model) return null;
-  const effort = getEffectiveModelEffort(model);
+  const effort = options?.initialEffort ? clampThinkingLevel(model, options.initialEffort) as ThinkingLevel : getEffectiveModelEffort(model);
   const result: ModelPickerResult = { model, effort };
   if (factoryRole) result.factoryRole = factoryRole;
+  if (options?.target === "factory-role" && !options.factoryRole && options.onFactoryAssign) {
+    options.onFactoryAssign(result);
+    const role = options.factoryRoles?.find((item) => item.name === factoryRole);
+    if (role) role.assignment = { provider: model.provider, modelId: model.id, effort };
+    return fallbackModelPicker(ctx, options);
+  }
   return result;
 }
 
