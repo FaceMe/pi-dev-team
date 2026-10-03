@@ -96,10 +96,34 @@ export async function changedFiles(cwd: string): Promise<string[]> {
     });
 }
 
-/** Diff of the working tree against HEAD, including untracked files, bounded in size. */
-export async function workingDiff(cwd: string, maxChars = 60_000): Promise<string> {
+/**
+ * Files that differ between `base` and the working tree (tracked, untracked and
+ * deleted), as repo-relative POSIX paths. With a ticket's base commit this is
+ * exactly the ticket's own change, even after integration was merged into it.
+ */
+export async function changedSince(cwd: string, base: string): Promise<string[]> {
   await git(cwd, ["add", "-A", "--intent-to-add"]);
-  const res = await git(cwd, ["diff", "HEAD", "--stat", "--patch", "--no-color"]);
+  const res = await git(cwd, ["diff", "--name-only", "--no-renames", base]);
+  return res.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
+/** Put files back to their content at `base` (deleting the ones `base` does not have). */
+export async function revertToBase(cwd: string, base: string, files: string[]): Promise<void> {
+  for (const file of files) {
+    const inBase = await git(cwd, ["cat-file", "-e", `${base}:${file}`]);
+    if (inBase.ok) {
+      await git(cwd, ["checkout", base, "--", file]);
+    } else {
+      await git(cwd, ["rm", "--cached", "--quiet", "--ignore-unmatch", "--", file]);
+      fs.rmSync(path.join(cwd, file), { force: true, recursive: true });
+    }
+  }
+}
+
+/** Diff of the working tree against HEAD (or `base`), including untracked files, bounded in size. */
+export async function workingDiff(cwd: string, maxChars = 60_000, base = "HEAD"): Promise<string> {
+  await git(cwd, ["add", "-A", "--intent-to-add"]);
+  const res = await git(cwd, ["diff", base, "--stat", "--patch", "--no-color"]);
   const text = res.stdout;
   return text.length > maxChars ? `${text.slice(0, maxChars)}\n… (diff truncated at ${maxChars} chars)` : text;
 }
@@ -107,7 +131,9 @@ export async function workingDiff(cwd: string, maxChars = 60_000): Promise<strin
 export async function commitAll(cwd: string, message: string): Promise<{ commit?: string; error?: string; empty?: boolean }> {
   await git(cwd, ["add", "-A"]);
   const staged = await git(cwd, ["diff", "--cached", "--quiet"]);
-  if (staged.ok) return { empty: true };
+  // A merge in progress is always concluded, even when its resolution equals HEAD.
+  const merging = (await git(cwd, ["rev-parse", "-q", "--verify", "MERGE_HEAD"])).ok;
+  if (staged.ok && !merging) return { empty: true };
   const id = await identityArgs(cwd);
   const res = await git(cwd, [...id, "commit", "-m", message]);
   if (!res.ok) return { error: res.stderr.trim() || "git commit failed" };
@@ -133,4 +159,56 @@ export async function mergeInto(repo: string, branch: string, message: string): 
 
 export async function removeWorktree(repo: string, worktree: string): Promise<void> {
   await git(repo, ["worktree", "remove", "--force", worktree]);
+  // A worktree folder git no longer knows about (crash, manual delete) is removed by hand.
+  if (fs.existsSync(worktree)) fs.rmSync(worktree, { recursive: true, force: true });
+  await git(repo, ["worktree", "prune"]);
+}
+
+export async function deleteBranch(repo: string, branch: string): Promise<void> {
+  await git(repo, ["branch", "-D", branch]);
+}
+
+/** Paths with unresolved merge conflicts. */
+export async function conflictedFiles(cwd: string): Promise<string[]> {
+  const res = await git(cwd, ["diff", "--name-only", "--diff-filter=U"]);
+  return res.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
+/**
+ * Merge `branch` into the checked-out branch of `cwd` with a merge commit.
+ * On conflict: with `keepConflicts` the conflict markers stay in the tree (for a
+ * worker to resolve); otherwise the merge is aborted. Either way the
+ * conflicted paths are returned.
+ */
+export async function mergeBranch(
+  cwd: string,
+  branch: string,
+  message: string,
+  options: { keepConflicts?: boolean } = {},
+): Promise<{ ok: boolean; conflicts: string[]; error?: string }> {
+  const id = await identityArgs(cwd);
+  const res = await git(cwd, [...id, "merge", "--no-ff", "-m", message, branch]);
+  if (res.ok) return { ok: true, conflicts: [] };
+  const conflicts = await conflictedFiles(cwd);
+  if (!options.keepConflicts || conflicts.length === 0) await git(cwd, ["merge", "--abort"]);
+  return { ok: false, conflicts, error: res.stderr.trim() || res.stdout.trim() || "merge failed" };
+}
+
+/** Move the checked-out branch back to `commit`, dropping later commits and local changes. */
+export async function resetTo(cwd: string, commit: string): Promise<void> {
+  await git(cwd, ["reset", "--hard", commit]);
+  await git(cwd, ["clean", "-fd"]);
+}
+
+/** Diff between two commits (no working tree), bounded in size. */
+export async function commitDiff(cwd: string, from: string, to: string, maxChars = 400_000): Promise<string> {
+  const res = await git(cwd, ["diff", "--no-color", "--patch", `${from}..${to}`]);
+  const text = res.stdout;
+  return text.length > maxChars ? text.slice(0, maxChars) : text;
+}
+
+/** Files changed between two commits. */
+export async function filesBetween(cwd: string, from: string, to: string): Promise<string[]> {
+  const res = await git(cwd, ["diff", "--name-only", "--no-renames", `${from}..${to}`]);
+  return res.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
 }

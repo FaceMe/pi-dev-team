@@ -5,6 +5,7 @@
 
 import { spawn } from "node:child_process";
 import { tail } from "../shared/text.js";
+import { formatGateFailureDetails, parseGateOutput } from "./gate-parse.js";
 import type { GateResult, GateSpec, Profile } from "./types.js";
 
 export function runCommand(command: string, cwd: string, timeoutMs: number): Promise<{ code: number; output: string; durationMs: number }> {
@@ -51,7 +52,10 @@ export async function runGates(profile: Profile, cwd: string, options: GateRunOp
   for (const gate of profile.gates) {
     if (options.skipInstall && gate.name === "install") continue;
     const res = await runCommand(gate.command, cwd, options.timeoutMs ?? 15 * 60_000);
-    results.push({ gate: gate.name, command: gate.command, ok: res.code === 0, exitCode: res.code, durationMs: res.durationMs, output: tail(res.output, 6000) });
+    const result: GateResult = { gate: gate.name, command: gate.command, ok: res.code === 0, exitCode: res.code, durationMs: res.durationMs, output: tail(res.output, 6000) };
+    // Parse the full output (not the tail) so early compiler errors are not lost.
+    if (!result.ok) result.details = parseGateOutput(res.output);
+    results.push(result);
     if (res.code !== 0 && options.failFast !== false) break;
   }
   return results;
@@ -65,7 +69,9 @@ export function gatesPassed(results: GateResult[], profile: Profile, skipInstall
 export function describeGateFailure(results: GateResult[]): string {
   const failed = results.find((r) => !r.ok);
   if (!failed) return "all gates passed";
-  return `Gate "${failed.gate}" failed (exit ${failed.exitCode}): \`${failed.command}\`\n\n${failed.output}`;
+  const structured = failed.details ? formatGateFailureDetails(failed.details) : "";
+  const head = `Gate "${failed.gate}" failed (exit ${failed.exitCode}): \`${failed.command}\``;
+  return structured ? `${head}\n\n${structured}\n\nOutput (tail):\n${failed.output}` : `${head}\n\n${failed.output}`;
 }
 
 export function summarizeGates(results: GateResult[]): string {

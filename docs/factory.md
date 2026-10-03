@@ -33,11 +33,15 @@ the [plan](software-factory-plan.md).
    [Planning and traceability](#planning-and-traceability).
 5. **skeleton** — a git worktree on branch `factory/<run>`, where the devops
    role builds a walking skeleton that must pass the gates.
-6. **build** — each ticket is built test-first by its role's worker; the
-   factory (not the agent) runs the gates, reverts out-of-scope changes, and
-   a reviewer from a different model family approves each ticket. Failures
-   retry with feedback, then escalate up the role's model ladder, then ask
-   you.
+6. **build** — tickets run in parallel where the plan allows (settled
+   dependencies, disjoint write scopes, up to 3 at once), each in its own
+   worktree and branch. A QA worker first writes failing acceptance tests,
+   then the role's builder makes them pass; the factory (not the agent) runs
+   the gates, reverts out-of-scope changes, scans for secrets, and a reviewer
+   from a different model family approves. Approved tickets merge into the
+   integration branch, where every gate runs again. Failures retry with
+   feedback, then escalate up the role's model ladder, then ask you. See
+   [The build loop](#the-build-loop).
 7. **docs** — README, architecture notes, `AGENTS.md`, CHANGELOG.
 8. **release** — final gates, merge into your branch when they pass (an
    optional deploy always asks first), and the report in
@@ -169,6 +173,135 @@ is true when every functional requirement has a ticket:
 (the `NFR-002` row above) is the planner warning on the build-plan screen,
 not a broken matrix.
 
+## The build loop
+
+Once the skeleton passes its gates, the build phase works through the ticket
+graph with a scheduler instead of one ticket after another.
+
+**Scheduling.** A ticket starts when every dependency is done (or skipped by
+you) and its write scope overlaps no running ticket's scope, up to
+`maxParallel` tickets at once (default 3). Tickets that both own a dependency
+manifest (`package.json`, `pyproject.toml`, …) also share the lockfiles, so
+they never run at the same time either — two parallel installs would
+otherwise conflict in `package-lock.json`. In the to-do example, T-002 (API
+handlers) and T-003 (web UI) both depend only on T-001 (the store) and have
+disjoint scopes, so they build side by side as soon as T-001 merges.
+
+**One worktree per ticket.** The skeleton's worktree on `factory/<run>` is
+the *integration* branch. Each ticket gets its own worktree,
+`.factory/worktrees/<run>-T-002`, on branch `factory/<run>-T-002`, branched
+from the integration head when the ticket starts. Builders never see each
+other's half-finished work; the ticket's change is exactly its diff against
+the integration commit it last synced with.
+
+**Per ticket:**
+
+1. **QA first.** For backend and frontend tickets with acceptance criteria,
+   the `qa` role writes tests for every criterion, limited to the test globs
+   in the ticket's write scope (`test/**`, `tests/web/**`, `*.spec.ts`, …).
+   The factory reverts anything QA writes outside them, runs the gates to
+   confirm the new tests are red, and commits them on the ticket branch as
+   `test(T-002): acceptance tests (QA)`. The builder's brief names those
+   tests and tells it not to weaken them. Tickets without test globs, docs
+   and devops tickets, and `build.qa: false` skip this step (the builder then
+   writes the tests first itself, as before).
+2. **Build.** The builder works in the ticket worktree. After each attempt
+   the factory reverts out-of-scope files and runs the gates (install once
+   per worktree, then again only when a manifest changed).
+3. **Structured failures.** A failing gate's output is parsed before it goes
+   back to the builder — failing test names (node:test, vitest, jest,
+   pytest, go test, cargo test) and compiler/linter diagnostics (tsc,
+   eslint, rustc, and any `file:line:col: error` style) come first, the raw
+   log tail after:
+
+   ```text
+   Gate "test" failed (exit 1): `node --test`
+
+   Failing tests (1):
+   - lists todos as JSON
+
+   Errors (1):
+   - src/api/handlers.ts:12:5 TS2322 Type 'string' is not assignable to type 'Todo[]'.
+
+   Output (tail):
+   …
+   ```
+
+4. **Secret scan.** The ticket's diff is scanned for high-confidence
+   credentials (private keys, AWS/GitHub/Anthropic/OpenAI/Slack/Stripe/Google/
+   npm tokens, connection strings with passwords) and committed `.env`
+   files. A hit goes back to the builder with redacted previews and the
+   instruction to read the value from the environment instead; the change
+   never reaches a commit.
+5. **Review** by a model from a different family than the builders, as
+   before — now against the ticket's whole diff including the QA tests.
+6. **Integrate.** The approved change is committed on the ticket branch and
+   merged into the integration branch (one merge at a time), and **every
+   gate runs again on integration**. Then the ticket worktree and branch are
+   removed.
+   - **Conflict:** the merge is aborted, the integration branch is merged
+     into the ticket branch instead, and the builder gets the conflicted
+     files to resolve in its own worktree (conflicts in files outside the
+     ticket's scope take the integration side automatically). Leftover
+     `<<<<<<<` markers are caught before the gates run.
+   - **Red integration:** the merge is undone, the integration branch is
+     brought into the ticket branch so the failure reproduces there, and
+     the builder gets the (structured) failure with a note that the change
+     must work together with the integrated code.
+
+**Escalation and breakers.** Every failed attempt (gates, secret, review,
+conflict, integration) counts toward the role's ladder: two attempts per
+model, then the next model up, then you choose to retry with the strongest
+model, skip the ticket, or pause. Two breakers stop the loop and ask:
+
+- the **budget breaker**, at 80% of the budget (raise it by 50% or pause);
+- the **escalation breaker**, when more than 30% of the tickets needed a
+  stronger model — usually a sign the tickets are too big or the briefs too
+  vague. It asks once per run.
+
+When one ticket stops the run (a pause, a blocker, the budget), the tickets
+running alongside it are interrupted too; they keep their worktrees and
+continue from them on `/factory resume`, and a blocked ticket is retried.
+
+**Settings.** The loop's knobs are never asked during setup. Put them under
+`build` in `~/.pi/agent/factory.json` (every project) or the folder's
+`.factory/project.json` (this project wins):
+
+```json
+{
+  "build": {
+    "maxParallel": 3,
+    "budgetBreaker": 0.8,
+    "escalationBreaker": 0.3,
+    "qa": true
+  }
+}
+```
+
+`maxParallel: 1` builds strictly one ticket at a time.
+
+**History.** Every step lands in the ledger as a ticket event — started, QA
+result, each attempt's outcome, scope reverts, review verdict, conflicts,
+integration failures, merges, escalations, done/skipped/blocked — next to
+the worker runs and gate runs (with their parsed failures). `/factory
+history` lists every ticket's attempts and cost; `/factory history T-002`
+replays one ticket:
+
+```text
+history of T-002 — $0.06 · 9.1k tok
+10:02:11  started on factory/run-20261003-100000-T-002 from 3f2a9c1
+10:02:11  qa · anthropic/claude-sonnet · 4 turn(s) · 2.1k tok · $0.01
+10:02:19  gates (QA red check) FAILED: ✓ install (3.1s)  ✗ test (0.6s) — failing: lists todos as JSON
+10:02:19  QA: red — test/api/handlers.test.js
+10:02:20  backend · anthropic/claude-sonnet · 7 turn(s) · 4.0k tok · $0.03
+10:02:31  gates passed: ✓ test (0.6s)
+10:02:40  review: approve · openai/gpt-5
+10:02:41  gates on integration passed: ✓ test (0.9s)
+10:02:41  merged into integration 9be1d04 (3 files)
+10:02:41  attempt 1: ok · anthropic/claude-sonnet
+10:02:41  ✓ done after 1 attempt(s)
+```
+
 ## Commands
 
 | Command | Action |
@@ -178,6 +311,7 @@ not a broken matrix.
 | `/factory board` | The ticket board (the same lines as the live widget) |
 | `/factory cost` | Spend by phase, role, model and ticket, with estimated savings vs an all-frontier team |
 | `/factory trace [ticket\|role]` | Expandable trace of the last worker run (filtered by ticket or role) |
+| `/factory history [ticket]` | Every ticket's attempts, outcomes and cost; with an id, that ticket's full history (QA, worker runs, gates with parsed failures, review, merges) |
 | `/factory pause` | Pause after the current step |
 | `/factory resume` | Continue the paused/interrupted run in this folder |
 | `/factory doctor [probe]` | Check git, pi, models, team, pi-web-access, toolchains and deploy CLIs, with fixes; `probe` sends one tool call to each distinct team model |
@@ -190,7 +324,7 @@ not a broken matrix.
 | `/factory help` (or bare `/factory`) | Menu when a run exists (resume, pause, status, doctor, new); otherwise prompts for an idea |
 
 Tab completion covers subcommands, `autonomy`/`team` values, ticket ids and
-role names for `trace`.
+role names for `trace`, and ticket ids for `history`.
 
 ## Resuming
 
@@ -393,9 +527,9 @@ Pins, presets and role files combine like this:
 ├── traceability.json    # requirement → tickets matrix, written at planning
 ├── reviews/             # reviewer verdicts per ticket attempt
 ├── report.md            # final report: tickets, cost by role, notes
-├── ledger.jsonl         # append-only worker/gate log (usage, cost, traces)
+├── ledger.jsonl         # append-only log: worker runs (usage, cost, traces), gates, ticket events
 ├── sessions/            # worker pi sessions               — git-ignored
-├── worktrees/           # the build worktree               — git-ignored
+├── worktrees/           # integration + per-ticket worktrees — git-ignored
 └── .gitignore           # written by the factory: sessions/, worktrees/, *.tmp
 ```
 
@@ -417,9 +551,12 @@ call they make passes the factory's guard:
   writable, and `.git/` is never writable. If a change slips through anyway,
   the harness diffs the worktree after every attempt and reverts anything
   out of scope before the gates run.
-- **Blocked commands.** `git push`/`commit` and history rewrites, `sudo`,
-  package publishing, `rm -rf` outside the project, fork bombs, piping
-  remote scripts into a shell, and deploy CLIs (`fly deploy`,
+- **Blocked commands.** `git push`/`commit`, history rewrites and branch
+  operations the factory owns (`merge`, `rebase`, `switch`, `stash`,
+  `cherry-pick`, …), `sudo`, package publishing, recursive deletes outside
+  the worktree (including absolute paths), writing to block devices,
+  reading credential stores (`~/.ssh`, `~/.aws`, `~/.npmrc`, …), fork bombs,
+  piping remote scripts into a shell, and deploy CLIs (`fly deploy`,
   `vercel --prod`, `netlify deploy`, `wrangler deploy`, `railway up`,
   `kubectl apply`, `terraform apply`, `docker push`, …) — deploy commands
   unlock only for the one deploy worker, after you approved the deploy.
@@ -428,10 +565,12 @@ call they make passes the factory's guard:
   passing gates plus a reviewer approval.
 - **Secrets.** The factory stores nothing: deploy CLIs reuse their own
   logins, and the deploy worker writes `.env.example` — never your `.env`.
-  The reviewer is instructed to flag secrets in code.
-- **The merge is yours.** Release merges only when the final gates pass, you
-  are on the branch you started on, and your tree is clean (in `careful`,
-  only after you approve).
+  A secret scan runs on every ticket's diff before it can merge, and on
+  the whole factory branch before release; a finding at release keeps the
+  build on the factory branch and is listed in the report.
+- **The merge is yours.** Release merges only when the final gates pass, the
+  secret scan is clean, you are on the branch you started on, and your tree
+  is clean (in `careful`, only after you approve).
 
 See the [plan's safety section](software-factory-plan.md#15-safety-cost-and-failure-handling)
 for the design, and the [README](../README.md) for the quick start.

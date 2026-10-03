@@ -12,9 +12,9 @@
  *   .factory/adr/               architecture decision records
  *   .factory/profile.json       stack + gate commands
  *   .factory/reviews/           reviewer output per ticket attempt
- *   .factory/ledger.jsonl       append-only usage/cost/gate log
+ *   .factory/ledger.jsonl       append-only usage/cost/gate/ticket-event log
  *   .factory/sessions/          worker pi sessions (git-ignored)
- *   .factory/worktrees/         the build worktree (git-ignored)
+ *   .factory/worktrees/         the integration worktree and one per ticket being built (git-ignored)
  */
 
 import * as fs from "node:fs";

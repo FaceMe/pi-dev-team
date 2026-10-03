@@ -11,7 +11,7 @@ It builds on the ideas in Cognition's
 [Devin Fusion](https://cognition.com/blog/devin-fusion) post, which the existing
 `fusion` extension already implements in part.
 
-- Status: **M0–M4 implemented** (see [Implementation status](#implementation-status)); M5–M7 planned
+- Status: **M0–M5 implemented** (see [Implementation status](#implementation-status)); M6–M7 planned
 - Scope: this repository (pi extension package)
 - Last updated: 2026-10-03
 
@@ -26,11 +26,45 @@ It builds on the ideas in Cognition's
 | M2 resume, board and cost | Done | Run state moved to `.factory/factory.lock.json` (M1's `state.json` is migrated on first load) with normalization of damaged state, an archived-runs folder (`runs/`), and a run-scoped settings snapshot applied on resume (the team still follows current logins). Session start offers to resume. Live board widget, `/factory board`, `/factory trace [ticket\|role]`, `/factory roles` (picker Factory tab), `/factory cost` per phase/role/ticket/model with an estimated all-frontier savings line. Ledger entries carry `runId`, input/output token split and bounded traces; skeleton phase resumes without re-prompting a worker when the gates already pass |
 | M3 discovery depth | Done | Readiness checklist scoring (§9.3) ends the interview when no topic is unknown; `spec/readiness.md` and pipeline-derived `spec/assumptions.md`; `factory_brainstorm`-style multi-model fan-out (analyst-triggered, ≤2 per run, distinct families, divergent/critical/pragmatic stances + synthesis into `research/brainstorm-<n>.md`); spec validator (§9.4) fed back into the analyst at the spec gate |
 | M4 architecture, contracts, planning | Done | Stack-profile template library (`node-ts-api`, `react-vite`, `python-fastapi`) the architect starts from; contracts under `.factory/contracts/` as the interface source of truth (required for API/UI specs, validated, copied into the build worktree next to all ADRs; numbered ADRs supported); planner hardening — dependency cycles rejected, write scopes of parallel tickets must be disjoint, FR coverage enforced, NFR coverage warned; `.factory/traceability.json` and a coverage line on the build-plan screen |
-| M5–M7 | Planned | Parallel ticket execution with the scheduler, QA role, deploy hardening, benchmarks |
+| M5 parallel build loop and safety | Done | Scheduler (`src/factory/scheduler.ts`) runs tickets whose dependencies are settled and whose write scopes (plus lockfiles for manifest owners) overlap no running ticket, up to `maxParallel` (3); a worktree and branch per ticket, merged into the integration branch one at a time with every gate re-run there; conflicts and red integrations are undone and handed back to the ticket's builder after syncing integration into the ticket branch; gate output parsed into failing tests and diagnostics (`gate-parse.ts`); `qa` role writes failing acceptance tests first (test globs only, red check, committed on the ticket branch); escalation breaker (>30% of tickets escalated) next to the configurable budget breaker; secret scan on every ticket diff and before release (`secrets.ts`); destructive-command gate extended (git merge/switch/stash/…, absolute-path deletes outside the worktree, credential stores, block devices); ticket events in the ledger and `/factory history [ticket]` |
+| M6–M7 | Planned | Exploratory QA and bug loop, release docs, `/factory change`, brownfield onboarding, benchmarks |
 
-Verification: 284 tests across 21 files, including the whole pipeline with
-**real `pi` worker processes** against a mock OpenAI-compatible model, and the
-real `/factory new` command run headless in a pi session.
+Verification: 322 tests across 23 files, including the whole pipeline with
+**real `pi` worker processes** against a mock OpenAI-compatible model, the
+real `/factory new` command run headless in a pi session, and the M5 exit
+brief — a TODO API with a web UI — built end to end with QA-first tests,
+two tickets in parallel, integration merges and per-ticket ledger history.
+
+M5 decisions (parallel build loop and safety):
+
+- **The skeleton's worktree is the integration branch.** Each ticket branches
+  from the integration head into `.factory/worktrees/<run>-<ticket>`; its
+  change is defined as the diff against the integration commit it last
+  synced with (`ticket.base`), so scope checks, the secret scan and the
+  review all see exactly the ticket's own work, even after integration was
+  merged into it.
+- **Merges are serialised; builds are not.** One `Mutex` guards the
+  integration branch (merge + full gates), another every user prompt, so
+  parallel tickets never race on git or on the UI. When one ticket stops the
+  run, an internal abort signal interrupts its siblings; they keep their
+  worktrees (and persistent worker sessions) and continue on resume.
+- **Conflict hand-off goes to the builder, not the orchestrator.** Disjoint
+  scopes make conflicts rare (stale worktrees, out-of-band integration
+  commits); when one happens the merge is aborted, integration is merged into
+  the ticket branch with markers left for the builder, and out-of-scope
+  conflicts resolve to the integration side. A red integration is undone the
+  same way. Both count as failed attempts on the escalation ladder.
+- **QA is a step, not a ticket.** The `qa` role runs inside each backend/
+  frontend ticket before the builder, limited to the test globs of the
+  ticket's write scope; no test globs means no QA (the builder writes tests
+  first, as in M1). The planner's ticket roles are unchanged.
+- **Breakers and parallelism are settings, not questions.** `build` in
+  `factory.json` / `project.json` (`maxParallel`, `budgetBreaker`,
+  `escalationBreaker`, `qa`); the escalation breaker asks once per run.
+- **Secret scanning favours precision.** Only high-confidence token formats,
+  private keys, credentialed connection strings and committed dotenv files;
+  placeholders are ignored. A hit fails the attempt (before any commit) or,
+  at release, keeps the build off your branch.
 
 M3 decisions (discovery depth):
 

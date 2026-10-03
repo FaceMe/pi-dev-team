@@ -6,6 +6,7 @@
  *   /factory status|cost     where the run is and what it has spent
  *   /factory board           the run at a glance: phase, tickets, spend
  *   /factory trace [id]      the last worker trace for a ticket id or role
+ *   /factory history [id]    a ticket's history (QA, attempts, gates, review, merges), or all tickets
  *   /factory doctor [probe]  check the machine and the team, with fixes
  *   /factory team [preset]   show the team, or switch preset (balanced|cheap|best|refresh)
  *   /factory roles           assign models to roles with the picker
@@ -34,6 +35,7 @@ import { boardLines } from "./board.js";
 import { buildCostReport, renderCostReport } from "./cost.js";
 import { formatDoctor, probeModels, runDoctor } from "./doctor.js";
 import { blockedCommand, inWriteScope } from "./guard.js";
+import { historyOverview, ticketHistory } from "./history.js";
 import { FactoryRun, makeRunId, newState } from "./pipeline.js";
 import type { PipelineDeps } from "./pipeline.js";
 import { loadRoles } from "./roles.js";
@@ -87,7 +89,7 @@ export function registerWorkerGuard(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
       }
     }
     if (name === "bash" || name === "powershell") {
-      const reason = blockedCommand(String(input.command ?? ""), { allowDeploy });
+      const reason = blockedCommand(String(input.command ?? ""), { allowDeploy, cwd: ctx.cwd });
       if (reason) return { block: true, reason: `Blocked by the factory: ${reason}.` };
     }
     return undefined;
@@ -393,7 +395,7 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
 
     // -- command ----------------------------------------------------------------
 
-    const SUBCOMMANDS = ["new", "resume", "pause", "status", "board", "cost", "trace", "doctor", "team", "roles", "autonomy", "settings", "run", "demo", "help"];
+    const SUBCOMMANDS = ["new", "resume", "pause", "status", "board", "cost", "trace", "history", "doctor", "team", "roles", "autonomy", "settings", "run", "demo", "help"];
 
     pi.registerCommand("factory", {
       description: "Software factory: turn an idea into a tested, documented project with a team of models",
@@ -402,6 +404,11 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
         if (second !== undefined) {
           if (first === "autonomy") return ["auto", "balanced", "careful"].filter((v) => v.startsWith(second)).map((v) => ({ value: `autonomy ${v}`, label: v }));
           if (first === "team") return ["balanced", "cheap", "best", "refresh"].filter((v) => v.startsWith(second)).map((v) => ({ value: `team ${v}`, label: v }));
+          if (first === "history") {
+            const state = new FactoryStore(active?.cwd ?? process.cwd()).loadState();
+            const items = (state?.tickets.map((t) => t.id) ?? []).filter((v) => v.startsWith(second)).map((v) => ({ value: `history ${v}`, label: v }));
+            return items.length ? items : null;
+          }
           if (first === "trace") {
             // The completion callback has no ctx; the active run's folder, else cwd.
             const state = new FactoryStore(active?.cwd ?? process.cwd()).loadState();
@@ -425,7 +432,7 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
               kind: "status",
               lines: [
                 "/factory new [idea] — quick setup, then the whole flow",
-                "/factory status · board · cost · trace [ticket|role] — watch the run",
+                "/factory status · board · cost · trace [ticket|role] · history [ticket] — watch the run",
                 "/factory pause · resume — stop after this step / continue (also after restarting pi)",
                 "/factory doctor [probe] · team [preset] · roles · autonomy <p> · settings · run <role> <brief> · demo",
               ],
@@ -521,6 +528,19 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
             const lines = [runId ? `cost for run ${runId}` : "cost, all runs", ...renderCostReport(report)];
             const hidden = runId ? entries.filter((e) => e.kind === "worker" && e.runId !== runId).length : 0;
             if (hidden > 0) lines.push(`other runs: ${hidden} worker run(s) not shown (start a run to filter)`);
+            pi.appendEntry(TAG, { kind: "status", lines });
+            return;
+          }
+
+          case "history": {
+            const store = new FactoryStore(ctx.cwd);
+            const state = active?.run.state ?? store.loadState();
+            if (!state) {
+              ctx.ui.notify("No factory run in this folder.", "info");
+              return;
+            }
+            const entries = store.readLedger();
+            const lines = rest ? ticketHistory(entries, rest, state.runId) : historyOverview(entries, state.tickets, state.runId);
             pi.appendEntry(TAG, { kind: "status", lines });
             return;
           }

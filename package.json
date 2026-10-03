@@ -1,6 +1,6 @@
 {
   "name": "pi-model-picker",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Software factory (/factory): a team of role-specialised agents that interviews you, specs, designs, builds test-first, reviews and documents software with any pi model; plus a two-panel model picker, roles, reasoning effort and the Fusion main/sidekick harness for the pi coding agent",
   "type": "module",
   "license": "MIT",
