@@ -51,6 +51,23 @@ describe("factory settings navigation", () => {
     expect(select.mock.calls[6][2]).toEqual({ initialIndex: 1 });
   });
 
+  it("stages integration saves and preserves the row after nested cancellation", async () => {
+    const answers = initial();
+    answers.integrations = { browser: { enabled: false } };
+    const d = deps(["Design/browser:", "Design/browser:", SAVE_SETTINGS]);
+    d.mode = "settings";
+    d.configureIntegrations = vi.fn().mockImplementationOnce(async (current) => {
+      current.browser.enabled = true;
+      return undefined;
+    }).mockResolvedValueOnce({ browser: { enabled: true } });
+    const select = vi.spyOn(d.ui, "select");
+    const output = await runQuickSetup(answers, d);
+    expect(output?.integrations?.browser?.enabled).toBe(true);
+    expect(answers.integrations.browser?.enabled).toBe(false);
+    expect(select.mock.calls[1][1].at(-1)).toContain("Brave QA off");
+    expect(select.mock.calls[1][2]).toEqual({ initialIndex: 8 });
+  });
+
   it("bulk assigns all roles, then updates only the chosen group", async () => {
     const pick = vi.fn().mockResolvedValueOnce({ provider: "p", modelId: "all" }).mockResolvedValueOnce({ provider: "p", modelId: "builders" });
     const output = await runRoleSetup(initial(), deps(["Assign all", "Assign builders", SAVE_SETTINGS], pick));

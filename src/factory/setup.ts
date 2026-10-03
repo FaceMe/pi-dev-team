@@ -5,6 +5,7 @@
  */
 
 import { formatTokens } from "../shared/usage.js";
+import { integrationSettings } from "./integrations.js";
 import type { DeployTarget } from "./settings.js";
 import type { Team } from "./team.js";
 import { describeTeam } from "./team.js";
@@ -39,6 +40,7 @@ export interface SetupDeps {
   previewTeam: (answers: SetupAnswers) => Team;
   /** Opens the model picker for a role; returns the chosen model or undefined. */
   pickModel?: (role: string, current?: SetupAnswers["pins"][string]) => Promise<{ provider: string; modelId: string; effort?: any } | undefined>;
+  configureIntegrations?: (current?: SetupAnswers["integrations"]) => Promise<SetupAnswers["integrations"] | undefined>;
 }
 
 export function budgetText(answers: SetupAnswers, estimate: SetupDeps["budgetEstimate"]): string {
@@ -81,6 +83,7 @@ export function setupLines(answers: SetupAnswers, deps: SetupDeps): string[] {
     `Web research: ${researchText(answers, deps.webAccessInstalled)}`,
     `Deployment: ${deployText(answers, deps.deployTargets)}`,
     `Budget: ${budgetText(answers, deps.budgetEstimate)}`,
+    ...(deps.configureIntegrations ? [`Design/browser: ${Object.values(answers.integrations?.design ?? {}).filter(bridge => bridge?.enabled !== false).length} design bridges · Brave QA ${answers.integrations?.browser?.enabled ? "on" : "off"}`] : []),
   ];
 }
 
@@ -145,7 +148,7 @@ async function configureTeam(answers: SetupAnswers, deps: SetupDeps): Promise<vo
 
 /** Run the quick setup. Returns the confirmed answers, or undefined if the user cancelled. */
 export async function runQuickSetup(initial: SetupAnswers, deps: SetupDeps): Promise<SetupAnswers | undefined> {
-  const answers: SetupAnswers = { ...initial, pins: { ...initial.pins } };
+  const answers: SetupAnswers = { ...initial, pins: { ...initial.pins }, ...(initial.integrations ? { integrations: integrationSettings(initial.integrations) } : {}) };
   const { ui } = deps;
 
   let initialIndex = 0;
@@ -158,6 +161,11 @@ export async function runQuickSetup(initial: SetupAnswers, deps: SetupDeps): Pro
     const key = choice.split(":")[0];
 
     switch (key) {
+      case "Design/browser": {
+        const config = await deps.configureIntegrations?.(integrationSettings(answers.integrations));
+        if (config) answers.integrations = integrationSettings(config);
+        break;
+      }
       case "Team": {
         await configureTeam(answers, deps);
         break;
