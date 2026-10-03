@@ -12,6 +12,10 @@
  *   .factory/adr/               architecture decision records
  *   .factory/profile.json       stack + gate commands
  *   .factory/reviews/           reviewer output per ticket attempt
+ *   .factory/qa/                exploratory QA reports per verification round, open-bugs.json
+ *   .factory/contributor.md     the new-contributor check (contributor.json: last outcome)
+ *   .factory/release-notes.md   delivered, fixed during verification, known issues
+ *   .factory/report.md          final report · retro.md: the retrospective
  *   .factory/ledger.jsonl       append-only usage/cost/gate/ticket-event log
  *   .factory/sessions/          worker pi sessions (git-ignored)
  *   .factory/worktrees/         the integration worktree and one per ticket being built (git-ignored)

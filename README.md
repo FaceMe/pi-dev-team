@@ -71,9 +71,16 @@ mkdir habit-tracker && cd habit-tracker && pi
    integrations go back to the ticket's builder. Failures retry with
    feedback, then escalate to a stronger model, then ask you; breakers stop
    at 80% of the budget or when over 30% of tickets escalate.
-5. **Docs and release** — README, architecture notes, `AGENTS.md`, CHANGELOG;
-   the branch is merged into yours when the gates pass; `.factory/report.md`
-   lists tickets and cost by role.
+5. **Verify** — every gate on the integrated build, then exploratory QA: a QA
+   worker runs the software like a user and reports bugs with reproduction
+   steps. Major and critical bugs become bug tickets that go back through the
+   build loop (regression test first), up to two fix rounds.
+6. **Docs and release** — README, architecture notes, `AGENTS.md`, CHANGELOG,
+   then a **new-contributor check**: a fresh agent clones the build and must
+   set it up, test it and extend it using only the docs (gaps go back to the
+   docs writer). The branch is merged into yours when the gates pass and
+   tagged `v<version>`; `.factory/` gets the report, release notes and a
+   retrospective (cost by phase, escalations, failures, follow-up tickets).
 
 | Command | Action |
 |---|---|
@@ -82,6 +89,7 @@ mkdir habit-tracker && cd habit-tracker && pi
 | `/factory board` | Ticket board: what is running, blocked and done |
 | `/factory trace [ticket\|role]` | Expandable trace of the last worker run |
 | `/factory history [ticket]` | A ticket's history — QA, attempts, gates with parsed failures, review, merges — or a summary of all tickets |
+| `/factory qa [round]` · `/factory retro` | Exploratory QA reports and the new-contributor check; the retrospective |
 | `/factory pause` · `/factory resume` | Pause after the current step; continue (also after restarting pi — pi offers to resume when you open the project) |
 | `/factory doctor [probe]` | Check git, pi, models, team, pi-web-access, toolchains and deploy CLIs, with fixes; `probe` sends one tool call to each team model |
 | `/factory team [balanced\|cheap\|best]` | Show or change the team |

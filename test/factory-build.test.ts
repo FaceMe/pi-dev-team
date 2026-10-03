@@ -98,8 +98,11 @@ describe("scheduler", () => {
 
 describe("build settings", () => {
   it("defaults, clamps and reads factory.json / project.json", () => {
-    expect(buildSettings(undefined)).toEqual({ maxParallel: 3, budgetBreaker: 0.8, escalationBreaker: 0.3, qa: true });
-    expect(buildSettings({ maxParallel: 0, budgetBreaker: 2, escalationBreaker: 0.5, qa: false })).toEqual({ maxParallel: 3, budgetBreaker: 0.8, escalationBreaker: 0.5, qa: false });
+    const m6 = { exploratoryQa: true, qaRounds: 2, bugSeverity: "major", contributorCheck: true, tagRelease: true };
+    expect(buildSettings(undefined)).toEqual({ maxParallel: 3, budgetBreaker: 0.8, escalationBreaker: 0.3, qa: true, ...m6 });
+    expect(buildSettings({ maxParallel: 0, budgetBreaker: 2, escalationBreaker: 0.5, qa: false })).toEqual({ maxParallel: 3, budgetBreaker: 0.8, escalationBreaker: 0.5, qa: false, ...m6 });
+    expect(buildSettings({ qaRounds: 9, bugSeverity: "minor", exploratoryQa: false } as any)).toMatchObject({ qaRounds: 5, bugSeverity: "minor", exploratoryQa: false });
+    expect(buildSettings({ qaRounds: -1, bugSeverity: "huge" } as any)).toMatchObject({ qaRounds: 2, bugSeverity: "major" });
     expect(buildSettings({ maxParallel: 99 }).maxParallel).toBe(16);
     const ctx = { cwd: tempDir("factory-settings-"), toolNames: [], budget: { usd: 0, tokens: 0, priced: false, size: "small" as const }, deployTargets: [] };
     expect(defaultAnswers(ctx, {}, null).build).toBeUndefined();
@@ -474,7 +477,8 @@ describe("parallel build loop", () => {
     const final = await new FactoryRun(deps, newState("A TODO API with a web UI", "run-serial", a)).run();
     expect(final.status).toBe("done");
     expect(runner.maxTickets).toBe(1);
-    expect(scripted.count("qa")).toBe(0);
+    // QA-first is off; exploratory QA after the build is a separate setting.
+    expect(scripted.calls.filter((c) => c.role === "qa" && !/-verify-\d+$/.test(c.sessionId)).length).toBe(0);
     expect(final.tickets.every((t) => t.qa === "skipped")).toBe(true);
     expect(scripted.calls.find((c) => c.role === "backend")!.prompt).toContain("Write the tests for the acceptance criteria first");
   }, 120_000);

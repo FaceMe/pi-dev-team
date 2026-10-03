@@ -17,6 +17,7 @@ export type Phase =
   | "planning"
   | "skeleton"
   | "build"
+  | "verify"
   | "docs"
   | "release"
   | "done";
@@ -29,6 +30,7 @@ export const PHASE_ORDER: readonly Phase[] = [
   "planning",
   "skeleton",
   "build",
+  "verify",
   "docs",
   "release",
   "done",
@@ -128,20 +130,50 @@ export interface BuildSettings {
   escalationBreaker: number;
   /** A QA worker writes failing acceptance tests before the builder starts. */
   qa: boolean;
+  /** Verification (phase 7): a QA worker tries the integrated build like a user and reports bugs. */
+  exploratoryQa: boolean;
+  /** Fix rounds: bugs at or above bugSeverity loop back to the build this many times at most. */
+  qaRounds: number;
+  /** Lowest severity that becomes a bug ticket; lower ones are listed as follow-ups. */
+  bugSeverity: BugSeverity;
+  /** After the docs, a fresh "new contributor" agent sets up, tests and extends a clean clone using only the docs. */
+  contributorCheck: boolean;
+  /** Tag the release (v<version>) in the local repository when it ships with passing gates. */
+  tagRelease: boolean;
 }
 
-export const DEFAULT_BUILD_SETTINGS: BuildSettings = { maxParallel: 3, budgetBreaker: 0.8, escalationBreaker: 0.3, qa: true };
+export type BugSeverity = "critical" | "major" | "minor";
+export const BUG_SEVERITIES: readonly BugSeverity[] = ["critical", "major", "minor"];
+
+export const DEFAULT_BUILD_SETTINGS: BuildSettings = {
+  maxParallel: 3,
+  budgetBreaker: 0.8,
+  escalationBreaker: 0.3,
+  qa: true,
+  exploratoryQa: true,
+  qaRounds: 2,
+  bugSeverity: "major",
+  contributorCheck: true,
+  tagRelease: true,
+};
 
 /** Normalise build settings: out-of-range values fall back to the defaults. */
 export function buildSettings(raw: Partial<BuildSettings> | undefined): BuildSettings {
   const d = DEFAULT_BUILD_SETTINGS;
   const fraction = (v: unknown, fallback: number) => (typeof v === "number" && v > 0 && v <= 1 ? v : fallback);
   const parallel = raw?.maxParallel;
+  const flag = (v: unknown, fallback: boolean) => (typeof v === "boolean" ? v : fallback);
+  const rounds = raw?.qaRounds;
   return {
     maxParallel: typeof parallel === "number" && Number.isInteger(parallel) && parallel >= 1 ? Math.min(parallel, 16) : d.maxParallel,
     budgetBreaker: fraction(raw?.budgetBreaker, d.budgetBreaker),
     escalationBreaker: fraction(raw?.escalationBreaker, d.escalationBreaker),
-    qa: typeof raw?.qa === "boolean" ? raw.qa : d.qa,
+    qa: flag(raw?.qa, d.qa),
+    exploratoryQa: flag(raw?.exploratoryQa, d.exploratoryQa),
+    qaRounds: typeof rounds === "number" && Number.isInteger(rounds) && rounds >= 0 ? Math.min(rounds, 5) : d.qaRounds,
+    bugSeverity: BUG_SEVERITIES.includes(raw?.bugSeverity as BugSeverity) ? (raw!.bugSeverity as BugSeverity) : d.bugSeverity,
+    contributorCheck: flag(raw?.contributorCheck, d.contributorCheck),
+    tagRelease: flag(raw?.tagRelease, d.tagRelease),
   };
 }
 
@@ -186,6 +218,11 @@ export interface Ticket {
   qaTests?: string[];
   /** Moved up the role's model ladder at least once (feeds the escalation breaker). */
   escalated?: boolean;
+  /** "bug": opened by verification (phase 7) from an exploratory QA finding or a red integration. */
+  kind?: "feature" | "bug";
+  severity?: BugSeverity;
+  /** Verification round that found the bug. */
+  foundInRound?: number;
 }
 
 export interface TicketAttempt {

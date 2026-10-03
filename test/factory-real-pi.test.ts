@@ -66,6 +66,12 @@ describe.skipIf(!fs.existsSync(piCli))("factory with real pi workers", () => {
     expect(log).toMatch(/feat\(T-001\)/);
     // Worker sessions persisted under .factory/sessions.
     expect(fs.readdirSync(store.sessionsDir).length).toBeGreaterThan(0);
+    // M6: exploratory QA ran the software; a fresh contributor extended a clean clone from the docs.
+    expect(fs.readFileSync(path.join(cwd, ".factory/qa/round-1.md"), "utf8")).toMatch(/✓ FR-001/);
+    expect(fs.readFileSync(path.join(cwd, ".factory/contributor.md"), "utf8")).toMatch(/Round 1: PASSED/);
+    expect(fs.existsSync(path.join(cwd, "src/double.js"))).toBe(false);
+    expect(execFileSync("git", ["tag"], { cwd, encoding: "utf8" }).trim()).toBe("v0.1.0");
+    expect(fs.readFileSync(path.join(cwd, ".factory/retro.md"), "utf8")).toMatch(/## Cost by phase/);
   }, 300_000);
 
   it("runs headless through the real /factory command in a pi session", async () => {

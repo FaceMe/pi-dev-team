@@ -442,7 +442,7 @@
     a <b>two-panel model picker</b> with roles and reasoning-effort control — and <b>Fusion</b>, a
     frontier-main + cheap-sidekick harness with dynamic mid-session routing.
   </p>
-  <div class="route">discovery → spec → architecture → planning → skeleton → build → docs → release</div>
+  <div class="route">discovery → spec → architecture → planning → skeleton → build → verify → docs → release</div>
   <div class="install">
     <span><span class="ps1">$</span> pi install git:github.com/FaceMe/pi-dev-team</span>
     <button onclick="copyInstall(this)">copy</button>
@@ -453,7 +453,7 @@
     <a class="pillar p1" href="#factory">
       <div class="idx"><b>01</b><span>/factory</span></div>
       <h3>Software factory</h3>
-      <p>Analyst, researcher, architect, planner, backend, frontend, devops, reviewer and docs agents run your idea through an 8-phase pipeline with gates, guard rails, budgets and resumes.</p>
+      <p>Analyst, researcher, architect, planner, backend, frontend, devops, reviewer and docs agents run your idea through a 9-phase pipeline with gates, guard rails, budgets and resumes.</p>
     </a>
     <a class="pillar p2" href="#picker">
       <div class="idx"><b>02</b><span>/models</span></div>
@@ -496,7 +496,7 @@
       <tr>
         <td><b>factory</b></td>
         <td><span class="filechip">extensions/factory/index.ts</span></td>
-        <td class="desc">The 8-phase software pipeline, worker subprocesses, guard rails, board, cost ledger</td>
+        <td class="desc">The 9-phase software pipeline, worker subprocesses, guard rails, board, cost ledger</td>
         <td><code>/factory</code></td>
       </tr>
     </table>
@@ -536,7 +536,7 @@
   <div class="kicker k-amber">02 · software factory</div>
   <h2>/factory — from idea to merged branch</h2>
   <p class="lead">
-    One command walks your project through <b>eight phases</b>, persisting to <code>.factory/</code> between every
+    One command walks your project through <b>nine phases</b>, persisting to <code>.factory/</code> between every
     step. You stay in control through a quick-setup screen, a bounded interview, and approval gates —
     the factory handles team assembly, test-first builds, reviews, gates and the merge.
   </p>
@@ -589,7 +589,7 @@
 <!-- ============ FLOW ============ -->
 <section id="flow">
   <div class="kicker k-amber">03 · process flow</div>
-  <h2>The eight-phase pipeline</h2>
+  <h2>The nine-phase pipeline</h2>
   <p class="lead">
     Click any phase to see who runs it, what it writes, and where you're asked.
     Green tags mark phases that stop for your approval — always for the spec; the rest depends on your
@@ -624,17 +624,21 @@
       </div>
       <div class="step" data-p="6">
         <div class="n">7</div>
-        <div class="lbl"><b>docs</b><span>README, architecture notes, AGENTS.md, CHANGELOG</span></div>
+        <div class="lbl"><b>verify</b><span>integration gates, exploratory QA, bug tickets loop back</span></div>
       </div>
       <div class="step" data-p="7">
         <div class="n">8</div>
-        <div class="lbl"><b>release</b> <span class="approve-tag" id="release-tag">MERGE*</span><span>final gates, merge, deploy ask, report</span></div>
+        <div class="lbl"><b>docs</b><span>README, AGENTS.md, CHANGELOG · new-contributor check</span></div>
+      </div>
+      <div class="step" data-p="8">
+        <div class="n">9</div>
+        <div class="lbl"><b>release</b> <span class="approve-tag" id="release-tag">MERGE*</span><span>final gates, merge, tag, release notes, retrospective</span></div>
       </div>
     </div>
 
     <div class="phase-detail" id="phase-detail">
       <div class="pd active" data-p="0">
-        <div class="phase-no">PHASE 1 / 8</div>
+        <div class="phase-no">PHASE 1 / 9</div>
         <h4>Discovery</h4>
         <div class="who"><span class="wlbl">Run by</span>
           <span class="rolechip rc-amber">analyst</span><span class="rolechip rc-blue">researcher</span>
@@ -652,7 +656,7 @@
       </div>
 
       <div class="pd" data-p="1">
-        <div class="phase-no">PHASE 2 / 8</div>
+        <div class="phase-no">PHASE 2 / 9</div>
         <h4>Spec</h4>
         <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-amber">analyst</span></div>
         <ul>
@@ -667,7 +671,7 @@
       </div>
 
       <div class="pd" data-p="2">
-        <div class="phase-no">PHASE 3 / 8</div>
+        <div class="phase-no">PHASE 3 / 9</div>
         <h4>Architecture</h4>
         <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-amber">architect</span></div>
         <ul>
@@ -681,7 +685,7 @@
       </div>
 
       <div class="pd" data-p="3">
-        <div class="phase-no">PHASE 4 / 8</div>
+        <div class="phase-no">PHASE 4 / 9</div>
         <h4>Planning</h4>
         <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-amber">planner</span></div>
         <ul>
@@ -693,7 +697,7 @@
       </div>
 
       <div class="pd" data-p="4">
-        <div class="phase-no">PHASE 5 / 8</div>
+        <div class="phase-no">PHASE 5 / 9</div>
         <h4>Skeleton</h4>
         <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-blue">devops</span></div>
         <ul>
@@ -707,7 +711,7 @@
       </div>
 
       <div class="pd" data-p="5">
-        <div class="phase-no">PHASE 6 / 8</div>
+        <div class="phase-no">PHASE 6 / 9</div>
         <h4>Build</h4>
         <div class="who"><span class="wlbl">Run by</span>
           <span class="rolechip rc-blue">backend</span><span class="rolechip rc-blue">frontend</span><span class="rolechip rc-violet">reviewer</span>
@@ -725,31 +729,47 @@
       </div>
 
       <div class="pd" data-p="6">
-        <div class="phase-no">PHASE 7 / 8</div>
-        <h4>Docs</h4>
-        <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-blue">docs</span></div>
+        <div class="phase-no">PHASE 7 / 9</div>
+        <h4>Verify</h4>
+        <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-amber">factory</span><span class="rolechip rc-blue">qa</span></div>
         <ul>
-          <li>The tech-writer role produces the <b>README</b>, architecture notes, <b>AGENTS.md</b> for future agents, and a <b>CHANGELOG</b>.</li>
-          <li>Everything is written from the actual code and spec — the reviewer's already approved the diff it documents.</li>
+          <li><b>Every gate</b> runs on the integrated build with a fresh install; a red build becomes a critical bug ticket.</li>
+          <li><b>Exploratory QA</b>: a read-only QA worker runs the software like a user — each requirement's acceptance criteria end to end, then invalid input, missing configuration and error paths — and reports bugs with reproduction steps and evidence.</li>
+          <li>Major and critical bugs become <b>bug tickets</b> (<code>B-001</code>…) that inherit the requirement's role and write scope and go back through the build loop — a QA-first regression test, the fix, gates, review, integration merge. The next QA round checks the fixes; at most two fix rounds by default.</li>
         </ul>
         <div class="artifacts"><span class="wlbl">Writes</span>
-          <span class="filechip">README.md</span><span class="filechip">docs/</span><span class="filechip">AGENTS.md</span><span class="filechip">CHANGELOG.md</span>
+          <span class="filechip">qa/round-&lt;n&gt;.md</span><span class="filechip">bug tickets</span><span class="filechip">qa/open-bugs.json</span>
+        </div>
+        <div class="approve-note"><span class="tag">stops</span><span><b>Stops for you</b> only when bugs remain after the last fix round (<code>balanced</code>, <code>careful</code>): release with known issues, another round, or pause. <code>auto</code> releases and lists them.</span></div>
+      </div>
+
+      <div class="pd" data-p="7">
+        <div class="phase-no">PHASE 8 / 9</div>
+        <h4>Docs</h4>
+        <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-blue">docs</span><span class="rolechip rc-violet">contributor</span></div>
+        <ul>
+          <li>The tech-writer role produces the <b>README</b>, architecture notes, <b>AGENTS.md</b> for future agents, and a <b>CHANGELOG</b>.</li>
+          <li>Then the <b>new-contributor check</b>: a fresh agent clones the build and, using only the docs, sets it up, runs the tests and makes a small extension. The factory re-runs the documented commands and every gate in that clone; gaps go back to the writer for one fix round. The clone is thrown away.</li>
+        </ul>
+        <div class="artifacts"><span class="wlbl">Writes</span>
+          <span class="filechip">README.md</span><span class="filechip">docs/</span><span class="filechip">AGENTS.md</span><span class="filechip">CHANGELOG.md</span><span class="filechip">.factory/contributor.md</span>
         </div>
         <div class="approve-note auto"><span class="tag">auto</span><span><b>Approval:</b> automatic in all presets — docs land in the worktree and go through the final gates with the rest.</span></div>
       </div>
 
-      <div class="pd" data-p="7">
-        <div class="phase-no">PHASE 8 / 8</div>
+      <div class="pd" data-p="8">
+        <div class="phase-no">PHASE 9 / 9</div>
         <h4>Release</h4>
         <div class="who"><span class="wlbl">Run by</span><span class="rolechip rc-amber">factory</span></div>
         <ul>
           <li><b>Final gates</b> run one last time over the whole branch.</li>
           <li>The branch is <b>merged into yours</b> when they pass — only if you're on the branch you started on and your tree is clean (in <code>careful</code>, you approve the merge itself).</li>
           <li>An optional <b>deploy</b> always asks first — the deploy worker writes <code>.env.example</code>, never your <code>.env</code>.</li>
-          <li>The run finishes with <b>.factory/report.md</b>: every ticket, the cost by role, and notes.</li>
+          <li>The release is <b>tagged</b> <code>v&lt;version&gt;</code> locally (never pushed) and <b>release notes</b> list what was delivered, what verification fixed, and known issues.</li>
+          <li>The run finishes with <b>.factory/report.md</b> and a <b>retrospective</b>: cost by phase, escalations, failed attempts, and suggested follow-up tickets.</li>
         </ul>
         <div class="artifacts"><span class="wlbl">Writes</span>
-          <span class="filechip">merge to your branch</span><span class="filechip">.factory/report.md</span>
+          <span class="filechip">merge to your branch</span><span class="filechip">v&lt;version&gt; tag</span><span class="filechip">release-notes.md</span><span class="filechip">report.md</span><span class="filechip">retro.md</span>
         </div>
         <div class="approve-note"><span class="tag">gate</span><span><b>The merge is yours:</b> gates + clean tree + your branch, and your explicit approval in <code>careful</code>.</span></div>
       </div>
@@ -1234,7 +1254,11 @@ total <span class="t-bold">$1.24</span> · 412.3k tokens · 19 worker run(s)
 ├── <span class="f">profile.json</span>       <span class="c"># stack, gate commands, manifests</span><br>
 ├── <span class="f">tickets.json</span>       <span class="c"># the plan, dependency-ordered</span><br>
 ├── <span class="d">reviews/</span>           <span class="c"># reviewer verdicts per ticket attempt</span><br>
+├── <span class="d">qa/</span>                <span class="c"># exploratory QA report per round</span><br>
+├── <span class="f">contributor.md</span>     <span class="c"># new-contributor check</span><br>
+├── <span class="f">release-notes.md</span>   <span class="c"># delivered · fixed · known issues</span><br>
 ├── <span class="f">report.md</span>          <span class="c"># final report: tickets, cost by role</span><br>
+├── <span class="f">retro.md</span>           <span class="c"># retrospective + follow-up tickets</span><br>
 ├── <span class="f">ledger.jsonl</span>       <span class="c"># append-only worker/gate log + traces</span><br>
 ├── <span class="d">sessions/</span>          <span class="c"># worker pi sessions — git-ignored</span><br>
 └── <span class="d">worktrees/</span>         <span class="c"># the build worktree — git-ignored</span>
@@ -1250,6 +1274,7 @@ total <span class="t-bold">$1.24</span> · 412.3k tokens · 19 worker run(s)
       <tr><td><span class="cmd">/factory status</span> · <span class="cmd">/factory cost</span></td><td class="desc">Where the run is · spend by phase, role, ticket and model, with savings vs an all-frontier team</td></tr>
       <tr><td><span class="cmd">/factory board</span></td><td class="desc">Ticket board: running, blocked and done</td></tr>
       <tr><td><span class="cmd">/factory trace [ticket|role]</span></td><td class="desc">Expandable trace of the last worker run — thinking, tool calls, output excerpts</td></tr>
+      <tr><td><span class="cmd">/factory qa [round]</span> · <span class="cmd">/factory retro</span></td><td class="desc">Exploratory QA reports and the new-contributor check · the retrospective</td></tr>
       <tr><td><span class="cmd">/factory pause</span> · <span class="cmd">/factory resume</span></td><td class="desc">Pause after the current step · continue (also offered automatically when you reopen the project)</td></tr>
       <tr><td><span class="cmd">/factory doctor [probe]</span></td><td class="desc">Check git, pi, models, team, pi-web-access, toolchains, deploy CLIs — with fixes; probe sends one tool call to each team model</td></tr>
       <tr><td><span class="cmd">/factory team [balanced|cheap|best|refresh]</span></td><td class="desc">Show or change the team · re-derive from the models you're logged in to now</td></tr>
@@ -1265,7 +1290,7 @@ total <span class="t-bold">$1.24</span> · 412.3k tokens · 19 worker run(s)
   <div class="tbl-wrap">
     <table>
       <tr><th>Module</th><th>Role in the codebase</th></tr>
-      <tr><td><span class="filechip">src/factory/pipeline.ts</span></td><td class="desc">The phase machine driving the 8-phase run</td></tr>
+      <tr><td><span class="filechip">src/factory/pipeline.ts</span></td><td class="desc">The phase machine driving the 9-phase run</td></tr>
       <tr><td><span class="filechip">src/factory/runner.ts</span></td><td class="desc">pi worker subprocesses (<code>pi --mode json</code>), persistent sessions per role + ticket</td></tr>
       <tr><td><span class="filechip">src/factory/guard.ts</span> · <span class="filechip">gates.ts</span> · <span class="filechip">git.ts</span></td><td class="desc">Tool-call guard, gate runner, worktree/branch/merge handling</td></tr>
       <tr><td><span class="filechip">src/factory/team.ts</span> · <span class="filechip">roles.ts</span></td><td class="desc">Team assembly: tiers, presets, pins, role Markdown, escalation ladders</td></tr>

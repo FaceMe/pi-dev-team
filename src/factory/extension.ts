@@ -395,7 +395,7 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
 
     // -- command ----------------------------------------------------------------
 
-    const SUBCOMMANDS = ["new", "resume", "pause", "status", "board", "cost", "trace", "history", "doctor", "team", "roles", "autonomy", "settings", "run", "demo", "help"];
+    const SUBCOMMANDS = ["new", "resume", "pause", "status", "board", "cost", "trace", "history", "qa", "retro", "doctor", "team", "roles", "autonomy", "settings", "run", "demo", "help"];
 
     pi.registerCommand("factory", {
       description: "Software factory: turn an idea into a tested, documented project with a team of models",
@@ -433,6 +433,7 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
               lines: [
                 "/factory new [idea] — quick setup, then the whole flow",
                 "/factory status · board · cost · trace [ticket|role] · history [ticket] — watch the run",
+                "/factory qa [round] · retro — exploratory QA reports, new-contributor check, retrospective",
                 "/factory pause · resume — stop after this step / continue (also after restarting pi)",
                 "/factory doctor [probe] · team [preset] · roles · autonomy <p> · settings · run <role> <brief> · demo",
               ],
@@ -542,6 +543,39 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
             const entries = store.readLedger();
             const lines = rest ? ticketHistory(entries, rest, state.runId) : historyOverview(entries, state.tickets, state.runId);
             pi.appendEntry(TAG, { kind: "status", lines });
+            return;
+          }
+
+          case "qa": {
+            const store = new FactoryStore(ctx.cwd);
+            let rounds: string[] = [];
+            try {
+              rounds = fs.readdirSync(store.path("qa")).filter((f) => /^round-\d+\.md$/.test(f));
+            } catch {
+              /* no QA yet */
+            }
+            rounds.sort((x, y) => Number(x.match(/\d+/)![0]) - Number(y.match(/\d+/)![0]));
+            const wanted = rest ? `round-${Number.parseInt(rest, 10)}.md` : rounds.at(-1);
+            const qa = wanted ? store.read(`qa/${wanted}`) : undefined;
+            const contributor = store.read("contributor.md");
+            if (!qa && !contributor) {
+              ctx.ui.notify(rest ? `No QA report for round ${rest}.` : "No exploratory QA or new-contributor check has run in this folder yet.", "info");
+              return;
+            }
+            const lines = [...(qa ? qa.trimEnd().split("\n") : []), ...(qa && contributor ? [""] : []), ...(contributor ? contributor.trimEnd().split("\n") : [])];
+            if (rounds.length > 1 && !rest) lines.push("", `${rounds.length} rounds: /factory qa <n> shows an earlier one`);
+            pi.appendEntry(TAG, { kind: "status", lines });
+            return;
+          }
+
+          case "retro": {
+            const store = new FactoryStore(ctx.cwd);
+            const retro = store.read("retro.md");
+            if (!retro) {
+              ctx.ui.notify("No retrospective yet; it is written when a run releases.", "info");
+              return;
+            }
+            pi.appendEntry(TAG, { kind: "status", lines: retro.trimEnd().split("\n") });
             return;
           }
 

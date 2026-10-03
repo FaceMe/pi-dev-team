@@ -11,7 +11,7 @@ It builds on the ideas in Cognition's
 [Devin Fusion](https://cognition.com/blog/devin-fusion) post, which the existing
 `fusion` extension already implements in part.
 
-- Status: **M0–M5 implemented** (see [Implementation status](#implementation-status)); M6–M7 planned
+- Status: **M0–M6 implemented** (see [Implementation status](#implementation-status)); M7 planned
 - Scope: this repository (pi extension package)
 - Last updated: 2026-10-03
 
@@ -27,13 +27,43 @@ It builds on the ideas in Cognition's
 | M3 discovery depth | Done | Readiness checklist scoring (§9.3) ends the interview when no topic is unknown; `spec/readiness.md` and pipeline-derived `spec/assumptions.md`; `factory_brainstorm`-style multi-model fan-out (analyst-triggered, ≤2 per run, distinct families, divergent/critical/pragmatic stances + synthesis into `research/brainstorm-<n>.md`); spec validator (§9.4) fed back into the analyst at the spec gate |
 | M4 architecture, contracts, planning | Done | Stack-profile template library (`node-ts-api`, `react-vite`, `python-fastapi`) the architect starts from; contracts under `.factory/contracts/` as the interface source of truth (required for API/UI specs, validated, copied into the build worktree next to all ADRs; numbered ADRs supported); planner hardening — dependency cycles rejected, write scopes of parallel tickets must be disjoint, FR coverage enforced, NFR coverage warned; `.factory/traceability.json` and a coverage line on the build-plan screen |
 | M5 parallel build loop and safety | Done | Scheduler (`src/factory/scheduler.ts`) runs tickets whose dependencies are settled and whose write scopes (plus lockfiles for manifest owners) overlap no running ticket, up to `maxParallel` (3); a worktree and branch per ticket, merged into the integration branch one at a time with every gate re-run there; conflicts and red integrations are undone and handed back to the ticket's builder after syncing integration into the ticket branch; gate output parsed into failing tests and diagnostics (`gate-parse.ts`); `qa` role writes failing acceptance tests first (test globs only, red check, committed on the ticket branch); escalation breaker (>30% of tickets escalated) next to the configurable budget breaker; secret scan on every ticket diff and before release (`secrets.ts`); destructive-command gate extended (git merge/switch/stash/…, absolute-path deletes outside the worktree, credential stores, block devices); ticket events in the ledger and `/factory history [ticket]` |
-| M6–M7 | Planned | Exploratory QA and bug loop, release docs, `/factory change`, brownfield onboarding, benchmarks |
+| M6 integration, docs, release | Done | `verify` phase between build and docs: every gate on the integrated build with a fresh install (a red build becomes a critical bug ticket), then exploratory QA — the `qa` role runs the software like a user, read-only, and returns a structured report (`.factory/qa/round-<n>.md/.json`); findings at or above `bugSeverity` (major) become `B-nnn` bug tickets inheriting the role and write scope of the requirement's tickets and loop back through the build (QA-first regression test, review, integration merge) for up to `qaRounds` (2) rounds, then `auto` releases with known issues and other presets ask. New-contributor check after the docs: a fresh `contributor` agent clones the factory branch and sets up, tests and extends it from the docs alone; the harness re-runs the documented test commands and every gate in the clone and judges on evidence; gaps get one docs fix round (`.factory/contributor.md`). Release writes `.factory/release-notes.md`, tags `v<version>` locally, and the retrospective `.factory/retro.md` (cost by phase, escalations, failed attempts, follow-up tickets); `/factory qa [round]` and `/factory retro` |
+| M7 | Planned | Benchmark harness, `/factory change`, brownfield onboarding, optional runner isolation |
 
-Verification: 322 tests across 23 files, including the whole pipeline with
-**real `pi` worker processes** against a mock OpenAI-compatible model, the
-real `/factory new` command run headless in a pi session, and the M5 exit
-brief — a TODO API with a web UI — built end to end with QA-first tests,
-two tickets in parallel, integration merges and per-ticket ledger history.
+Verification: 334 tests across 24 files, including the whole pipeline with
+**real `pi` worker processes** against a mock OpenAI-compatible model (which
+now also runs exploratory QA against the built code and the new-contributor
+check in a throwaway clone under the real worker guard), the real
+`/factory new` command run headless in a pi session, the M5 exit brief — a
+TODO API with a web UI — built end to end with QA-first tests, two tickets in
+parallel, integration merges and per-ticket ledger history, and the M6 flow: a
+QA-found bug looped back as `B-001` with a regression test, documentation gaps
+found by the contributor fixed and re-checked, a `v0.1.0` tag, release notes
+and a retrospective.
+
+M6 decisions (integration, docs, release):
+
+- **Verification is its own phase** (`verify`, between build and docs) so it
+  can loop: it sets the phase back to `build` with new bug tickets, and the
+  round count lives in hidden `verify:<n>` notes so it survives resume.
+- **Exploratory QA reuses the `qa` role** with a read-only write scope; the
+  harness restores tracked files and deletes only the untracked files QA
+  added (an un-ignored dependency folder survives).
+- **A red integrated build is a bug, not a QA input**: it becomes a critical
+  bug ticket and QA waits for a green build.
+- **Bug tickets inherit ownership** (role and write scope) from the tickets
+  that delivered the requirement, so the scheduler and QA-first regression
+  tests work unchanged; duplicates of open bug tickets are skipped.
+- **The release never blocks on optional checks**: a QA or contributor worker
+  that returns no usable report is noted, not fatal. After `qaRounds` fix
+  rounds, `auto` releases with known issues; other presets ask.
+- **The new-contributor check judges on evidence** (documented test commands
+  and every gate re-run by the harness in the clone, a real change, no
+  blocking gaps) rather than the agent's verdict, and its extension is thrown
+  away with the clone.
+- **The tag is local and lightweight** (`v<version>` from the manifest or
+  `0.1.0`), never pushed or moved; the retrospective is deterministic (from
+  the ledger and tickets), so it costs no tokens.
 
 M5 decisions (parallel build loop and safety):
 
