@@ -45,7 +45,13 @@ mkdir habit-tracker && cd habit-tracker && pi
    Your answers are remembered: team, autonomy and research for every project,
    the rest per folder.
 2. **Interview** — at most 4 questions per round, each with a recommended
-   answer and a "use your defaults" option. Small ideas get one round.
+   answer and a "use your defaults" option; small ideas get one round. A
+   readiness checklist ends the interview as soon as every topic is known or
+   assumed (unresolved topics become explicit assumptions in the spec), and for
+   contested questions the analyst can fan a brainstorm out to several of your
+   models — divergent, critical and pragmatic stances — then synthesise the
+   options. The spec is machine-checked (requirements with Given/When/Then,
+   measurable non-functional requirements, traceability) before you see it.
 3. **Spec → architecture → plan** — `.factory/spec/spec.md` (FR/NFR IDs with
    Given/When/Then), an ADR, a stack profile with gate commands, and a ticket
    list. You approve per the autonomy preset.
@@ -96,6 +102,9 @@ you open the project. See
 [docs/software-factory-plan.md](docs/software-factory-plan.md) for the design
 and roadmap.
 
+See [docs/factory.md](docs/factory.md) for the full guide — resuming runs,
+the board, cost reports, traces and per-role model assignment.
+
 ## Model picker
 
 ### Two-panel model picker
@@ -105,6 +114,7 @@ Open with `/models`, `/mp`, `/picker`, `/model-picker` or `Ctrl+Shift+M`.
 - **Left panel** — providers with auth indicators and model counts.
 - **Right panel** — models with context window, thinking/reasoning badges with effective effort (e.g. `🧠 high`), and vision indicators.
 - **Spec card** — shows active effort, token limits, cost, and exact supported reasoning levels.
+- **Factory tab** — `/factory roles` opens the same picker on a factory-role list: pick a role, then a model for it (`Esc` returns to the role list).
 
 | Key | Action |
 |---|---|

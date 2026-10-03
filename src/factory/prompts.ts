@@ -4,6 +4,9 @@
  * written as files by the worker; structured data comes back as JSON.
  */
 
+import { READINESS_LABELS, READINESS_TOPICS } from "./readiness.js";
+import type { Readiness, ReadinessItem } from "./readiness.js";
+import type { SpecValidation } from "./spec-validator.js";
 import type { Answer, GateResult, Profile, SetupAnswers, Ticket } from "./types.js";
 
 const bullet = (items: string[]) => items.map((item) => `- ${item}`).join("\n");
@@ -32,10 +35,20 @@ export function interviewPrompt(args: {
   answers: Answer[];
   round: number;
   maxRounds: number;
+  readiness?: Readiness;
+  /** Synthesis digests from earlier brainstorm rounds (options, not decisions). */
+  brainstorms?: string[];
 }): string {
   const prior = args.answers.length
     ? args.answers.map((a) => `- Q: ${a.question}\n  A: ${a.answer}${a.assumed ? " (default accepted)" : ""}`).join("\n")
     : "(none yet)";
+  const checklist = (args.readiness?.items ?? READINESS_TOPICS.map((topic): ReadinessItem => ({ topic, status: "unknown" })))
+    .map((item) => `- ${item.topic}: ${item.status}${item.note && item.note !== "not assessed" ? ` — ${item.note}` : ""}`)
+    .join("\n");
+  const topics = READINESS_TOPICS.map((topic) => `${topic} (${READINESS_LABELS[topic]})`).join(", ");
+  const digests = args.brainstorms?.length
+    ? `\nBrainstorm results from earlier rounds (options, not decisions):\n${args.brainstorms.map((d) => `- ${d}`).join("\n")}\n`
+    : "";
   return `The user wants the factory to build this:
 
 <brief>
@@ -47,12 +60,21 @@ ${settingsSummary(args.settings)}
 
 Answers so far:
 ${prior}
+${digests}
+Readiness checklist — re-assess all nine topics every round. "known" means the
+user answered; "assumed" means you recorded a safe default in the answers;
+"unknown" means it still needs a question. Current state:
+${checklist}
 
-This is interview round ${args.round} of at most ${args.maxRounds}. Decide whether you
-can write a complete, testable specification now. If important unknowns remain
-(users, core flows, data, integrations, constraints, what "done" looks like),
-ask at most 4 questions whose answers change what gets built. For everything
-else, choose a sensible default yourself.
+This is interview round ${args.round} of at most ${args.maxRounds}. Ask at most 4
+questions whose answers change what gets built, turning "unknown" topics into
+questions this round where possible. For everything else, choose a sensible
+default yourself and mark the topic "assumed".
+
+If exactly one open question is genuinely contested (several plausible answers,
+high impact on what gets built), set "brainstorm" to it: the factory will ask
+other model families for stanced takes and bring back options next round.
+Omit the field otherwise; use it at most once per reply.
 
 Reply with exactly one fenced json block:
 \`\`\`json
@@ -66,11 +88,78 @@ Reply with exactly one fenced json block:
       "options": ["Recommended option", "Alternative", "Another alternative"],
       "recommended": 0
     }
-  ]
+  ],
+  "readiness": {
+    "items": [
+      { "topic": "problem", "status": "known", "note": "why" },
+      { "topic": "users", "status": "assumed", "note": "single local user" },
+      { "topic": "journeys", "status": "unknown", "note": "failure path unclear" }
+    ]
+  },
+  "brainstorm": "The one contested question worth fanning out, or omit this field"
 }
 \`\`\`
-Use "ready": true with an empty "questions" list when no more questions are needed.
-Options must be concrete answers (not "other"); the UI adds a free-text choice.`;
+"readiness.items" must cover all nine topics — ids: ${topics} — each with status
+"known", "assumed" or "unknown" and a short note. Use "ready": true with an
+empty "questions" list when no more questions are needed. Options must be
+concrete answers (not "other"); the UI adds a free-text choice.`;
+}
+
+export type BrainstormStance = "divergent" | "critical" | "pragmatic";
+
+const STANCE_GOALS: Record<BrainstormStance, string> = {
+  divergent: "widen the option space",
+  critical: "attack the assumptions",
+  pragmatic: "simplest thing that works",
+};
+
+export function brainstormStancePrompt(args: { question: string; stance: BrainstormStance; idea: string; answers: Answer[] }): string {
+  const prior = args.answers.length
+    ? args.answers.map((a) => `- Q: ${a.question}\n  A: ${a.answer}`).join("\n")
+    : "(none yet)";
+  return `You are one of several models asked the same contested question, each
+from a different stance. Your stance: ${args.stance} — ${STANCE_GOALS[args.stance]}.
+
+The product being built:
+<brief>
+${args.idea.trim()}
+</brief>
+
+Decisions so far:
+${prior}
+
+The contested question:
+<question>
+${args.question}
+</question>
+
+Answer strictly from your stance: ${STANCE_GOALS[args.stance]}. Give at most 3
+concrete options or objections with one line of reasoning each, then the single
+strongest takeaway. Plain text, at most 15 lines. Do not write files.`;
+}
+
+export function brainstormSynthesisPrompt(args: { question: string; stances: Array<{ stance: string; model: string; output: string }> }): string {
+  const takes = args.stances.map((s) => `### ${s.stance} (${s.model})\n${s.output}`).join("\n\n");
+  return `Several models answered the same contested question from different
+stances. Synthesise their takes into one recommendation for the interview.
+
+The question:
+<question>
+${args.question}
+</question>
+
+The takes:
+${takes}
+
+Reply with exactly one fenced json block:
+\`\`\`json
+{
+  "options": ["short option name", "..."],
+  "recommendation": "Which option to prefer and why, in one or two sentences",
+  "risks": ["what could go wrong with the recommendation"]
+}
+\`\`\`
+"options" lists 1-8 distinct options mentioned across the takes.`;
 }
 
 export function researchPrompt(args: { idea: string; decisionsPath: string; webAccess: boolean }): string {
@@ -99,9 +188,8 @@ export function specPrompt(args: { idea: string; decisionsPath: string; research
 ${args.feedback}
 </feedback>
 
-Update .factory/spec/spec.md (and .factory/spec/assumptions.md if affected)
-accordingly, keeping requirement IDs stable where the requirement is unchanged.
-Reply with a short summary of what changed.`;
+Update .factory/spec/spec.md accordingly, keeping requirement IDs stable where
+the requirement is unchanged. Reply with a short summary of what changed.`;
   }
   return `Write the specification for this project.
 
@@ -116,10 +204,18 @@ Write .factory/spec/spec.md with these sections:
 4. Non-functional requirements — IDs NFR-001…, each measurable.
 5. Out of scope for this version.
 
-Also write .factory/spec/assumptions.md listing every assumption you made
-where the user did not decide explicitly (one line each, so they can correct it).
-
 Keep the scope to what the user asked for. Reply with a two-line summary.`;
+}
+
+export function specValidatorFeedback(validation: SpecValidation): string {
+  const issues = validation.issues.map((issue) => `- ${issue.requirement ? `${issue.requirement}: ` : ""}${issue.message}`).join("\n");
+  return `The spec validator found problems in .factory/spec/spec.md:
+
+${issues}
+
+Fix exactly these issues and keep everything else as written — including every
+FR-xxx and NFR-xxx id whose requirement is not itself the problem. Write the
+corrected .factory/spec/spec.md, then reply with a short summary.`;
 }
 
 export function architecturePrompt(args: { settings: SetupAnswers; researchPath?: string; feedback?: string }): string {

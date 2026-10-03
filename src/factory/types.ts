@@ -1,6 +1,7 @@
 /** Core types for the software factory. */
 
 import type { Usage } from "@earendil-works/pi-ai";
+import type { Readiness } from "./readiness.js";
 import type { EffortLevel } from "../shared/models.js";
 import type { Tier } from "../shared/tiers.js";
 import type { TraceStep } from "../shared/trace.js";
@@ -229,6 +230,8 @@ export interface FactoryState {
   worktree?: string;
   answers: Answer[];
   interviewRounds: number;
+  /** Readiness checklist (§9.3), re-assessed by the analyst each round; survives resume. */
+  readiness?: Readiness;
   tickets: Ticket[];
   spentUsd: number;
   spentTokens: number;

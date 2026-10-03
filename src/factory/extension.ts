@@ -420,8 +420,20 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
         const rest = trimmed.slice(sub.length).trim();
 
         switch (sub) {
-          case "":
           case "help": {
+            pi.appendEntry(TAG, {
+              kind: "status",
+              lines: [
+                "/factory new [idea] — quick setup, then the whole flow",
+                "/factory status · board · cost · trace [ticket|role] — watch the run",
+                "/factory pause · resume — stop after this step / continue (also after restarting pi)",
+                "/factory doctor [probe] · team [preset] · roles · autonomy <p> · settings · run <role> <brief> · demo",
+              ],
+            });
+            return;
+          }
+
+          case "": {
             const state = new FactoryStore(ctx.cwd).loadState();
             if (active || (state && state.status !== "done")) {
               const choice = await ctx.ui.select("Factory", [
@@ -596,8 +608,14 @@ export function createFactoryExtension(options: FactoryExtensionOptions = {}) {
             answers.autonomy = value;
             saveUserDefaults(answers);
             if (project) store.saveProject({ ...(project as SetupAnswers), autonomy: value });
-            // Live update: the running pipeline reads answers.autonomy at each gate.
-            if (active) (active.run as any).deps.answers.autonomy = value;
+            // Live update: the running pipeline reads answers.autonomy at each gate,
+            // and the lock's settings snapshot is refreshed so a resume keeps it.
+            if (active) {
+              const run = active.run as any;
+              run.deps.answers.autonomy = value;
+              active.run.state.settings = { ...runSettings(run.deps.answers as SetupAnswers), autonomy: value };
+              store.saveState(active.run.state);
+            }
             ctx.ui.notify(`Autonomy: ${AUTONOMY_TEXT[value]}`, "info");
             return;
           }

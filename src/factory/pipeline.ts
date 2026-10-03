@@ -9,9 +9,12 @@
  * gate commands and the reviewer, never by a worker's own claim.
  */
 
+import type { Model } from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { clampEffort, modelFamily } from "../shared/models.js";
 import { truncate } from "../shared/text.js";
+import type { Tier } from "../shared/tiers.js";
 import { formatCost, formatTokens } from "../shared/usage.js";
 import { boardLines } from "./board.js";
 import { outOfScope } from "./guard.js";
@@ -31,8 +34,13 @@ import {
 } from "./git.js";
 import { extractJson } from "./json-reply.js";
 import { requirementIds, validatePlan } from "./plan.js";
+import type { BrainstormStance } from "./prompts.js";
 import * as prompts from "./prompts.js";
+import { READINESS_LABELS, isReady, normalizeReadiness, readinessMarkdown } from "./readiness.js";
+import type { Readiness } from "./readiness.js";
 import { estimateSize } from "./settings.js";
+import { validateSpec } from "./spec-validator.js";
+import type { SpecValidation } from "./spec-validator.js";
 import type { FactoryStore } from "./store.js";
 import { escalate } from "./team.js";
 import type { Team } from "./team.js";
@@ -78,6 +86,8 @@ export class StopRun extends Error {
 const OTHER = "Other — type my own answer";
 const DEFAULTS = "Use your defaults for the remaining questions";
 const MAX_ATTEMPTS_PER_MODEL = 2;
+/** Brainstorms per run (plan §9.2); tracked via "brainstorm:<n>" notes so the cap survives resume. */
+const MAX_BRAINSTORMS = 2;
 /** Lockfiles a package manager may touch whenever the manifest is in scope. */
 const LOCKFILES = [
   "package-lock.json",
@@ -397,13 +407,22 @@ Work only inside the current working directory.`;
     const size = estimateSize(state.idea);
     const maxRounds = size === "small" ? 1 : size === "medium" ? 2 : 3;
     let useDefaults = false;
+    const brainstormDigests: string[] = [];
 
     while (state.interviewRounds < maxRounds && !useDefaults) {
       const round = state.interviewRounds + 1;
-      const reply = await this.workJson<{ ready: boolean; questions: Question[] }>(
+      const reply = await this.workJson<{ ready: boolean; questions: Question[]; readiness?: Readiness; brainstorm?: string }>(
         "analyst",
         {
-          prompt: prompts.interviewPrompt({ idea: state.idea, settings: deps.answers, answers: state.answers, round, maxRounds }),
+          prompt: prompts.interviewPrompt({
+            idea: state.idea,
+            settings: deps.answers,
+            answers: state.answers,
+            round,
+            maxRounds,
+            readiness: state.readiness,
+            brainstorms: brainstormDigests.slice(-2),
+          }),
           cwd: deps.cwd,
           session: "analyst",
           writeScope: [".factory/spec/**"],
@@ -420,14 +439,17 @@ Work only inside the current working directory.`;
               options: q.options.filter((o: unknown) => typeof o === "string").slice(0, 4),
               recommended: Number.isInteger(q.recommended) && q.recommended >= 0 && q.recommended < q.options.length ? q.recommended : 0,
             }));
-          return { value: { ready: value.ready === true || questions.length === 0, questions } };
+          const readiness = value.readiness === undefined ? undefined : (normalizeReadiness(value.readiness) ?? undefined);
+          const brainstorm = typeof value.brainstorm === "string" && value.brainstorm.trim() ? value.brainstorm.trim() : undefined;
+          return { value: { ready: value.ready === true || questions.length === 0, questions, readiness, brainstorm } };
         },
       );
       state.interviewRounds = round;
-      if (reply.ready) {
-        this.save();
-        break;
-      }
+      if (reply.readiness) state.readiness = reply.readiness;
+      this.save();
+
+      // The readiness checklist, not the analyst's own "ready", decides when discovery is deep enough.
+      if (reply.ready || (state.readiness && isReady(state.readiness))) break;
 
       for (const q of reply.questions) {
         const recommended = q.options[q.recommended] ?? q.options[0];
@@ -453,10 +475,17 @@ Work only inside the current working directory.`;
         }
         state.answers.push(answer);
       }
+
+      if (reply.brainstorm && !useDefaults && this.brainstormCount() < MAX_BRAINSTORMS) {
+        const digest = await this.runBrainstorm(reply.brainstorm);
+        if (digest) brainstormDigests.push(digest);
+      }
       this.save();
     }
 
+    if (state.readiness) deps.store.write("spec/readiness.md", readinessMarkdown(state.readiness));
     deps.store.write("spec/decisions.md", prompts.decisionsMarkdown(state.idea, state.answers));
+    this.writeAssumptions();
 
     if (deps.answers.research !== "off" && !deps.store.read("research/notes.md")) {
       const result = await this.work("researcher", {
@@ -467,6 +496,138 @@ Work only inside the current working directory.`;
       });
       if (result.isError) state.notes.push(`research skipped: ${truncate(result.errorMessage ?? "", 160)}`);
     }
+  }
+
+  /** spec/assumptions.md is derived data: every silently accepted default plus every unresolved readiness topic. Rewritten fresh each pass. */
+  private writeAssumptions(): void {
+    const { state, deps } = this;
+    const lines = ["# Assumptions", "", "## Accepted defaults", ""];
+    const assumed = state.answers.filter((a) => a.assumed);
+    if (assumed.length === 0) lines.push("_No defaults were accepted without an answer._");
+    for (const a of assumed) lines.push(`- Assumed (you did not answer): ${a.question} — ${a.answer}`);
+    lines.push("", "## Unresolved topics", "");
+    const unresolved = state.readiness?.items.filter((item) => item.status === "unknown") ?? [];
+    if (unresolved.length === 0) lines.push("_Every readiness topic is known or assumed._");
+    for (const item of unresolved) {
+      const label = READINESS_LABELS[item.topic] ?? item.topic;
+      lines.push(`- Unresolved: ${label} — ${item.note ?? label}`);
+    }
+    deps.store.write("spec/assumptions.md", `${lines.join("\n")}\n`);
+  }
+
+  // -- brainstorm (plan §9.2) --------------------------------------------------
+
+  /** Brainstorms already run in this run ("brainstorm:<n>" notes survive resume). */
+  private brainstormCount(): number {
+    return this.state.notes.filter((n) => /^brainstorm:\d+$/.test(n)).length;
+  }
+
+  /** The tier models (frontier, daily, small order) deduplicated by model family, up to 3. */
+  private brainstormCandidates(): TeamMember[] {
+    const tiers = this.deps.team.tiers;
+    const effort = this.role("analyst").effort;
+    const byTier: Array<[Tier, Model<any> | undefined]> = [
+      ["frontier", tiers.frontier],
+      ["daily", tiers.daily],
+      ["small", tiers.small],
+    ];
+    const seen = new Set<string>();
+    const members: TeamMember[] = [];
+    for (const [tier, model] of byTier) {
+      if (!model) continue;
+      const family = modelFamily(model);
+      if (seen.has(family)) continue;
+      seen.add(family);
+      members.push({ role: "analyst", provider: model.provider, modelId: model.id, tier, family, effort: clampEffort(model, effort) });
+    }
+    return members.slice(0, 3);
+  }
+
+  /**
+   * Fan one contested interview question out to a model per stance, synthesise,
+   * and file .factory/research/brainstorm-<n>.md. Returns a digest for the next
+   * interview round, or undefined when skipped (one family) or failed.
+   */
+  private async runBrainstorm(question: string): Promise<string | undefined> {
+    const { deps, state } = this;
+    const candidates = this.brainstormCandidates();
+    if (candidates.length < 2) {
+      state.notes.push("brainstorm skipped: one model family logged in");
+      this.save();
+      return undefined;
+    }
+    const n = this.brainstormCount() + 1;
+    const stances: BrainstormStance[] = ["divergent", "critical", "pragmatic"];
+    const takes = stances.map((stance, i) => ({ stance, member: candidates[i % candidates.length] }));
+    const outputs = await Promise.all(
+      takes.map(({ stance, member }) =>
+        this.work("analyst", {
+          prompt: prompts.brainstormStancePrompt({ question, stance, idea: state.idea, answers: state.answers }),
+          cwd: deps.cwd,
+          session: `brainstorm-${n}-${stance}`,
+          writeScope: [],
+          member,
+        }),
+      ),
+    );
+
+    let synthesis: { options: string[]; recommendation: string; risks: string[] };
+    try {
+      synthesis = await this.workJson<{ options: string[]; recommendation: string; risks: string[] }>(
+        "analyst",
+        {
+          prompt: prompts.brainstormSynthesisPrompt({
+            question,
+            stances: takes.map((take, i) => ({
+              stance: take.stance,
+              model: `${take.member.provider}/${take.member.modelId}`,
+              output: outputs[i].isError
+                ? `(this take failed: ${truncate(outputs[i].errorMessage ?? "", 120)})`
+                : truncate(outputs[i].text, 600),
+            })),
+          }),
+          cwd: deps.cwd,
+          session: `brainstorm-${n}-synthesis`,
+          writeScope: [],
+        },
+        (value) => {
+          const options = Array.isArray(value?.options) ? value.options.filter((o: unknown) => typeof o === "string" && o.trim()) : [];
+          const recommendation = typeof value?.recommendation === "string" ? value.recommendation.trim() : "";
+          const risks = Array.isArray(value?.risks) ? value.risks.filter((r: unknown) => typeof r === "string" && r.trim()) : [];
+          if (options.length < 1 || options.length > 8 || !recommendation) {
+            return { error: 'reply needs "options" (1-8 strings) and a non-empty "recommendation"' };
+          }
+          return { value: { options, recommendation, risks } };
+        },
+      );
+    } catch (error) {
+      // An optional enhancement must not take the run down; a pause/abort still propagates.
+      if (!(error instanceof StopRun) || error.status !== "failed") throw error;
+      state.notes.push(`brainstorm ${n} failed: ${truncate(error.message, 160)}`);
+      this.save();
+      return undefined;
+    }
+
+    const lines = [
+      `# Brainstorm ${n}`,
+      "",
+      `Question: ${question}`,
+      "",
+      ...takes.flatMap((take, i) => [`## ${take.stance} — ${take.member.provider}/${take.member.modelId}`, "", outputs[i].isError ? `(failed: ${truncate(outputs[i].errorMessage ?? "", 200)})` : truncate(outputs[i].text, 600), ""]),
+      "## Synthesis",
+      "",
+      `Recommendation: ${synthesis.recommendation}`,
+      "",
+      "Options:",
+      ...synthesis.options.map((option) => `- ${option}`),
+      "",
+      "Risks:",
+      ...(synthesis.risks.length ? synthesis.risks.map((risk) => `- ${risk}`) : ["- (none listed)"]),
+    ];
+    deps.store.write(`research/brainstorm-${n}.md`, `${lines.join("\n")}\n`);
+    state.notes.push(`brainstorm:${n}`);
+    this.save();
+    return truncate(`Brainstorm ${n} on "${question}": recommend ${synthesis.recommendation}; options: ${synthesis.options.join("; ")}`, 500);
   }
 
   private async spec(): Promise<void> {
@@ -482,9 +643,13 @@ Work only inside the current working directory.`;
     for (;;) {
       const spec = deps.store.read("spec/spec.md") ?? "";
       const ids = requirementIds(spec);
+      const validation = this.checkSpec(spec);
       const assumptions = (deps.store.read("spec/assumptions.md") ?? "").split("\n").filter((l) => l.trim().startsWith("-")).length;
+      const requirements = validation?.summary
+        ?? `${ids.filter((id) => id.startsWith("FR-")).length} functional and ${ids.filter((id) => id.startsWith("NFR-")).length} non-functional requirements`;
       const summary = [
-        `${ids.filter((id) => id.startsWith("FR-")).length} functional and ${ids.filter((id) => id.startsWith("NFR-")).length} non-functional requirements; ${assumptions} assumptions.`,
+        `${requirements}; ${assumptions} assumptions.`,
+        ...(validation && !validation.ok ? [`${validation.issues.length} spec-validator issue(s) — see .factory/spec/spec.md`] : []),
         `Read it in .factory/spec/spec.md (assumptions in .factory/spec/assumptions.md).`,
         "",
         truncate(spec.split("\n").filter((l) => l.trim() && !l.startsWith("#")).slice(0, 6).join(" "), 400),
@@ -499,6 +664,7 @@ Work only inside the current working directory.`;
 
   private async writeSpec(feedback?: string): Promise<void> {
     const { deps } = this;
+    let retry: string | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
       const result = await this.work("analyst", {
         prompt:
@@ -509,20 +675,46 @@ Work only inside the current working directory.`;
                 researchPath: deps.store.read("research/notes.md") ? ".factory/research/notes.md" : undefined,
                 feedback,
               })
-            : "The file .factory/spec/spec.md is missing or has no FR-xxx requirements with Given/When/Then acceptance criteria. Write it now as instructed.",
+            : (retry ??
+              "The file .factory/spec/spec.md is missing or has no FR-xxx requirements with Given/When/Then acceptance criteria. Write it now as instructed."),
         cwd: deps.cwd,
         session: "analyst",
         writeScope: [".factory/spec/**"],
       });
       if (result.isError) throw new StopRun("failed", `The analyst failed to write the spec: ${result.errorMessage}`);
       const spec = deps.store.read("spec/spec.md") ?? "";
-      if (/\bFR-\d+/.test(spec) && /\bGiven\b/i.test(spec)) {
-        if (!this.state.notes.includes("spec:written")) this.state.notes.push("spec:written");
-        this.save();
+      if (!/\bFR-\d+/.test(spec) || !/\bGiven\b/i.test(spec)) {
+        retry = "The file .factory/spec/spec.md is missing or has no FR-xxx requirements with Given/When/Then acceptance criteria. Write it now as instructed.";
+        continue;
+      }
+      const validation = this.checkSpec(spec);
+      if (!validation || validation.ok) {
+        this.markSpecWritten();
         return;
       }
+      if (attempt === 1) {
+        // Persistent validator failure is surfaced at the approval gate, not a hard stop.
+        this.state.notes.push(`spec validator still failing: ${truncate(validation.summary, 200)}`);
+        this.markSpecWritten();
+        return;
+      }
+      retry = prompts.specValidatorFeedback(validation);
     }
     throw new StopRun("failed", "The analyst did not produce a valid .factory/spec/spec.md.");
+  }
+
+  private markSpecWritten(): void {
+    if (!this.state.notes.includes("spec:written")) this.state.notes.push("spec:written");
+    this.save();
+  }
+
+  /** validateSpec is a quality gate; when the validator itself cannot run, spec quality is judged at the approval gate instead. */
+  private checkSpec(spec: string): SpecValidation | undefined {
+    try {
+      return validateSpec(spec);
+    } catch {
+      return undefined;
+    }
   }
 
   private async architecture(): Promise<void> {
@@ -967,8 +1159,9 @@ Work only inside the current working directory.`;
       "|---|---|---|---|---|",
       ...[...byRole.entries()].map(([role, r]) => `| ${role} | ${r.model} | ${r.runs} | ${formatTokens(r.tokens)} | ${formatCost(r.cost)} |`),
     ];
-    if (this.state.notes.filter((n) => !n.includes(":written")).length) {
-      lines.push("", "## Notes", "", ...this.state.notes.filter((n) => !n.includes(":written")).map((n) => `- ${n}`));
+    const visibleNotes = this.state.notes.filter((n) => !n.includes(":written") && !/^brainstorm:\d+$/.test(n));
+    if (visibleNotes.length) {
+      lines.push("", "## Notes", "", ...visibleNotes.map((n) => `- ${n}`));
     }
     return `${lines.join("\n")}\n`;
   }
